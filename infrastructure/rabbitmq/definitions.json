@@ -1,0 +1,239 @@
+{
+  "rabbit_version": "3.13.0",
+  "rabbitmq_version": "3.13.0",
+  "product_name": "RabbitMQ",
+  "vhosts": [
+    { "name": "/" }
+  ],
+  "exchanges": [
+    {
+      "name": "asm.scan",
+      "vhost": "/",
+      "type": "topic",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    },
+    {
+      "name": "asm.correlation",
+      "vhost": "/",
+      "type": "fanout",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    },
+    {
+      "name": "asm.risk",
+      "vhost": "/",
+      "type": "direct",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    },
+    {
+      "name": "asm.notify",
+      "vhost": "/",
+      "type": "topic",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    },
+    {
+      "name": "asm.enrich",
+      "vhost": "/",
+      "type": "direct",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    },
+    {
+      "name": "asm.report",
+      "vhost": "/",
+      "type": "direct",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    },
+    {
+      "name": "asm.dlx",
+      "vhost": "/",
+      "type": "direct",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    }
+  ],
+  "queues": [
+    {
+      "name": "scan.discovery",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-dead-letter-exchange": "asm.dlx",
+        "x-dead-letter-routing-key": "scan.discovery",
+        "x-max-priority": 10,
+        "x-message-ttl": 86400000,
+        "x-queue-mode": "lazy"
+      }
+    },
+    {
+      "name": "scan.probe",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-dead-letter-exchange": "asm.dlx",
+        "x-dead-letter-routing-key": "scan.probe",
+        "x-max-priority": 10,
+        "x-message-ttl": 86400000
+      }
+    },
+    {
+      "name": "scan.port",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-dead-letter-exchange": "asm.dlx",
+        "x-dead-letter-routing-key": "scan.port",
+        "x-max-priority": 10,
+        "x-message-ttl": 86400000
+      }
+    },
+    {
+      "name": "scan.nuclei",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-dead-letter-exchange": "asm.dlx",
+        "x-dead-letter-routing-key": "scan.nuclei",
+        "x-max-priority": 10,
+        "x-message-ttl": 86400000,
+        "x-max-length": 50000
+      }
+    },
+    {
+      "name": "scan.screenshot",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-dead-letter-exchange": "asm.dlx",
+        "x-dead-letter-routing-key": "scan.screenshot",
+        "x-max-priority": 5,
+        "x-message-ttl": 43200000,
+        "x-max-length": 10000
+      }
+    },
+    {
+      "name": "correlation.process",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-dead-letter-exchange": "asm.dlx",
+        "x-dead-letter-routing-key": "correlation.process",
+        "x-max-priority": 10,
+        "x-message-ttl": 86400000
+      }
+    },
+    {
+      "name": "risk.compute",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-dead-letter-exchange": "asm.dlx",
+        "x-dead-letter-routing-key": "risk.compute",
+        "x-max-priority": 10,
+        "x-message-ttl": 86400000
+      }
+    },
+    {
+      "name": "notify.send",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-dead-letter-exchange": "asm.dlx",
+        "x-dead-letter-routing-key": "notify.send",
+        "x-max-priority": 10,
+        "x-message-ttl": 3600000
+      }
+    },
+    {
+      "name": "enrich.assets",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-dead-letter-exchange": "asm.dlx",
+        "x-dead-letter-routing-key": "enrich.assets",
+        "x-max-priority": 5,
+        "x-message-ttl": 86400000
+      }
+    },
+    {
+      "name": "report.daily",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-dead-letter-exchange": "asm.dlx",
+        "x-message-ttl": 86400000
+      }
+    },
+    {
+      "name": "scan.discovery.dlq",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-message-ttl": 604800000,
+        "x-max-length": 10000
+      }
+    },
+    {
+      "name": "scan.nuclei.dlq",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-message-ttl": 604800000,
+        "x-max-length": 10000
+      }
+    }
+  ],
+  "bindings": [
+    { "source": "asm.scan",        "vhost": "/", "destination": "scan.discovery",    "destination_type": "queue", "routing_key": "scan.discovery",    "arguments": {} },
+    { "source": "asm.scan",        "vhost": "/", "destination": "scan.probe",        "destination_type": "queue", "routing_key": "scan.probe",        "arguments": {} },
+    { "source": "asm.scan",        "vhost": "/", "destination": "scan.port",         "destination_type": "queue", "routing_key": "scan.port",         "arguments": {} },
+    { "source": "asm.scan",        "vhost": "/", "destination": "scan.nuclei",       "destination_type": "queue", "routing_key": "scan.nuclei",       "arguments": {} },
+    { "source": "asm.scan",        "vhost": "/", "destination": "scan.screenshot",   "destination_type": "queue", "routing_key": "scan.screenshot",   "arguments": {} },
+    { "source": "asm.correlation", "vhost": "/", "destination": "correlation.process","destination_type": "queue","routing_key": "",                   "arguments": {} },
+    { "source": "asm.risk",        "vhost": "/", "destination": "risk.compute",      "destination_type": "queue", "routing_key": "risk.compute",      "arguments": {} },
+    { "source": "asm.notify",      "vhost": "/", "destination": "notify.send",       "destination_type": "queue", "routing_key": "#",                 "arguments": {} },
+    { "source": "asm.enrich",      "vhost": "/", "destination": "enrich.assets",     "destination_type": "queue", "routing_key": "enrich.assets",     "arguments": {} },
+    { "source": "asm.report",      "vhost": "/", "destination": "report.daily",      "destination_type": "queue", "routing_key": "report.daily",      "arguments": {} },
+    { "source": "asm.dlx",        "vhost": "/", "destination": "scan.discovery.dlq","destination_type": "queue", "routing_key": "scan.discovery",    "arguments": {} },
+    { "source": "asm.dlx",        "vhost": "/", "destination": "scan.nuclei.dlq",   "destination_type": "queue", "routing_key": "scan.nuclei",       "arguments": {} }
+  ],
+  "permissions": [
+    {
+      "user": "asm",
+      "vhost": "/",
+      "configure": ".*",
+      "write": ".*",
+      "read": ".*"
+    }
+  ]
+}

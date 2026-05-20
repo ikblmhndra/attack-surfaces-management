@@ -1,0 +1,223 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&display=swap');
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 222 47% 4%;
+    --foreground: 210 40% 96%;
+    --card: 222 47% 6%;
+    --card-foreground: 210 40% 96%;
+    --popover: 222 47% 6%;
+    --popover-foreground: 210 40% 96%;
+    --primary: 199 89% 48%;
+    --primary-foreground: 222 47% 4%;
+    --secondary: 217 33% 12%;
+    --secondary-foreground: 210 40% 96%;
+    --muted: 217 33% 12%;
+    --muted-foreground: 215 20% 55%;
+    --accent: 217 33% 12%;
+    --accent-foreground: 210 40% 96%;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 217 33% 14%;
+    --input: 217 33% 10%;
+    --ring: 199 89% 48%;
+    --radius: 0.5rem;
+
+    /* Severity colors */
+    --severity-critical: 0 84% 60%;
+    --severity-high: 25 95% 53%;
+    --severity-medium: 48 96% 53%;
+    --severity-low: 217 91% 60%;
+    --severity-info: 215 20% 55%;
+
+    /* Grade colors */
+    --grade-a: 160 84% 39%;
+    --grade-b: 217 91% 60%;
+    --grade-c: 48 96% 53%;
+    --grade-d: 25 95% 53%;
+    --grade-f: 0 84% 60%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+
+  /* Custom scrollbar */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    @apply bg-surface-900;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    @apply bg-surface-600 rounded-full;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-surface-500;
+  }
+
+  /* Selection */
+  ::selection {
+    @apply bg-brand-900 text-brand-200;
+  }
+}
+
+@layer components {
+  /* Severity badge variants */
+  .severity-critical {
+    @apply bg-red-500/10 text-red-400 border-red-500/20;
+  }
+  .severity-high {
+    @apply bg-orange-500/10 text-orange-400 border-orange-500/20;
+  }
+  .severity-medium {
+    @apply bg-yellow-500/10 text-yellow-400 border-yellow-500/20;
+  }
+  .severity-low {
+    @apply bg-blue-500/10 text-blue-400 border-blue-500/20;
+  }
+  .severity-info {
+    @apply bg-gray-500/10 text-gray-400 border-gray-500/20;
+  }
+
+  /* Grade badges */
+  .grade-a { @apply text-emerald-400 bg-emerald-400/10 border-emerald-400/20; }
+  .grade-b { @apply text-blue-400 bg-blue-400/10 border-blue-400/20; }
+  .grade-c { @apply text-yellow-400 bg-yellow-400/10 border-yellow-400/20; }
+  .grade-d { @apply text-orange-400 bg-orange-400/10 border-orange-400/20; }
+  .grade-f { @apply text-red-400 bg-red-400/10 border-red-400/20; }
+
+  /* Glass card */
+  .glass-card {
+    @apply bg-surface-800/50 backdrop-blur-sm border border-surface-700/50 rounded-xl;
+  }
+
+  /* Scan activity line */
+  .scan-active::before {
+    content: '';
+    @apply absolute left-0 top-0 w-full h-0.5 bg-gradient-to-r from-transparent via-brand-400 to-transparent;
+    animation: scanLine 2s linear infinite;
+  }
+
+  /* Metric card */
+  .metric-card {
+    @apply glass-card p-5 relative overflow-hidden;
+  }
+  .metric-card::after {
+    content: '';
+    @apply absolute top-0 right-0 w-32 h-32 rounded-full blur-3xl opacity-5 pointer-events-none;
+    background: radial-gradient(circle, theme(colors.brand.400), transparent);
+  }
+
+  /* Data table */
+  .data-table th {
+    @apply text-xs font-medium text-muted-foreground uppercase tracking-wider
+           px-4 py-3 text-left bg-surface-900/50 border-b border-border;
+  }
+  .data-table td {
+    @apply px-4 py-3 text-sm border-b border-border/50;
+  }
+  .data-table tr:hover td {
+    @apply bg-surface-700/30;
+  }
+
+  /* Terminal text style */
+  .terminal {
+    @apply font-mono text-sm text-brand-300 bg-surface-950 rounded-lg p-4
+           border border-brand-900/30;
+  }
+
+  /* Score ring */
+  .score-ring {
+    @apply relative inline-flex items-center justify-center;
+  }
+
+  /* Navigation item */
+  .nav-item {
+    @apply flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm font-medium
+           text-muted-foreground transition-all duration-150
+           hover:text-foreground hover:bg-surface-700/50;
+  }
+  .nav-item.active {
+    @apply text-foreground bg-surface-700/80 shadow-sm;
+  }
+  .nav-item.active svg {
+    @apply text-brand-400;
+  }
+}
+
+@layer utilities {
+  /* Glow effects */
+  .glow-sm { box-shadow: 0 0 10px rgba(14, 165, 233, 0.2); }
+  .glow-md { box-shadow: 0 0 20px rgba(14, 165, 233, 0.3); }
+  .glow-lg { box-shadow: 0 0 40px rgba(14, 165, 233, 0.25); }
+
+  .glow-red { box-shadow: 0 0 20px rgba(239, 68, 68, 0.25); }
+  .glow-orange { box-shadow: 0 0 20px rgba(249, 115, 22, 0.25); }
+  .glow-green { box-shadow: 0 0 20px rgba(16, 185, 129, 0.25); }
+
+  /* Text gradient */
+  .text-gradient {
+    @apply bg-gradient-to-r from-brand-300 to-brand-500 bg-clip-text text-transparent;
+  }
+
+  /* Animated border */
+  .border-animated {
+    position: relative;
+  }
+  .border-animated::before {
+    content: '';
+    position: absolute;
+    inset: -1px;
+    border-radius: inherit;
+    padding: 1px;
+    background: linear-gradient(135deg, theme(colors.brand.500), transparent, theme(colors.brand.500));
+    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+    opacity: 0.4;
+  }
+}
+
+/* Recharts customization */
+.recharts-cartesian-grid-horizontal line,
+.recharts-cartesian-grid-vertical line {
+  stroke: hsl(var(--border));
+  stroke-opacity: 0.5;
+}
+
+.recharts-tooltip-wrapper .recharts-default-tooltip {
+  @apply bg-surface-800 border border-border rounded-lg shadow-xl !important;
+}
+
+/* Loading skeleton */
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    hsl(var(--muted)) 25%,
+    hsl(var(--accent)) 50%,
+    hsl(var(--muted)) 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+  @apply rounded;
+}

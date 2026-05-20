@@ -1,0 +1,48 @@
+# Core async
+asyncio==3.4.3
+aio-pika==9.4.1
+asyncpg==0.29.0
+sqlalchemy[asyncio]==2.0.30
+alembic==1.13.1
+
+# HTTP / scraping
+aiohttp==3.9.5
+httpx==0.27.0
+
+# Storage
+minio==7.2.7
+boto3==1.34.93
+
+# Search
+opensearch-py==2.6.0
+
+# Queue
+aio-pika==9.4.1
+
+# Scheduler
+APScheduler==3.10.4
+
+# Screenshot
+playwright==1.44.0
+Pillow==10.3.0
+
+# Enrichment
+tenacity==8.3.0
+
+# Metrics
+prometheus-client==0.20.0
+
+# Logging
+structlog==24.1.0
+
+# Utils
+python-dotenv==1.0.1
+tldextract==5.1.2
+redis[hiredis]==5.0.4
+
+# Risk engine (shared with backend)
+passlib[bcrypt]==1.7.4
+python-jose[cryptography]==3.3.0
+
+# Type stubs
+typing-extensions==4.11.0

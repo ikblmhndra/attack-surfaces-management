@@ -1,0 +1,446 @@
+x-common-env: &common-env
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: 5432
+  POSTGRES_DB: ${POSTGRES_DB:-asmdb}
+  POSTGRES_USER: ${POSTGRES_USER:-asmuser}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+  REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+  RABBITMQ_URL: amqp://${RABBITMQ_USER:-asm}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+  MINIO_ENDPOINT: minio:9000
+  MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+  MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+  OPENSEARCH_HOST: opensearch
+  OPENSEARCH_PORT: 9200
+  SECRET_KEY: ${SECRET_KEY}
+  ENVIRONMENT: ${ENVIRONMENT:-production}
+
+x-worker-base: &worker-base
+  build:
+    context: ./workers
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    rabbitmq:
+      condition: service_healthy
+  networks:
+    - asm-internal
+  volumes:
+    - ./workers:/app/workers
+    - ./backend/app:/app/app:ro
+    - worker-tmp:/tmp/asm-scans
+  environment:
+    <<: *common-env
+
+services:
+  # ============================================================
+  # GATEWAY
+  # ============================================================
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: asm-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./infrastructure/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./infrastructure/nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./infrastructure/nginx/ssl:/etc/nginx/ssl:ro
+      - nginx-logs:/var/log/nginx
+    depends_on:
+      - api
+      - frontend
+    networks:
+      - asm-public
+      - asm-internal
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ============================================================
+  # FRONTEND
+  # ============================================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: production
+    container_name: asm-frontend
+    restart: unless-stopped
+    environment:
+      HOSTNAME: 0.0.0.0
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-https://localhost/api}
+      NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-wss://localhost/ws}
+    networks:
+      - asm-internal
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/dashboard"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ============================================================
+  # BACKEND API
+  # ============================================================
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: asm-api
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+      API_WORKERS: ${API_WORKERS:-4}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-https://localhost}
+      TRUSTED_HOSTS: ${TRUSTED_HOSTS}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-60}
+      REFRESH_TOKEN_EXPIRE_DAYS: ${REFRESH_TOKEN_EXPIRE_DAYS:-30}
+      SHODAN_API_KEY: ${SHODAN_API_KEY:-}
+      CENSYS_API_ID: ${CENSYS_API_ID:-}
+      CENSYS_API_SECRET: ${CENSYS_API_SECRET:-}
+      VIRUSTOTAL_API_KEY: ${VIRUSTOTAL_API_KEY:-}
+      ABUSEIPDB_API_KEY: ${ABUSEIPDB_API_KEY:-}
+      OTX_API_KEY: ${OTX_API_KEY:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-noreply@asm-platform.local}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+    networks:
+      - asm-internal
+    volumes:
+      - ./backend:/app
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  # ============================================================
+  # WORKERS
+  # ============================================================
+  worker-discovery:
+    <<: *worker-base
+    command: python -m workers.scanner.discovery_worker
+    environment:
+      <<: *common-env
+      WORKER_TYPE: discovery
+      WORKER_CONCURRENCY: ${DISCOVERY_CONCURRENCY:-3}
+    cap_add:
+      - NET_RAW
+
+  worker-probe:
+    <<: *worker-base
+    command: python -m workers.scanner.probe_worker
+    environment:
+      <<: *common-env
+      WORKER_TYPE: probe
+      WORKER_CONCURRENCY: ${PROBE_CONCURRENCY:-5}
+    cap_add:
+      - NET_RAW
+
+  worker-port:
+    <<: *worker-base
+    command: python -m workers.scanner.port_worker
+    environment:
+      <<: *common-env
+      WORKER_TYPE: port
+      WORKER_CONCURRENCY: ${PORT_CONCURRENCY:-3}
+    cap_add:
+      - NET_RAW
+
+  worker-nuclei:
+    <<: *worker-base
+    command: python -m workers.scanner.nuclei_worker
+    environment:
+      <<: *common-env
+      WORKER_TYPE: nuclei
+      NUCLEI_TEMPLATES_PATH: /opt/nuclei-templates
+      NUCLEI_RATE_LIMIT: ${NUCLEI_RATE_LIMIT:-150}
+    volumes:
+      - ./workers:/app/workers
+      - ./backend/app:/app/app:ro
+      - worker-tmp:/tmp/asm-scans
+      - nuclei-templates:/opt/nuclei-templates
+    cap_add:
+      - NET_RAW
+
+  worker-screenshot:
+    <<: *worker-base
+    command: python -m workers.screenshot.screenshot_worker
+    environment:
+      <<: *common-env
+      WORKER_TYPE: screenshot
+      MINIO_BUCKET: screenshots
+    shm_size: "2gb"
+
+  worker-correlation:
+    <<: *worker-base
+    container_name: asm-worker-correlation
+    command: python -m workers.correlation.correlation_worker
+    environment:
+      <<: *common-env
+      WORKER_TYPE: correlation
+
+  worker-risk:
+    <<: *worker-base
+    container_name: asm-worker-risk
+    command: python -m workers.risk.risk_worker
+    environment:
+      <<: *common-env
+      WORKER_TYPE: risk
+
+  worker-notification:
+    <<: *worker-base
+    container_name: asm-worker-notification
+    command: python -m workers.notification.notification_worker
+    environment:
+      <<: *common-env
+      WORKER_TYPE: notification
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+
+  scheduler:
+    <<: *worker-base
+    container_name: asm-scheduler
+    command: python -m workers.scheduler.scheduler
+    environment:
+      <<: *common-env
+      WORKER_TYPE: scheduler
+      SCAN_INTERVAL_HOURS: ${SCAN_INTERVAL_HOURS:-24}
+
+  # ============================================================
+  # DATABASES & STORAGE
+  # ============================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: asm-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-asmdb}
+      POSTGRES_USER: ${POSTGRES_USER:-asmuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infrastructure/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ./infrastructure/postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+    networks:
+      - asm-internal
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-asmuser} -d ${POSTGRES_DB:-asmdb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf
+
+  redis:
+    image: redis:7-alpine
+    container_name: asm-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD}
+      --maxmemory 2gb
+      --maxmemory-policy allkeys-lru
+      --save 900 1
+      --save 300 10
+      --save 60 10000
+      --loglevel warning
+    volumes:
+      - redis-data:/data
+    networks:
+      - asm-internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: asm-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-asm}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+      RABBITMQ_DEFAULT_VHOST: /
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+      - ./infrastructure/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+      - ./infrastructure/rabbitmq/definitions.json:/etc/rabbitmq/definitions.json:ro
+    networks:
+      - asm-internal
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    ports:
+      - "15672:15672"
+
+  minio:
+    image: minio/minio:latest
+    container_name: asm-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
+      MINIO_BROWSER: "on"
+    volumes:
+      - minio-data:/data
+    networks:
+      - asm-internal
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    ports:
+      - "9001:9001"
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: asm-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set asm http://minio:9000 ${MINIO_ACCESS_KEY} ${MINIO_SECRET_KEY};
+      mc mb --ignore-existing asm/screenshots;
+      mc mb --ignore-existing asm/evidence;
+      mc mb --ignore-existing asm/reports;
+      mc mb --ignore-existing asm/exports;
+      mc anonymous set download asm/screenshots;
+      exit 0;
+      "
+    networks:
+      - asm-internal
+
+  opensearch:
+    image: opensearchproject/opensearch:2.13.0
+    container_name: asm-opensearch
+    restart: unless-stopped
+    environment:
+      cluster.name: asm-cluster
+      node.name: opensearch-node1
+      discovery.type: single-node
+      bootstrap.memory_lock: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      DISABLE_SECURITY_PLUGIN: "true"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    networks:
+      - asm-internal
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:2.13.0
+    container_name: asm-opensearch-dashboards
+    restart: unless-stopped
+    environment:
+      OPENSEARCH_HOSTS: '["http://opensearch:9200"]'
+      DISABLE_SECURITY_DASHBOARDS_PLUGIN: "true"
+    networks:
+      - asm-internal
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    ports:
+      - "5601:5601"
+
+  # ============================================================
+  # OBSERVABILITY
+  # ============================================================
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: asm-prometheus
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./infrastructure/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    networks:
+      - asm-internal
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: asm-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost:3001}
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./infrastructure/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infrastructure/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks:
+      - asm-internal
+    depends_on:
+      - prometheus
+    ports:
+      - "3001:3000"
+
+networks:
+  asm-public:
+    driver: bridge
+  asm-internal:
+    driver: bridge
+    internal: false
+
+volumes:
+  postgres-data:
+  redis-data:
+  rabbitmq-data:
+  minio-data:
+  opensearch-data:
+  prometheus-data:
+  grafana-data:
+  nginx-logs:
+  worker-tmp:
+  nuclei-templates:
