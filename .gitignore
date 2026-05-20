@@ -2,4 +2,4 @@
 /.env
 /.github
 /AGENTS.md
-/infrastructure/nginx/ssl/*
+infrastructure/nginx/ssl/*
