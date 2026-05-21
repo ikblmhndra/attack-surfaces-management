@@ -4,6 +4,27 @@ All notable changes to this project are documented below, sorted newest-first.
 
 ---
 
+## 2026-05-22 — 3 Bug Fixes: Findings Persist, UnboundLocalError, JSON List Parse
+
+### Fixed: Findings upsert fails — `ON CONFLICT` requires unique index, not btree
+- **File**: Database schema / `workers/scanner/nuclei_worker.py`
+- `pg_insert(Finding.__table__).on_conflict_do_update(index_elements=["fingerprint", "org_id"])` requires a **unique** constraint or unique index on those columns in PostgreSQL. The existing `ix_finding_fingerprint` was a regular (non-unique) btree index, so every insert threw `InvalidColumnReferenceError: there is no unique or exclusion constraint matching the ON CONFLICT specification`.
+- **Impact**: **Root cause of findings not appearing in the UI**. The finding was parsed correctly from nuclei JSON output, but the database upsert failed. The `message_processing_error` exception was caught by the BaseWorker and the message was requeued (infinite retry loop).
+- **Fix**: Replaced index `ix_finding_fingerprint` with unique index `uq_finding_fingerprint_org` via `CREATE UNIQUE INDEX`.
+
+### Fixed: `UnboundLocalError: cannot access local variable 'findings'`
+- **File**: `workers/scanner/nuclei_worker.py:146`
+- When `findings_raw` was empty (nuclei found zero vulnerabilities), the `findings` variable was never assigned before `log.info("nuclei_scan_completed", findings=len(findings))` referenced it.
+- **Impact**: When nuclei found nothing (e.g., zero findings), the log line threw `UnboundLocalError`, the message was requeued with retry, and the correlation terminal message was never sent. Scan stayed "running" forever despite having zero findings.
+- **Fix**: Initialize `findings = []` before the `if findings_raw:` branch.
+
+### Fixed: Nuclei JSON output lines may be arrays, not objects
+- **File**: `workers/scanner/nuclei_worker.py:273-281`
+- `nuclei -json-export` can output JSON arrays on a single line. `json.loads(line)` returned a list, which was passed to `_parse_finding()` as `raw` — calling `raw.get("template-id")` on a list raised `AttributeError`.
+- **Fix**: Check `isinstance(parsed, list)` → `results.extend(parsed)`. Also guard `_parse_finding()` with `isinstance(raw, dict)`.
+
+---
+
 ## 2026-05-22 — Port Worker Race Condition Fix
 
 ### Fixed: Race condition causes scan to complete before port worker's nuclei tasks finish

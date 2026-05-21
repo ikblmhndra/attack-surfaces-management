@@ -127,6 +127,7 @@ class NucleiWorker(BaseWorker):
                 scan_id=scan_id,
             )
 
+            findings = []
             if findings_raw:
                 log.info("nuclei_raw_findings", count=len(findings_raw), scan_id=scan_id)
 
@@ -270,7 +271,11 @@ class NucleiWorker(BaseWorker):
                 if not line:
                     continue
                 try:
-                    results.append(json.loads(line))
+                    parsed = json.loads(line)
+                    if isinstance(parsed, list):
+                        results.extend(parsed)
+                    elif isinstance(parsed, dict):
+                        results.append(parsed)
                 except json.JSONDecodeError:
                     continue
 
@@ -278,12 +283,14 @@ class NucleiWorker(BaseWorker):
 
     def _parse_finding(
         self,
-        raw: Dict,
+        raw: Any,
         org_id: str,
         workspace_id: str,
         scan_id: str,
     ) -> Optional[Dict]:
         """Parse a nuclei JSON result into platform finding format."""
+        if not isinstance(raw, dict):
+            return None
         try:
             template_id = raw.get("template-id", "")
             template_info = raw.get("info", {})
