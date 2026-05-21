@@ -15,7 +15,6 @@ log = structlog.get_logger()
 # Exchange → routing key → queue mappings
 ROUTING_CONFIG = {
     "scan.discovery":      {"exchange": "asm.scan",         "type": aio_pika.ExchangeType.TOPIC},
-    "scan.probe":          {"exchange": "asm.scan",         "type": aio_pika.ExchangeType.TOPIC},
     "scan.port":           {"exchange": "asm.scan",         "type": aio_pika.ExchangeType.TOPIC},
     "scan.nuclei":         {"exchange": "asm.scan",         "type": aio_pika.ExchangeType.TOPIC},
     "scan.screenshot":     {"exchange": "asm.scan",         "type": aio_pika.ExchangeType.TOPIC},

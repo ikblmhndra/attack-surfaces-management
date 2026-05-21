@@ -533,6 +533,41 @@ async def findings_trend(
     }
 
 
+# ── Export ──────────────────────────────────────────────────
+
+@router.get("/export")
+async def export_findings(
+    org_id: Optional[UUID] = Query(None),
+    severity: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    category: Optional[str] = Query(None),
+    format: str = Query("csv", regex="^(csv|json)$"),
+    workspace_id: UUID = Depends(get_workspace_id),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    from fastapi.responses import StreamingResponse
+    import csv, io
+
+    query = select(Finding).where(Finding.workspace_id == workspace_id, Finding.deleted_at.is_(None))
+    if org_id: query = query.where(Finding.org_id == org_id)
+    if severity: query = query.where(Finding.severity == severity)
+    if status: query = query.where(Finding.status == status)
+    if category: query = query.where(Finding.category == category)
+    findings = (await db.execute(query.order_by(Finding.last_seen.desc()).limit(10000))).scalars().all()
+
+    if format == "json":
+        return [_finding_to_dict(f) for f in findings]
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["id", "org_id", "title", "severity", "category", "status", "source", "cve_ids", "cvss_score", "affected_url", "first_seen", "last_seen"])
+    for f in findings:
+        writer.writerow([str(f.id), str(f.org_id), f.title, f.severity, f.category, f.status, f.source, ";".join(f.cve_ids or []), f.cvss_score, f.affected_url, f.first_seen.isoformat() if f.first_seen else "", f.last_seen.isoformat() if f.last_seen else ""])
+    output.seek(0)
+    return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=findings.csv"})
+
+
 # ── Helpers ───────────────────────────────────────────────────
 
 async def _get_finding_or_404(

@@ -74,7 +74,6 @@ class BaseWorker(ABC):
     # Exchange mapping: queue name → (exchange_name, type)
     EXCHANGE_MAP: Dict[str, tuple] = {
         "scan.discovery":      ("asm.scan", aio_pika.ExchangeType.TOPIC),
-        "scan.probe":          ("asm.scan", aio_pika.ExchangeType.TOPIC),
         "scan.port":           ("asm.scan", aio_pika.ExchangeType.TOPIC),
         "scan.nuclei":         ("asm.scan", aio_pika.ExchangeType.TOPIC),
         "scan.screenshot":     ("asm.scan", aio_pika.ExchangeType.TOPIC),

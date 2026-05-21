@@ -77,12 +77,38 @@ class NucleiWorker(BaseWorker):
         workspace_id = message["workspace_id"]
         targets = message["targets"]  # List of URLs/subdomains
         config = message.get("config", {})
+        tech_map = message.get("tech_map", {})  # {url: [tech_names]}
+
+        # Update scan status to running (handles manual nuclei scans too)
+        async with get_session() as db:
+            from sqlalchemy import update, func
+            from workers.db_models import Scan
+            from datetime import datetime, timezone
+            await db.execute(
+                update(Scan).where(Scan.id == scan_id).values(
+                    status="running",
+                    started_at=datetime.now(timezone.utc),
+                    progress_pct=func.greatest(Scan.progress_pct, 10),
+                )
+            )
+            await db.commit()
 
         if not targets:
             log.warning("nuclei_no_targets", scan_id=scan_id)
             return
 
         log.info("nuclei_scan_started", scan_id=scan_id, targets=len(targets), org_id=org_id)
+
+        # Collect unique tech tags from tech_map for template filtering
+        all_techs = set()
+        if tech_map:
+            for url, techs in tech_map.items():
+                if techs:
+                    all_techs.update(t.lower().replace(" ", "-") for t in techs if isinstance(t, str))
+            if all_techs:
+                existing_tags = config.get("tags", [])
+                config["tags"] = list(set(existing_tags) | all_techs)
+                log.info("nuclei_tech_tags", count=len(all_techs), tags=list(all_techs)[:20], scan_id=scan_id)
 
         with tempfile.TemporaryDirectory(prefix="asm-nuclei-") as tmpdir:
             tmpdir = Path(tmpdir)
@@ -101,22 +127,20 @@ class NucleiWorker(BaseWorker):
                 scan_id=scan_id,
             )
 
-            if not findings_raw:
+            if findings_raw:
+                log.info("nuclei_raw_findings", count=len(findings_raw), scan_id=scan_id)
+
+                findings = [self._parse_finding(f, org_id, workspace_id, scan_id) for f in findings_raw]
+                findings = [f for f in findings if f is not None]
+
+                async with get_session() as db:
+                    persisted = await self._persist_findings(db, findings, scan_id)
+                    await self._update_scan_findings_count(db, scan_id, len(persisted))
+            else:
                 log.info("nuclei_no_findings", scan_id=scan_id, targets=len(targets))
-                return
 
-            log.info("nuclei_raw_findings", count=len(findings_raw), scan_id=scan_id)
-
-            # Enrich and parse
-            findings = [self._parse_finding(f, org_id, workspace_id, scan_id) for f in findings_raw]
-            findings = [f for f in findings if f is not None]
-
-            # Persist findings
-            async with get_session() as db:
-                persisted = await self._persist_findings(db, findings, scan_id)
-                await self._update_scan_findings_count(db, scan_id, len(persisted))
-
-            # Queue correlation
+            # Queue correlation — ALWAYS called, even with zero findings.
+            # This increments nuclei_done and checks for terminal condition.
             await self._queue_correlation(scan_id, org_id, workspace_id)
 
         log.info("nuclei_scan_completed", scan_id=scan_id, findings=len(findings))
@@ -153,17 +177,21 @@ class NucleiWorker(BaseWorker):
             "-disable-update-check",
         ]
 
-        # Severity filter
-        if severities:
+        # Template selection based on vuln_depth
+        vuln_depth = config.get("vuln_depth", "default")
+
+        # Severity filter (restrict further for critical-only depth)
+        if vuln_depth == "critical":
+            cmd.extend(["-severity", "critical,high"])
+        elif severities:
             cmd.extend(["-severity", ",".join(severities)])
 
-        # Template selection
-        if templates:
-            for tmpl in templates:
-                cmd.extend(["-t", tmpl])
-        else:
-            # Default: use key template categories
-            default_template_dirs = [
+        # Map depth → template directories
+        TEMPLATE_DIRS_BY_DEPTH = {
+            "critical": [
+                "cves",  # Includes all CVE templates (severity-filtered below)
+            ],
+            "default": [
                 "cves",
                 "vulnerabilities",
                 "exposures",
@@ -174,15 +202,32 @@ class NucleiWorker(BaseWorker):
                 "ssl",
                 "exposed-panels",
                 "network",
-            ]
-            for tmpl_dir in default_template_dirs:
+            ],
+            "full": [],
+        }
+
+        if templates:
+            for tmpl in templates:
+                cmd.extend(["-t", tmpl])
+        elif vuln_depth == "full":
+            # All template directories (no path filter)
+            pass
+        else:
+            dirs = TEMPLATE_DIRS_BY_DEPTH.get(vuln_depth, TEMPLATE_DIRS_BY_DEPTH["default"])
+            for tmpl_dir in dirs:
                 tmpl_path = Path(self.TEMPLATES_PATH) / tmpl_dir
                 if tmpl_path.exists():
                     cmd.extend(["-t", str(tmpl_path)])
 
-        # Tag filters
+        # Tag filters — always include cve + vulnerabilities so tech filtering
+        # doesn't miss security issues. Tech-specific tags add on top.
+        final_tags = list(tags)
         if tags:
-            cmd.extend(["-tags", ",".join(tags)])
+            for required in ("cve", "vulnerabilities"):
+                if required not in final_tags:
+                    final_tags.append(required)
+        if final_tags:
+            cmd.extend(["-tags", ",".join(final_tags)])
         if exclude_tags:
             cmd.extend(["-etags", ",".join(exclude_tags)])
 
@@ -403,7 +448,7 @@ class NucleiWorker(BaseWorker):
 
             stmt = pg_insert(Finding.__table__).values(**values, first_seen=now)
             stmt = stmt.on_conflict_do_update(
-                constraint="uq_finding_fingerprint_org",
+                index_elements=["fingerprint", "org_id"],
                 set_={"last_seen": now, "status": "open"},
             ).returning(Finding.__table__.c.id, Finding.__table__.c.first_seen)
 
@@ -442,6 +487,22 @@ class NucleiWorker(BaseWorker):
         )
         return result.scalar_one_or_none()
 
+    async def _update_nuclei_progress(self, scan_id: str, coord) -> None:
+        """Update progress from 75 toward 99 based on nuclei_done / nuclei_expected."""
+        r = await coord._get_redis()
+        expected = int(await r.get(f"scan:{scan_id}:nuclei_expected") or 1)
+        done = int(await r.get(f"scan:{scan_id}:nuclei_done") or 0)
+        pct = min(75 + int((done / expected) * 24), 99)
+        async with get_session() as db:
+            from sqlalchemy import update, func
+            from workers.db_models import Scan
+            await db.execute(
+                update(Scan).where(Scan.id == scan_id).values(
+                    progress_pct=func.greatest(Scan.progress_pct, pct),
+                )
+            )
+            await db.commit()
+
     async def _update_scan_findings_count(self, db, scan_id: str, count: int) -> None:
         from sqlalchemy import update, func
         from workers.db_models import Scan
@@ -459,6 +520,14 @@ class NucleiWorker(BaseWorker):
         queue = QueueClient()
         await queue.connect()
 
+        coord = TaskCoordinator()
+        await coord.incr_nuclei_done(scan_id)
+
+        # Update progress proportionally so the bar keeps moving
+        # even after screenshot set it to 90%.
+        # Range: 75 → 99 (terminal will set 100).
+        await self._update_nuclei_progress(scan_id, coord)
+
         # Intermediate correlation (dedup, relationships, indexing)
         await queue.publish(
             routing_key="correlation.process",
@@ -469,12 +538,9 @@ class NucleiWorker(BaseWorker):
             },
         )
 
-        # Check if all work for this scan is done. Only the last
-        # worker to finish sends the terminal message that triggers
-        # scan completion, risk engine, and notifications.
-        coord = TaskCoordinator()
-        await coord.incr_nuclei_done(scan_id)
-        if await coord.is_all_done(scan_id):
+        # Atomic terminal claim — only one worker (nuclei or screenshot)
+        # will get `True` and send the terminal message.
+        if await coord.mark_terminal_if_all_done(scan_id):
             await queue.publish(
                 routing_key="correlation.process",
                 message={
@@ -485,8 +551,8 @@ class NucleiWorker(BaseWorker):
                 },
             )
             await coord.cleanup(scan_id)
-        await coord.close()
 
+        await coord.close()
         await queue.close()
 
 

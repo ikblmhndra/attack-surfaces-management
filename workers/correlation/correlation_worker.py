@@ -285,33 +285,34 @@ class CorrelationWorker(BaseWorker):
         previous_scan = scans[1]
 
         # Get asset sets for each scan
-        # Current: assets seen in last 24h
-        from datetime import timedelta
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+        # Use the previous scan's started_at as the boundary so comparison
+        # aligns with actual scan rounds rather than an arbitrary 24h window.
+        prev_scan_start = previous_scan.started_at
+        if prev_scan_start is None:
+            return changes
 
         current_assets = set(
             row[0] for row in (await db.execute(
                 select(Asset.value).where(
                     Asset.org_id == org_id,
-                    Asset.last_seen >= cutoff,
+                    Asset.last_seen >= prev_scan_start,
                     Asset.deleted_at.is_(None),
                 )
             )).all()
         )
 
-        # Previous: assets seen before current scan
-        prev_cutoff = previous_scan.started_at or (cutoff - timedelta(hours=24))
+        # Assets that existed and were active before the previous scan started
         previous_assets = set(
             row[0] for row in (await db.execute(
                 select(Asset.value).where(
                     Asset.org_id == org_id,
-                    Asset.first_seen < cutoff,
+                    Asset.first_seen < prev_scan_start,
                     Asset.deleted_at.is_(None),
                 )
             )).all()
         )
 
-        # New assets
+        # New assets (first seen during or after the previous scan)
         new_assets = current_assets - previous_assets
         for value in new_assets:
             changes.append({

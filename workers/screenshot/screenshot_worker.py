@@ -133,13 +133,25 @@ class ScreenshotWorker(BaseWorker):
         async with get_session() as db:
             await self._update_scan_progress(db, scan_id)
 
-        # Flag screenshot as done. If all nuclei batches have also finished,
-        # send the terminal correlation message that triggers scan completion.
+        # Flag screenshot as done. Atomically claim terminal slot —
+        # only one worker (screenshot or nuclei) will send the terminal
+        # correlation message.
         from workers.task_coordinator import TaskCoordinator
         coord = TaskCoordinator()
         await coord.set_screenshot_done(scan_id)
-        if await coord.is_all_done(scan_id):
-            await self._queue_terminal_correlation(scan_id, org_id, workspace_id)
+        if await coord.mark_terminal_if_all_done(scan_id):
+            queue = QueueClient()
+            await queue.connect()
+            await queue.publish(
+                routing_key="correlation.process",
+                message={
+                    "scan_id": scan_id,
+                    "org_id": org_id,
+                    "workspace_id": workspace_id,
+                    "is_terminal": True,
+                },
+            )
+            await queue.close()
             await coord.cleanup(scan_id)
         await coord.close()
 
@@ -388,21 +400,6 @@ class ScreenshotWorker(BaseWorker):
             )
         )
         await db.commit()
-
-    async def _queue_terminal_correlation(self, scan_id: str, org_id: str, workspace_id: str) -> None:
-        queue = QueueClient()
-        await queue.connect()
-        await queue.publish(
-            routing_key="correlation.process",
-            message={
-                "scan_id": scan_id,
-                "org_id": org_id,
-                "workspace_id": workspace_id,
-                "is_terminal": True,
-            },
-        )
-        await queue.close()
-
 
 if __name__ == "__main__":
     worker = ScreenshotWorker()

@@ -5,11 +5,12 @@ import { useParams, useRouter } from "next/navigation";
 import {
   Building2, ArrowLeft, RefreshCw, Scan, Edit, AlertTriangle,
   Layers, Globe, Clock, Activity, TrendingUp, TrendingDown,
-  ChevronRight
+  ChevronRight, X, Save, Loader2
 } from "lucide-react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { formatDistanceToNow } from "date-fns";
-import { motion } from "framer-motion";
+import { motion, AnimatePresence } from "framer-motion";
+import { toast } from "sonner";
 import Link from "next/link";
 import {
   AreaChart, Area, ResponsiveContainer, XAxis, YAxis,
@@ -21,6 +22,7 @@ import {
   SeverityBadge, GradeRing, StatusBadge
 } from "@/components/ui/SeverityBadge";
 import { cn, formatNumber } from "@/lib/utils";
+import { ScanModal } from "@/components/modals/ScanModal";
 
 export default function OrganizationDetailPage() {
   const params = useParams();
@@ -30,6 +32,36 @@ export default function OrganizationDetailPage() {
   const orgId = params.id as string;
 
   const [editing, setEditing] = useState(false);
+  const [showScanModal, setShowScanModal] = useState(false);
+  const [editForm, setEditForm] = useState({
+    name: "", description: "", domains: "", ip_ranges: "", asns: "",
+    company_name: "", industry: "", criticality: 3, environment: "production",
+  });
+
+  const updateOrg = useMutation({
+    mutationFn: (data: any) => apiClient.put(`/organizations/${orgId}`, data),
+    onSuccess: () => {
+      toast.success("Organization updated");
+      qc.invalidateQueries({ queryKey: ["organization", orgId] });
+      setEditing(false);
+    },
+    onError: (err: any) => toast.error(err?.response?.data?.detail || "Failed to update"),
+  });
+
+  const openEditor = () => {
+    setEditForm({
+      name: org?.name || "",
+      description: org?.description || "",
+      domains: (org?.domains || []).join("\n"),
+      ip_ranges: (org?.ip_ranges || []).join("\n"),
+      asns: (org?.asns || []).join("\n"),
+      company_name: org?.company_name || "",
+      industry: org?.industry || "",
+      criticality: org?.criticality || 3,
+      environment: org?.environment || "production",
+    });
+    setEditing(true);
+  };
 
   const { data: org, isLoading } = useQuery({
     queryKey: ["organization", orgId],
@@ -57,13 +89,6 @@ export default function OrganizationDetailPage() {
     refetchInterval: 15_000,
   });
 
-  const triggerScan = useMutation({
-    mutationFn: () => apiClient.post(`/organizations/${orgId}/scans`, { scan_type: "full" }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["org-scans"] });
-    },
-  });
-
   const riskScore = org?.risk_score;
   const scoreTrend = scoreHistory?.history || [];
   const timelineEvents = timeline?.events || [];
@@ -85,6 +110,7 @@ export default function OrganizationDetailPage() {
   }
 
   return (
+    <>
     <div className="p-6 space-y-6">
       {/* Header */}
       <div className="flex items-start justify-between">
@@ -118,15 +144,14 @@ export default function OrganizationDetailPage() {
           {canWrite() && (
             <>
               <button
-                onClick={() => triggerScan.mutate()}
-                disabled={triggerScan.isPending}
-                className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg bg-brand-600 hover:bg-brand-500 text-white font-medium transition-colors disabled:opacity-50"
+                onClick={() => setShowScanModal(true)}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg bg-brand-600 hover:bg-brand-500 text-white font-medium transition-colors"
               >
                 <Scan className="w-3.5 h-3.5" />
                 Run Scan
               </button>
               <button
-                onClick={() => setEditing(!editing)}
+                onClick={openEditor}
                 className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg bg-surface-700 hover:bg-surface-600 border border-surface-600 text-foreground"
               >
                 <Edit className="w-3.5 h-3.5" />
@@ -316,5 +341,147 @@ export default function OrganizationDetailPage() {
         </div>
       </div>
     </div>
+
+    {showScanModal && (
+      <ScanModal orgId={orgId} onClose={() => setShowScanModal(false)} />
+    )}
+
+    <AnimatePresence>
+      {editing && (
+        <>
+          <motion.div
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50"
+            onClick={() => setEditing(false)}
+          />
+          <motion.div
+            initial={{ opacity: 0, scale: 0.96, y: 8 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.96, y: 8 }}
+            className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          >
+            <div className="w-full max-w-lg bg-surface-900 border border-border rounded-2xl shadow-2xl overflow-hidden">
+              <div className="flex items-center justify-between p-5 border-b border-border">
+                <div className="flex items-center gap-3">
+                  <div className="w-9 h-9 rounded-xl bg-brand-500/10 flex items-center justify-center">
+                    <Edit className="w-4.5 h-4.5 text-brand-400" />
+                  </div>
+                  <h2 className="text-sm font-semibold text-foreground">Edit Organization</h2>
+                </div>
+                <button onClick={() => setEditing(false)} className="w-8 h-8 flex items-center justify-center rounded-lg hover:bg-surface-700 text-muted-foreground">
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <form
+                onSubmit={(e) => { e.preventDefault(); updateOrg.mutate({
+                  name: editForm.name,
+                  description: editForm.description || null,
+                  domains: editForm.domains.split("\n").map(s => s.trim()).filter(Boolean),
+                  ip_ranges: editForm.ip_ranges.split("\n").map(s => s.trim()).filter(Boolean),
+                  asns: editForm.asns.split("\n").map(s => s.trim()).filter(Boolean),
+                  company_name: editForm.company_name || null,
+                  industry: editForm.industry || null,
+                  criticality: editForm.criticality,
+                  environment: editForm.environment,
+                })}}
+                className="p-5 space-y-4 max-h-[60vh] overflow-y-auto"
+              >
+                <div>
+                  <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1.5 block">Name</label>
+                  <input
+                    value={editForm.name} onChange={(e) => setEditForm(f => ({...f, name: e.target.value}))}
+                    className="w-full bg-surface-800 border border-surface-700 rounded-lg px-3 py-2 text-sm text-foreground focus:outline-none focus:border-brand-500/50"
+                    required
+                  />
+                </div>
+                <div>
+                  <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1.5 block">Description</label>
+                  <input
+                    value={editForm.description} onChange={(e) => setEditForm(f => ({...f, description: e.target.value}))}
+                    className="w-full bg-surface-800 border border-surface-700 rounded-lg px-3 py-2 text-sm text-foreground focus:outline-none focus:border-brand-500/50"
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1.5 block">Company</label>
+                    <input
+                      value={editForm.company_name} onChange={(e) => setEditForm(f => ({...f, company_name: e.target.value}))}
+                      className="w-full bg-surface-800 border border-surface-700 rounded-lg px-3 py-2 text-sm text-foreground focus:outline-none focus:border-brand-500/50"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1.5 block">Industry</label>
+                    <input
+                      value={editForm.industry} onChange={(e) => setEditForm(f => ({...f, industry: e.target.value}))}
+                      className="w-full bg-surface-800 border border-surface-700 rounded-lg px-3 py-2 text-sm text-foreground focus:outline-none focus:border-brand-500/50"
+                    />
+                  </div>
+                </div>
+                <div>
+                  <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1.5 block">Domains (one per line)</label>
+                  <textarea
+                    value={editForm.domains} onChange={(e) => setEditForm(f => ({...f, domains: e.target.value}))}
+                    rows={3}
+                    className="w-full bg-surface-800 border border-surface-700 rounded-lg px-3 py-2 text-sm text-foreground font-mono focus:outline-none focus:border-brand-500/50 resize-none"
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1.5 block">IP Ranges</label>
+                    <textarea
+                      value={editForm.ip_ranges} onChange={(e) => setEditForm(f => ({...f, ip_ranges: e.target.value}))}
+                      rows={2}
+                      className="w-full bg-surface-800 border border-surface-700 rounded-lg px-3 py-2 text-sm text-foreground font-mono focus:outline-none focus:border-brand-500/50 resize-none"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1.5 block">ASNs</label>
+                    <textarea
+                      value={editForm.asns} onChange={(e) => setEditForm(f => ({...f, asns: e.target.value}))}
+                      rows={2}
+                      className="w-full bg-surface-800 border border-surface-700 rounded-lg px-3 py-2 text-sm text-foreground font-mono focus:outline-none focus:border-brand-500/50 resize-none"
+                    />
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1.5 block">Criticality (1-5)</label>
+                    <select
+                      value={editForm.criticality} onChange={(e) => setEditForm(f => ({...f, criticality: parseInt(e.target.value)}))}
+                      className="w-full bg-surface-800 border border-surface-700 rounded-lg px-3 py-2 text-sm text-foreground focus:outline-none focus:border-brand-500/50"
+                    >
+                      {[1,2,3,4,5].map(v => <option key={v} value={v}>{v}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1.5 block">Environment</label>
+                    <select
+                      value={editForm.environment} onChange={(e) => setEditForm(f => ({...f, environment: e.target.value}))}
+                      className="w-full bg-surface-800 border border-surface-700 rounded-lg px-3 py-2 text-sm text-foreground focus:outline-none focus:border-brand-500/50"
+                    >
+                      {["production", "staging", "development", "testing"].map(v => <option key={v} value={v}>{v}</option>)}
+                    </select>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-3 pt-2">
+                  <button type="button" onClick={() => setEditing(false)}
+                    className="flex-1 px-3 py-2 rounded-lg bg-surface-700 hover:bg-surface-600 border border-surface-600 text-foreground text-sm font-medium transition-colors"
+                  >Cancel</button>
+                  <button type="submit" disabled={updateOrg.isPending}
+                    className="flex-1 px-3 py-2 rounded-lg bg-brand-600 hover:bg-brand-500 text-white text-sm font-medium transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
+                  >
+                    {updateOrg.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+                    {updateOrg.isPending ? "Saving..." : "Save Changes"}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </motion.div>
+        </>
+      )}
+    </AnimatePresence>
+    </>
   );
 }

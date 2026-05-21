@@ -3,3 +3,4 @@
 /.github
 /AGENTS.md
 infrastructure/nginx/ssl/*
+opencode.json

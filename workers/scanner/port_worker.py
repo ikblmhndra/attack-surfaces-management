@@ -16,7 +16,6 @@ import structlog
 
 from workers.base_worker import BaseWorker
 from workers.db import get_session
-from workers.queue_client import QueueClient
 
 log = structlog.get_logger()
 
@@ -49,9 +48,6 @@ class PortWorker(BaseWorker):
             if results:
                 async with get_session() as db:
                     await self._persist_results(db, org_id, workspace_id, scan_id, results)
-
-            # Queue nuclei scan for discovered services
-            await self._queue_nuclei(scan_id, org_id, workspace_id, ips, config)
 
         async with get_session() as db:
             await self._update_scan_progress(db, scan_id)
@@ -157,47 +153,22 @@ class PortWorker(BaseWorker):
             # Insert ports
             for port_data in ports:
                 port_values = {
-                    "asset_id": asset_id,
-                    "org_id": org_id,
-                    "port": port_data["port"],
+                    "ip_id": asset_id,
+                    "port_number": port_data["port"],
                     "protocol": port_data.get("protocol", "tcp"),
-                    "service": port_data.get("service", ""),
+                    "service_name": port_data.get("service", ""),
                     "state": "open",
                     "last_seen": now,
                 }
                 stmt = pg_insert(Port.__table__).values(**port_values)
                 stmt = stmt.on_conflict_do_update(
-                    constraint="uq_port_asset_port_protocol",
+                    index_elements=["ip_id", "port_number", "protocol"],
                     set_={"last_seen": now, "state": "open"},
                 )
                 await db.execute(stmt)
 
         await db.commit()
         log.info("ports_persisted", org_id=org_id, total_ports=sum(len(p) for p in results.values()))
-
-    async def _queue_nuclei(
-        self, scan_id: str, org_id: str, workspace_id: str, ips: List[str], config: Dict
-    ) -> None:
-        from workers.task_coordinator import TaskCoordinator
-        queue = QueueClient()
-        await queue.connect()
-        coord = TaskCoordinator()
-        for i in range(0, len(ips), 50):
-            batch = ips[i:i + 50]
-            await queue.publish(
-                routing_key="scan.nuclei",
-                message={
-                    "scan_id": scan_id,
-                    "org_id": org_id,
-                    "workspace_id": workspace_id,
-                    "targets": [f"http://{ip}" for ip in batch],
-                    "config": config,
-                },
-            )
-            await coord.add_nuclei_expected(scan_id)
-        await queue.close()
-        await coord.close()
-
 
     async def _update_scan_progress(self, db, scan_id: str) -> None:
         from sqlalchemy import update, func

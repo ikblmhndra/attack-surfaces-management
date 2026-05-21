@@ -171,6 +171,7 @@ class ScanScheduler:
                         "config": {
                             "scan_type": "full",
                             "severities": ["critical", "high", "medium", "low"],
+                            "modules": ["discovery", "port", "nuclei", "screenshot"],
                             "use_amass": False,
                             "ports": "top-1000",
                         },
@@ -205,9 +206,7 @@ class ScanScheduler:
                         "config": {
                             "scan_type": "quick",
                             "severities": ["critical", "high"],
-                            "modules": ["dns", "http", "tls"],
-                            "skip_port_scan": True,
-                            "skip_nuclei": False,
+                            "modules": ["discovery", "nuclei"],
                         },
                         "triggered_by": "scheduler",
                     },
@@ -462,6 +461,19 @@ class ScanScheduler:
 
         scan_id = str(uuid.uuid4())
 
+        # Estimate total tasks for progress tracking
+        if scan_type == "quick":
+            modules = ["discovery", "nuclei"]
+        else:
+            modules = ["discovery", "port", "nuclei", "screenshot"]
+        total_tasks = 1  # discovery
+        if "port" in modules:
+            total_tasks += 1
+        if "nuclei" in modules:
+            total_tasks += 1
+        if "screenshot" in modules:
+            total_tasks += 1
+
         async with get_session() as db:
             from sqlalchemy.dialects.postgresql import insert as pg_insert
             await db.execute(
@@ -471,7 +483,8 @@ class ScanScheduler:
                     workspace_id=workspace_id,
                     scan_type=scan_type,
                     status="pending",
-                    modules=["discovery", "probe", "nuclei"],
+                    total_tasks=total_tasks,
+                    modules=modules,
                     config={"triggered_by": "scheduler"},
                 )
             )

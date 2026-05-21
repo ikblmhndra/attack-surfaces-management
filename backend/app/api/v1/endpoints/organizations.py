@@ -17,7 +17,7 @@ from app.api.v1.dependencies.auth import (
     get_db,
     get_workspace_id,
 )
-from app.db.models.models import Asset, Finding, Organization, RiskScore, Scan, User
+from app.db.models.models import Asset, Finding, Organization, RiskScore, Scan, ScanTemplate, User
 from app.services.audit_service import audit_log
 from app.services.scan_service import ScanService
 
@@ -63,6 +63,7 @@ class ScanRequest(BaseModel):
     scan_type: str = Field(default="full")  # full, discovery, vuln, quick
     modules: List[str] = Field(default_factory=list)
     config: dict = Field(default_factory=dict)
+    template_id: Optional[str] = None  # Optional scan template reference
 
 
 class OrgResponse(BaseModel):
@@ -408,14 +409,35 @@ async def trigger_scan(
             detail="Maximum concurrent scans (3) reached. Please wait for active scans to complete.",
         )
 
+    # Resolve template if provided
+    modules = request.modules
+    config = request.config
+    scan_type = request.scan_type
+    if request.template_id:
+        result = await db.execute(
+            select(ScanTemplate).where(
+                ScanTemplate.id == request.template_id,
+                ScanTemplate.workspace_id == workspace_id,
+                ScanTemplate.is_active == True,
+            )
+        )
+        tmpl = result.scalar_one_or_none()
+        if tmpl:
+            if not modules:
+                modules = tmpl.modules
+            config = {**tmpl.config, **config}
+            config["severities"] = config.get("severities", tmpl.severities)
+            config["template_name"] = tmpl.name
+            scan_type = tmpl.scan_type
+
     scan_service = ScanService(db)
     scan = await scan_service.create_and_queue(
         org_id=org_id,
         workspace_id=workspace_id,
         created_by=current_user.id,
-        scan_type=request.scan_type,
-        modules=request.modules,
-        config=request.config,
+        scan_type=scan_type,
+        modules=modules,
+        config=config,
         org=org,
     )
 

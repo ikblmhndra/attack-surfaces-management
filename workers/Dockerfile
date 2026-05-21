@@ -24,6 +24,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxtst6 \
     && rm -rf /var/lib/apt/lists/*
 
+# ── Nikto (web server scanner) ────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    perl \
+    libnet-ssleay-perl \
+    libwww-perl \
+    libjson-perl \
+    libxml-writer-perl \
+    && rm -rf /var/lib/apt/lists/* \
+    && git clone --depth 1 https://github.com/sullo/nikto.git /opt/nikto \
+    && chmod +x /opt/nikto/program/nikto.pl \
+    && ln -s /opt/nikto/program/nikto.pl /usr/local/bin/nikto
+ENV NIKTO_PATH=/opt/nikto
+
 # ── Go-based security tools ────────────────────────────────────
 ENV GOPATH=/go
 ENV PATH=/go/bin:/usr/local/go/bin:$PATH

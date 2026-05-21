@@ -16,9 +16,9 @@ from app.core.config import settings
 log = structlog.get_logger()
 
 DEFAULT_MODULES = {
-    "full":      ["discovery", "dns", "probe", "port", "nuclei", "screenshot", "enrich"],
-    "quick":     ["dns", "probe", "nuclei"],
-    "discovery": ["discovery", "dns", "probe"],
+    "full":      ["discovery", "port", "nuclei", "screenshot"],
+    "quick":     ["discovery", "nuclei"],
+    "discovery": ["discovery"],
     "vuln":      ["nuclei"],
 }
 

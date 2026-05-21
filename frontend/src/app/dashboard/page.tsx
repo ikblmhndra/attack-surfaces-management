@@ -50,10 +50,14 @@ export default function DashboardPage() {
   const [showScanModal, setShowScanModal] = useState(false);
   const [scanOrgId, setScanOrgId] = useState("");
   const [scanType, setScanType] = useState("full");
+  const [vulnDepth, setVulnDepth] = useState("default");
 
   const triggerScan = useMutation({
-    mutationFn: (data: { org_id: string; scan_type: string }) =>
-      apiClient.post(`/organizations/${data.org_id}/scans`, { scan_type: data.scan_type }),
+    mutationFn: (data: { org_id: string; scan_type: string; vuln_depth?: string }) =>
+      apiClient.post(`/organizations/${data.org_id}/scans`, {
+        scan_type: data.scan_type,
+        config: { vuln_depth: data.vuln_depth || "default" },
+      }),
     onSuccess: () => {
       setShowScanModal(false);
       queryClient.invalidateQueries({ queryKey: ["recent-scans"] });
@@ -659,6 +663,21 @@ export default function DashboardPage() {
                   ))}
                 </div>
               </div>
+
+              {(scanType === "full" || scanType === "vuln") && (
+                <div>
+                  <label className="block text-xs text-muted-foreground mb-1">Vulnerability Depth</label>
+                  <select
+                    value={vulnDepth}
+                    onChange={e => setVulnDepth(e.target.value)}
+                    className="w-full px-3 py-2 bg-surface-900 border border-border rounded-lg text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-brand-500"
+                  >
+                    <option value="critical">Critical only — fastest (CVEs high/critical)</option>
+                    <option value="default">Default — balanced (CVEs, misconfigs, exposures)</option>
+                    <option value="full">Full — thorough (all templates)</option>
+                  </select>
+                </div>
+              )}
             </div>
 
             <div className="flex items-center gap-3 pt-2">
@@ -669,7 +688,7 @@ export default function DashboardPage() {
                 Cancel
               </button>
               <button
-                onClick={() => scanOrgId && triggerScan.mutate({ org_id: scanOrgId, scan_type: scanType })}
+                onClick={() => scanOrgId && triggerScan.mutate({ org_id: scanOrgId, scan_type: scanType, vuln_depth: vulnDepth })}
                 disabled={!scanOrgId || triggerScan.isPending}
                 className="flex-1 px-4 py-2 rounded-lg bg-brand-600 hover:bg-brand-500 text-sm text-white font-medium transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
               >

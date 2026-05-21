@@ -185,6 +185,7 @@ class Organization(TimestampMixin, SoftDeleteMixin, Base):
     scans = relationship("Scan", back_populates="organization")
     risk_scores = relationship("RiskScore", back_populates="organization")
     notifications = relationship("Notification", back_populates="organization")
+    reports = relationship("Report", back_populates="organization")
 
 
 # ============================================================
@@ -698,3 +699,60 @@ class AssetRelationship(TimestampMixin, Base):
         UniqueConstraint("source_asset_id", "target_asset_id", "relationship_type",
                          name="uq_asset_relationship"),
     )
+
+
+# ============================================================
+# SCAN TEMPLATES
+# ============================================================
+
+# ============================================================
+# REPORTS
+# ============================================================
+
+class Report(TimestampMixin, Base):
+    __tablename__ = "reports"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True)
+    workspace_id = Column(UUID(as_uuid=True), nullable=False, index=True)
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+
+    report_type = Column(String(50), nullable=False)  # executive, detailed, csv_export
+    format = Column(String(20), nullable=False, default="json")  # json, csv, pdf
+    status = Column(String(20), nullable=False, default="pending")  # pending, generating, completed, failed
+
+    title = Column(String(500), nullable=False)
+    summary = Column(Text, nullable=True)
+    data = Column(JSONB, nullable=True)  # Full report data snapshot
+    file_path = Column(String(500), nullable=True)  # Path to generated file (for PDF)
+
+    stats = Column(JSONB, nullable=False, default=dict)  # total_assets, total_findings, critical_count, etc.
+    date_range_start = Column(DateTime(timezone=True), nullable=True)
+    date_range_end = Column(DateTime(timezone=True), nullable=True)
+    generated_at = Column(DateTime(timezone=True), nullable=True)
+    error_message = Column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("ix_report_org_generated", "org_id", "generated_at"),
+    )
+
+    # Relationships
+    organization = relationship("Organization", back_populates="reports")
+
+
+class ScanTemplate(TimestampMixin, Base):
+    __tablename__ = "scan_templates"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id = Column(UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+
+    name = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    scan_type = Column(String(50), nullable=False, default="full")
+    modules = Column(ARRAY(String), nullable=False, default=list)
+    config = Column(JSONB, nullable=False, default=dict)
+    severities = Column(ARRAY(String), nullable=False, default=["critical", "high", "medium", "low"])
+    tags = Column(ARRAY(String), nullable=False, default=list)
+    is_active = Column(Boolean, nullable=False, default=True)
+    is_default = Column(Boolean, nullable=False, default=False)

@@ -147,16 +147,6 @@ services:
     cap_add:
       - NET_RAW
 
-  worker-probe:
-    <<: *worker-base
-    command: python -m workers.scanner.probe_worker
-    environment:
-      <<: *common-env
-      WORKER_TYPE: probe
-      WORKER_CONCURRENCY: ${PROBE_CONCURRENCY:-5}
-    cap_add:
-      - NET_RAW
-
   worker-port:
     <<: *worker-base
     command: python -m workers.scanner.port_worker

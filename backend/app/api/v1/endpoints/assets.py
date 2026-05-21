@@ -543,6 +543,44 @@ def _finding_summary(f) -> dict:
     }
 
 
+# ── Export ──────────────────────────────────────────────────
+
+@router.get("/export")
+async def export_assets(
+    org_id: Optional[UUID] = Query(None),
+    asset_type: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    format: str = Query("csv", regex="^(csv|json)$"),
+    workspace_id: UUID = Depends(get_workspace_id),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    from fastapi.responses import StreamingResponse
+    import csv, io
+
+    query = select(Asset).where(Asset.workspace_id == workspace_id)
+    if org_id: query = query.where(Asset.org_id == org_id)
+    if asset_type: query = query.where(Asset.asset_type == asset_type)
+    if status: query = query.where(Asset.status == status)
+    assets = (await db.execute(query.order_by(Asset.last_seen.desc()).limit(10000))).scalars().all()
+
+    if format == "json":
+        return [{
+            "id": str(a.id), "org_id": str(a.org_id), "asset_type": a.asset_type,
+            "value": a.value, "status": a.status, "tags": a.tags or [],
+            "criticality": a.criticality, "discovery_method": a.discovery_method,
+            "first_seen": a.first_seen.isoformat(), "last_seen": a.last_seen.isoformat(),
+        } for a in assets]
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["id", "org_id", "asset_type", "value", "status", "tags", "criticality", "discovery_method", "first_seen", "last_seen"])
+    for a in assets:
+        writer.writerow([str(a.id), str(a.org_id), a.asset_type, a.value, a.status, ";".join(a.tags or []), a.criticality, a.discovery_method, a.first_seen.isoformat(), a.last_seen.isoformat()])
+    output.seek(0)
+    return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=assets.csv"})
+
+
 def _intel_to_dict(ti) -> dict:
     return {
         "id": str(ti.id),

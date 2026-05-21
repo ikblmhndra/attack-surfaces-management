@@ -20,6 +20,7 @@ from app.api.v1.endpoints import (
     websocket,
     intel,
     screenshots,
+    templates,
 )
 
 api_router = APIRouter()
@@ -39,3 +40,4 @@ api_router.include_router(admin.router,         prefix="/admin",         tags=["
 api_router.include_router(keys.router,          prefix="/keys",          tags=["API Keys"])
 api_router.include_router(screenshots.router,   prefix="/screenshots",   tags=["Screenshots"])
 api_router.include_router(websocket.router,     prefix="/ws",            tags=["WebSocket"])
+api_router.include_router(templates.router,    prefix="/templates",     tags=["Scan Templates"])

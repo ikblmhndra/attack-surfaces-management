@@ -36,7 +36,7 @@ scrape_configs:
     static_configs:
       - targets:
           - "worker-discovery:8001"
-          - "worker-probe:8001"
+
           - "worker-nuclei:8001"
           - "worker-screenshot:8001"
           - "worker-correlation:8001"

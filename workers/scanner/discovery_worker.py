@@ -1,7 +1,7 @@
 """
 ASM Platform — Discovery Worker
-Runs subdomain discovery, DNS enumeration, and HTTP probing.
-Integrates: subfinder, amass, assetfinder, dnsx, httpx, naabu
+Runs subdomain discovery, DNS enumeration, HTTP probing, endpoint crawling, and fuzzing.
+Integrates: subfinder, amass, assetfinder, dnsx, httpx, naabu, katana, ffuf
 """
 import asyncio
 import hashlib
@@ -55,11 +55,29 @@ class DiscoveryWorker(BaseWorker):
         workspace_id = message["workspace_id"]
         targets = message["targets"]  # domains, IPs, CIDRs
         config = message.get("config", {})
+        modules = config.get("modules", [])
 
         log.info("discovery_started", scan_id=scan_id, org_id=org_id, targets=targets)
 
         async with get_session() as db:
             await self._update_scan_status(db, scan_id, "running")
+
+        # For targeted scans (e.g. vuln-only), skip discovery phase and
+        # queue downstream tasks directly with the input targets.
+        if "discovery" not in modules and "probe" not in modules:
+            had_work = await self._queue_downstream(
+                scan_id=scan_id,
+                org_id=org_id,
+                workspace_id=workspace_id,
+                subdomains=[],
+                ips=[],
+                config=config,
+                direct_targets=targets.get("domains", []),
+            )
+            if not had_work:
+                await self._finalize_if_no_work(scan_id, org_id, workspace_id)
+            log.info("discovery_skipped", scan_id=scan_id, modules=modules)
+            return
 
         with tempfile.TemporaryDirectory(prefix="asm-discovery-") as tmpdir:
             tmpdir = Path(tmpdir)
@@ -94,14 +112,18 @@ class DiscoveryWorker(BaseWorker):
                 all_ips.update(dns_data.get("a", []))
                 all_ips.update(dns_data.get("aaaa", []))
 
-            await self._queue_downstream(
+            had_work = await self._queue_downstream(
                 scan_id=scan_id,
                 org_id=org_id,
                 workspace_id=workspace_id,
                 subdomains=list(all_subdomains),
                 ips=list(all_ips),
+                alive_hosts=alive_hosts,
+                tmpdir=tmpdir,
                 config=config,
             )
+            if not had_work:
+                await self._finalize_if_no_work(scan_id, org_id, workspace_id)
 
         log.info("discovery_completed", scan_id=scan_id, subdomains=len(all_subdomains))
 
@@ -359,6 +381,148 @@ class DiscoveryWorker(BaseWorker):
 
         return resolved
 
+    # ── Endpoint Crawling (Katana) ────────────────────────────
+
+    async def _crawl_endpoints(
+        self,
+        urls: List[str],
+        tmpdir: Path,
+        config: Dict,
+    ) -> Set[str]:
+        """Run katana to crawl alive URLs and discover hidden endpoints, JS paths, API routes."""
+        if not urls or not tool_available("katana"):
+            return set()
+
+        input_file = tmpdir / "katana_targets.txt"
+        input_file.write_text("\n".join(urls))
+        output_file = tmpdir / "katana_output.txt"
+
+        depth = config.get("crawl_depth", 1)
+        rate_limit = config.get("crawl_rate", 50)
+
+        cmd = [
+            "katana",
+            "-list", str(input_file),
+            "-o", str(output_file),
+            "-silent",
+            "-depth", str(depth),
+            "-rate-limit", str(rate_limit),
+            "-timeout", "10",
+            "-retries", "1",
+            "-concurrency", "10",
+            "-disable-update-check",
+            "-jc",  # Extract JS endpoints
+        ]
+
+        log.info("katana_crawl_started", urls=len(urls), depth=depth)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=120)
+        except asyncio.TimeoutError:
+            log.warning("katana_timeout")
+            return set()
+        except Exception as e:
+            log.error("katana_error", error=str(e))
+            return set()
+
+        discovered = set()
+        if output_file.exists():
+            for line in output_file.read_text().splitlines():
+                line = line.strip()
+                if line and line.startswith("http"):
+                    discovered.add(line)
+
+        log.info("katana_crawl_completed", discovered=len(discovered))
+        return discovered
+
+    # ── Directory/Endpoint Fuzzing (FFUF) ─────────────────────
+
+    async def _fuzz_endpoints(
+        self,
+        urls: List[str],
+        tmpdir: Path,
+        config: Dict,
+    ) -> Set[str]:
+        """Fuzz discovered URLs with ffuf to find hidden endpoints, backups, admin panels."""
+        if not urls or not tool_available("ffuf"):
+            return set()
+
+        discovered = set()
+        wordlist = config.get("fuzz_wordlist", "")
+        for candidate in [wordlist, "/usr/share/wordlists/dirb/common.txt", "/usr/share/seclists/Discovery/Web-Content/common.txt"]:
+            if candidate and os.path.exists(candidate):
+                wordlist = candidate
+                break
+        else:
+            fallback = tmpdir / "fuzz_words.txt"
+            fallback.write_text("\n".join([
+                "admin", "login", "dashboard", "api", "v1", "v2", "graphql",
+                "backup", ".git", ".env", "config", "wp-admin", "wp-content",
+                "uploads", "files", "assets", "static", "status", "health",
+                ".well-known", "sitemap.xml", "robots.txt", "swagger",
+                "api-docs", "openapi.json", "jenkins", ".aws", ".azure",
+            ]))
+            wordlist = str(fallback)
+
+        input_file = tmpdir / "fuzz_targets.txt"
+        input_file.write_text("\n".join(urls))
+        output_file = tmpdir / "ffuf_output.json"
+
+        rate = config.get("fuzz_rate", 50)
+        timeout = config.get("fuzz_timeout", 10)
+
+        for url in urls[:50]:  # Limit to 50 URLs max to avoid runaway
+            parsed = url.rstrip("/")
+            out = tmpdir / f"ffuf_{hash(parsed)}.json"
+
+            cmd = [
+                "ffuf",
+                "-u", f"{parsed}/FUZZ",
+                "-w", wordlist,
+                "-o", str(out),
+                "-of", "json",
+                "-fc", "404,301,302,307",  # Filter out common non-interesting
+                "-fs", "0",                 # Filter out zero-length
+                "-t", "20",
+                "-rate", str(rate),
+                "-timeout", str(timeout),
+                "-max-time", "120",
+                "-noninteractive",
+                "-ac",  # Auto-calibrate filtering
+            ]
+
+            log.info("ffuf_fuzz_started", url=parsed)
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=180)
+            except asyncio.TimeoutError:
+                log.warning("ffuf_timeout", url=parsed)
+                continue
+            except Exception as e:
+                log.error("ffuf_error", url=parsed, error=str(e))
+                continue
+
+            if out.exists():
+                try:
+                    data = json.loads(out.read_text())
+                    for result in data.get("results", []):
+                        discovered_url = result.get("url", "")
+                        if discovered_url:
+                            discovered.add(discovered_url)
+                except (json.JSONDecodeError, KeyError):
+                    pass
+
+        log.info("ffuf_fuzz_completed", discovered=len(discovered))
+        return discovered
+
     # ── HTTP Probing ──────────────────────────────────────────
 
     async def _probe_http(
@@ -441,71 +605,6 @@ class DiscoveryWorker(BaseWorker):
                     continue
 
         return alive
-
-    # ── Port Scanning ─────────────────────────────────────────
-
-    async def _run_port_scan(
-        self,
-        ips: List[str],
-        tmpdir: Path,
-        config: Dict,
-    ) -> Dict[str, List[Dict]]:
-        """Run naabu for fast port scanning."""
-        if not ips or not tool_available("naabu"):
-            return {}
-
-        input_file = tmpdir / "ips_to_scan.txt"
-        input_file.write_text("\n".join(ips))
-        output_file = tmpdir / "naabu_output.json"
-
-        ports = config.get("ports", "top-100")
-        rate = config.get("rate", 1000)
-
-        cmd = [
-            "naabu",
-            "-l", str(input_file),
-            "-json",
-            "-o", str(output_file),
-            "-silent",
-            f"-p", ports,
-            "-rate", str(rate),
-            "-t", "25",
-            "-timeout", "5",
-            "-retries", "2",
-        ]
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await asyncio.wait_for(proc.communicate(), timeout=600)
-        except asyncio.TimeoutError:
-            log.warning("naabu_timeout")
-            return {}
-        except Exception as e:
-            log.error("naabu_error", error=str(e))
-            return {}
-
-        results: Dict[str, List[Dict]] = {}
-        if output_file.exists():
-            for line in output_file.read_text().splitlines():
-                try:
-                    data = json.loads(line)
-                    ip = data.get("ip", "")
-                    port = data.get("port")
-                    if ip and port:
-                        if ip not in results:
-                            results[ip] = []
-                        results[ip].append({
-                            "port": port,
-                            "protocol": data.get("protocol", "tcp"),
-                        })
-                except json.JSONDecodeError:
-                    continue
-
-        return results
 
     # ── Persistence ───────────────────────────────────────────
 
@@ -611,58 +710,110 @@ class DiscoveryWorker(BaseWorker):
         subdomains: List[str],
         ips: List[str],
         config: Dict,
+        direct_targets: Optional[List[str]] = None,
+        alive_hosts: Optional[Dict[str, Dict]] = None,
+        tmpdir: Optional[Path] = None,
     ) -> None:
         """Publish port scan and nuclei tasks for discovered assets."""
         from workers.task_coordinator import TaskCoordinator
+        modules = config.get("modules", [])
         queue = QueueClient()
         await queue.connect()
 
         coord = TaskCoordinator()
 
         # Port scan task per IP batch (100 IPs per task)
-        batch_size = 100
-        for i in range(0, len(ips), batch_size):
-            ip_batch = ips[i:i + batch_size]
-            await queue.publish(
-                routing_key="scan.port",
-                message={
-                    "scan_id": scan_id,
-                    "org_id": org_id,
-                    "workspace_id": workspace_id,
-                    "ips": ip_batch,
-                    "config": config,
-                },
-            )
+        if "port" in modules:
+            batch_size = 100
+            for i in range(0, len(ips), batch_size):
+                ip_batch = ips[i:i + batch_size]
+                await queue.publish(
+                    routing_key="scan.port",
+                    message={
+                        "scan_id": scan_id,
+                        "org_id": org_id,
+                        "workspace_id": workspace_id,
+                        "ips": ip_batch,
+                        "config": config,
+                    },
+                )
+
+        # Crawl alive URLs with katana to discover hidden endpoints
+        crawled_urls = set()
+        if alive_hosts and config.get("crawl", True):
+            alive_urls = [info["url"] for info in alive_hosts.values() if info.get("url")]
+            if alive_urls and tmpdir:
+                crawl_tmpdir = tmpdir.parent / f"{tmpdir.name}-katana"
+                crawl_tmpdir.mkdir(exist_ok=True)
+                crawled = await self._crawl_endpoints(alive_urls, crawl_tmpdir, config)
+                crawled_urls.update(crawled)
+
+        # Fuzz URLs with ffuf to discover hidden endpoints (optional, off by default)
+        fuzzed_urls = set()
+        if alive_hosts and config.get("fuzz", False) and tmpdir:
+            alive_urls = [info["url"] for info in alive_hosts.values() if info.get("url")]
+            if alive_urls:
+                fuzz_tmpdir = tmpdir.parent / f"{tmpdir.name}-ffuf"
+                fuzz_tmpdir.mkdir(exist_ok=True)
+                fuzzed = await self._fuzz_endpoints(alive_urls, fuzz_tmpdir, config)
+                fuzzed_urls.update(fuzzed)
+
+        nuclei_queued = False
 
         # Nuclei scan per subdomain batch (50 per task)
-        for i in range(0, len(subdomains), 50):
-            batch = subdomains[i:i + 50]
-            await queue.publish(
-                routing_key="scan.nuclei",
-                message={
+        if "nuclei" in modules:
+            if direct_targets:
+                nuclei_targets = list(direct_targets) + list(crawled_urls) + list(fuzzed_urls)
+                tech_map = {}
+            else:
+                nuclei_targets = list(subdomains) + list(crawled_urls) + list(fuzzed_urls)
+                tech_map = {}
+                if alive_hosts:
+                    for host in list(subdomains):
+                        info = alive_hosts.get(host)
+                        if info and info.get("url"):
+                            tech_map[info["url"]] = info.get("technologies", [])
+
+            for i in range(0, len(nuclei_targets), 50):
+                batch = nuclei_targets[i:i + 50]
+                msg = {
                     "scan_id": scan_id,
                     "org_id": org_id,
                     "workspace_id": workspace_id,
                     "targets": batch,
                     "config": config,
-                },
-            )
-            await coord.add_nuclei_expected(scan_id)
+                }
+                if tech_map:
+                    msg["tech_map"] = tech_map
+                await queue.publish(
+                    routing_key="scan.nuclei",
+                    message=msg,
+                )
+                await coord.add_nuclei_expected(scan_id)
+                nuclei_queued = True
 
         # Screenshot task
-        await queue.publish(
-            routing_key="scan.screenshot",
-            message={
-                "scan_id": scan_id,
-                "org_id": org_id,
-                "workspace_id": workspace_id,
-                "targets": subdomains[:200],  # Limit screenshots
-                "config": config,
-            },
-        )
+        if "screenshot" in modules and subdomains:
+            await queue.publish(
+                routing_key="scan.screenshot",
+                message={
+                    "scan_id": scan_id,
+                    "org_id": org_id,
+                    "workspace_id": workspace_id,
+                    "targets": subdomains[:200],  # Limit screenshots
+                    "config": config,
+                },
+            )
+        elif "screenshot" not in modules:
+            # No screenshot worker in pipeline — mark screenshot as done
+            # so the terminal check (nuclei_done >= expected && screenshot_done == 1)
+            # can pass without waiting for a non-existent worker.
+            await coord.set_screenshot_done(scan_id)
 
         await queue.close()
         await coord.close()
+
+        return nuclei_queued
 
     # ── Utilities ─────────────────────────────────────────────
 
@@ -697,12 +848,15 @@ class DiscoveryWorker(BaseWorker):
     async def _update_scan_status(self, db: AsyncSession, scan_id: str, status: str) -> None:
         from sqlalchemy import update, func
         from workers.db_models import Scan
+        values = {
+            "status": status,
+            "progress_pct": func.greatest(Scan.progress_pct, 10),
+        }
+        # Only set started_at when transitioning to running, never reset to None
+        if status == "running":
+            values["started_at"] = datetime.now(timezone.utc)
         await db.execute(
-            update(Scan).where(Scan.id == scan_id).values(
-                status=status,
-                progress_pct=func.greatest(Scan.progress_pct, 10),
-                started_at=datetime.now(timezone.utc) if status == "running" else None,
-            )
+            update(Scan).where(Scan.id == scan_id).values(**values)
         )
         await db.commit()
 
@@ -722,6 +876,35 @@ class DiscoveryWorker(BaseWorker):
             )
         )
         await db.commit()
+
+    async def _finalize_if_no_work(
+        self,
+        scan_id: str,
+        org_id: str,
+        workspace_id: str,
+    ) -> None:
+        """Called when discovery queued zero downstream tasks — finalize so scan doesn't hang."""
+        from workers.queue_client import QueueClient
+        from workers.task_coordinator import TaskCoordinator
+
+        coord = TaskCoordinator()
+        # Ensure screenshot_done is set so terminal condition can be met
+        await coord.set_screenshot_done(scan_id)
+        if await coord.mark_terminal_if_all_done(scan_id):
+            queue = QueueClient()
+            await queue.connect()
+            await queue.publish(
+                routing_key="correlation.process",
+                message={
+                    "scan_id": scan_id,
+                    "org_id": org_id,
+                    "workspace_id": workspace_id,
+                    "is_terminal": True,
+                },
+            )
+            await queue.close()
+            await coord.cleanup(scan_id)
+        await coord.close()
 
 
 if __name__ == "__main__":
