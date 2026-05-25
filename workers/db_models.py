@@ -25,6 +25,7 @@ from app.db.models.models import (
     RiskScore,
     Scan,
     ScanFinding,
+    OutboxEvent,
     NotificationRule,
     Notification,
     Screenshot,
@@ -35,7 +36,7 @@ from app.db.models.models import (
 __all__ = [
     "Base", "Workspace", "User", "APIKey", "AuditLog",
     "Organization", "Asset", "Subdomain", "IPAddress", "Port",
-    "Technology", "Finding", "RiskScore", "Scan", "ScanFinding",
+    "Technology", "Finding", "RiskScore", "Scan", "ScanFinding", "OutboxEvent",
     "NotificationRule", "Notification", "Screenshot", "ThreatIntel",
     "AssetRelationship",
 ]

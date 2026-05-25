@@ -2,16 +2,14 @@
 ASM Platform — Scan Service
 Creates scan records and publishes tasks to RabbitMQ queue.
 """
-import uuid
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 from uuid import UUID
 
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models.models import Organization, Scan
-from app.core.config import settings
+from app.services.outbox_service import create_queue_event, dispatch_pending_outbox_once
 
 log = structlog.get_logger()
 
@@ -45,23 +43,18 @@ class ScanService:
             workspace_id=workspace_id,
             created_by=created_by,
             scan_type=scan_type,
-            status="pending",
+            status="queued",
             modules=scan_modules,
             config=config,
             total_tasks=len(scan_modules),
         )
         self.db.add(scan)
-        await self.db.commit()
-        await self.db.refresh(scan)
+        await self.db.flush()
 
-        # Publish to queue
-        try:
-            from app.core.queue_client import QueueClient
-            queue = QueueClient()
-            await queue.connect()
-            await queue.publish(
+        self.db.add(
+            create_queue_event(
                 routing_key="scan.discovery",
-                message={
+                payload={
                     "scan_id": str(scan.id),
                     "org_id": str(org_id),
                     "workspace_id": str(workspace_id),
@@ -78,14 +71,13 @@ class ScanService:
                     "triggered_by": "api",
                 },
                 priority=7,
+                aggregate_type="scan",
+                aggregate_id=str(scan.id),
             )
-            await queue.close()
-            log.info("scan_queued", scan_id=str(scan.id), scan_type=scan_type, org_id=str(org_id))
-        except Exception as e:
-            log.error("scan_queue_publish_failed", scan_id=str(scan.id), error=str(e))
-            scan.status = "failed"
-            scan.error_message = f"Failed to queue scan: {str(e)}"
-            await self.db.commit()
-            raise
+        )
+        await self.db.commit()
+        await self.db.refresh(scan)
+        await dispatch_pending_outbox_once(limit=5)
+        log.info("scan_queued", scan_id=str(scan.id), scan_type=scan_type, org_id=str(org_id))
 
         return scan

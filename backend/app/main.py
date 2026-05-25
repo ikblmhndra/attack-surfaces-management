@@ -20,6 +20,7 @@ from app.core.rabbitmq import init_rabbitmq, close_rabbitmq
 from app.core.opensearch import init_opensearch, close_opensearch
 from app.core.logging import setup_logging
 from app.core.minio_client import init_minio
+from app.services.outbox_service import start_outbox_dispatcher, stop_outbox_dispatcher
 
 log = structlog.get_logger()
 
@@ -36,11 +37,13 @@ async def lifespan(app: FastAPI):
     await init_rabbitmq()
     await init_opensearch()
     await init_minio()
+    await start_outbox_dispatcher()
 
     log.info("All services initialized successfully")
     yield
 
     # Cleanup
+    await stop_outbox_dispatcher()
     await close_db()
     await close_redis()
     await close_rabbitmq()

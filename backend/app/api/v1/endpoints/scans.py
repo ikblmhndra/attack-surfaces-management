@@ -1,15 +1,14 @@
 import uuid
 from uuid import UUID
-from datetime import datetime, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, Query, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 from app.api.v1.dependencies.auth import get_current_user, get_workspace_id, get_db, RequireRole
-from app.db.models.models import User, Scan
-from sqlalchemy import select, update, func
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+from app.db.models.models import User, Scan, Organization
+from app.services.outbox_service import create_queue_event, dispatch_pending_outbox_once
+from sqlalchemy import select, update, func, or_, cast, String
 from sqlalchemy.ext.asyncio import AsyncSession
 
 router = APIRouter()
@@ -18,24 +17,42 @@ require_analyst = RequireRole(["owner", "admin", "analyst"])
 
 
 class ManualScanRequest(BaseModel):
-    org_id: str
+    org_id: UUID
     targets: List[str]
-    config: dict = {}
+    config: dict = Field(default_factory=dict)
     vuln_depth: str = "default"
+
+    @field_validator("vuln_depth")
+    @classmethod
+    def validate_vuln_depth(cls, value: str) -> str:
+        allowed = {"critical", "default", "full"}
+        if value not in allowed:
+            raise ValueError(f"vuln_depth must be one of: {', '.join(sorted(allowed))}")
+        return value
 
 @router.get("")
 async def list_scans(org_id: Optional[UUID] = Query(None), status: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
     page: int = Query(1), page_size: int = Query(20),
     workspace_id: UUID = Depends(get_workspace_id),
     current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     query = select(Scan).where(Scan.workspace_id == workspace_id)
     if org_id: query = query.where(Scan.org_id == org_id)
     if status: query = query.where(Scan.status == status)
+    if search:
+        term = f"%{search}%"
+        query = query.where(or_(
+            cast(Scan.id, String).ilike(term),
+            Scan.scan_type.ilike(term),
+            Scan.status.ilike(term),
+            Scan.error_message.ilike(term),
+        ))
     total = (await db.execute(select(func.count()).select_from(query.subquery()))).scalar_one()
     scans = (await db.execute(query.order_by(Scan.created_at.desc()).offset((page-1)*page_size).limit(page_size))).scalars().all()
     return {"items": [{"id": str(s.id), "org_id": str(s.org_id), "scan_type": s.scan_type,
                        "status": s.status, "progress_pct": s.progress_pct,
                        "assets_found": s.assets_found, "findings_found": s.findings_found,
+                       "error_message": s.error_message,
                        "started_at": s.started_at.isoformat() if s.started_at else None,
                        "completed_at": s.completed_at.isoformat() if s.completed_at else None,
                        "created_at": s.created_at.isoformat()} for s in scans], "total": total}
@@ -52,7 +69,8 @@ async def get_scan(scan_id: UUID, workspace_id: UUID = Depends(get_workspace_id)
             "assets_found": scan.assets_found, "findings_found": scan.findings_found,
             "error_message": scan.error_message,
             "started_at": scan.started_at.isoformat() if scan.started_at else None,
-            "completed_at": scan.completed_at.isoformat() if scan.completed_at else None}
+            "completed_at": scan.completed_at.isoformat() if scan.completed_at else None,
+            "created_at": scan.created_at.isoformat()}
 
 @router.post("/manual", status_code=201)
 async def manual_scan(
@@ -65,35 +83,37 @@ async def manual_scan(
     if not request.targets:
         raise HTTPException(400, "At least one target is required")
 
-    from app.core.queue_client import QueueClient
+    org_exists = await db.execute(
+        select(Organization.id).where(
+            Organization.id == request.org_id,
+            Organization.workspace_id == workspace_id,
+            Organization.deleted_at.is_(None),
+        )
+    )
+    if not org_exists.scalar_one_or_none():
+        raise HTTPException(404, "Organization not found")
 
     scan_id = str(uuid.uuid4())
 
-    await db.execute(
-        pg_insert(Scan.__table__).values(
+    db.add(
+        Scan(
             id=scan_id,
             org_id=request.org_id,
             workspace_id=workspace_id,
             created_by=current_user.id,
             scan_type="manual_nuclei",
-            status="pending",
+            status="queued",
             modules=["nuclei"],
             config={"targets": request.targets, "vuln_depth": request.vuln_depth, **request.config},
             total_tasks=1,
         )
     )
-    await db.commit()
-
-    try:
-        queue = QueueClient()
-        await queue.connect()
-
-        # Publish directly to nuclei queue
-        await queue.publish(
+    db.add(
+        create_queue_event(
             routing_key="scan.nuclei",
-            message={
+            payload={
                 "scan_id": scan_id,
-                "org_id": request.org_id,
+                "org_id": str(request.org_id),
                 "workspace_id": str(workspace_id),
                 "targets": request.targets,
                 "config": {
@@ -102,18 +122,21 @@ async def manual_scan(
                     **request.config,
                 },
             },
+            headers={
+                "coordinator": {
+                    "scan_id": scan_id,
+                    "nuclei_expected": 1,
+                    "screenshot_done": True,
+                }
+            },
+            aggregate_type="scan",
+            aggregate_id=scan_id,
         )
-        await queue.close()
+    )
+    await db.commit()
 
-        # Set up Redis coordinator: mark screenshot done so terminal check passes
-        import redis.asyncio as aioredis
-        import os
-        r = aioredis.from_url(os.getenv("REDIS_URL", "redis://redis:6379/0"), decode_responses=True)
-        await r.incr(f"scan:{scan_id}:nuclei_expected")
-        await r.setex(f"scan:{scan_id}:screenshot_done", 86400, 1)
-        await r.expire(f"scan:{scan_id}:nuclei_expected", 86400)
-        await r.aclose()
-
+    try:
+        await dispatch_pending_outbox_once(limit=5)
     except Exception as e:
         await db.execute(update(Scan).where(Scan.id == scan_id).values(status="failed", error_message=str(e)))
         await db.commit()

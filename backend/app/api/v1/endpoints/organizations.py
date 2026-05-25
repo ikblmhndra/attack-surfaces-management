@@ -7,7 +7,7 @@ from uuid import UUID
 
 import structlog
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -64,6 +64,23 @@ class ScanRequest(BaseModel):
     modules: List[str] = Field(default_factory=list)
     config: dict = Field(default_factory=dict)
     template_id: Optional[str] = None  # Optional scan template reference
+
+    @field_validator("scan_type")
+    @classmethod
+    def validate_scan_type(cls, value: str) -> str:
+        allowed = {"full", "quick", "discovery", "vuln"}
+        if value not in allowed:
+            raise ValueError(f"scan_type must be one of: {', '.join(sorted(allowed))}")
+        return value
+
+    @field_validator("modules")
+    @classmethod
+    def validate_modules(cls, value: List[str]) -> List[str]:
+        allowed = {"discovery", "port", "nuclei", "screenshot"}
+        invalid = sorted(set(value) - allowed)
+        if invalid:
+            raise ValueError(f"unsupported scan module(s): {', '.join(invalid)}")
+        return value
 
 
 class OrgResponse(BaseModel):
@@ -399,7 +416,7 @@ async def trigger_scan(
     active_scans = (await db.execute(
         select(func.count(Scan.id)).where(
             Scan.org_id == org_id,
-            Scan.status.in_(["pending", "running"]),
+            Scan.status.in_(["queued", "pending", "running"]),
         )
     )).scalar_one()
 
@@ -446,7 +463,7 @@ async def trigger_scan(
     return {
         "scan_id": str(scan.id),
         "status": "queued",
-        "scan_type": request.scan_type,
+        "scan_type": scan.scan_type,
         "message": "Scan queued successfully. Check /api/v1/scans/{scan_id} for status.",
     }
 

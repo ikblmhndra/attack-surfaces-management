@@ -15,6 +15,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { formatDistanceToNow } from "date-fns";
 import { apiClient } from "@/lib/api";
+import { useRealtimeEvents } from "@/lib/useRealtimeEvents";
 import { useWorkspaceStore } from "@/store/workspace";
 import { SeverityBadge, GradeRing } from "@/components/ui/SeverityBadge";
 import { cn } from "@/lib/utils";
@@ -46,6 +47,7 @@ const CATEGORY_LABELS: Record<string, string> = {
 export default function DashboardPage() {
   const { activeOrg } = useWorkspaceStore();
   const queryClient = useQueryClient();
+  useRealtimeEvents(activeOrg?.id);
   const [refreshing, setRefreshing] = useState(false);
   const [showScanModal, setShowScanModal] = useState(false);
   const [scanOrgId, setScanOrgId] = useState("");

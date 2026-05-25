@@ -157,25 +157,21 @@ class ScanScheduler:
         queued = 0
         for org in orgs:
             try:
-                await self.queue.publish(
-                    routing_key="scan.discovery",
-                    message={
-                        "scan_id": await self._create_scheduled_scan(org["id"], org["workspace_id"], "full"),
-                        "org_id": org["id"],
-                        "workspace_id": org["workspace_id"],
-                        "targets": {
-                            "domains": org["domains"] + org["root_domains"],
-                            "ip_ranges": org["ip_ranges"],
-                            "asns": org["asns"],
-                        },
-                        "config": {
-                            "scan_type": "full",
-                            "severities": ["critical", "high", "medium", "low"],
-                            "modules": ["discovery", "port", "nuclei", "screenshot"],
-                            "use_amass": False,
-                            "ports": "top-1000",
-                        },
-                        "triggered_by": "scheduler",
+                await self._create_scheduled_scan(
+                    org["id"],
+                    org["workspace_id"],
+                    "full",
+                    targets={
+                        "domains": org["domains"] + org["root_domains"],
+                        "ip_ranges": org["ip_ranges"],
+                        "asns": org["asns"],
+                    },
+                    config={
+                        "scan_type": "full",
+                        "severities": ["critical", "high", "medium", "low"],
+                        "modules": ["discovery", "port", "nuclei", "screenshot"],
+                        "use_amass": False,
+                        "ports": "top-1000",
                     },
                     priority=5,
                 )
@@ -194,21 +190,17 @@ class ScanScheduler:
 
         for org in orgs:
             try:
-                await self.queue.publish(
-                    routing_key="scan.discovery",
-                    message={
-                        "scan_id": await self._create_scheduled_scan(org["id"], org["workspace_id"], "quick"),
-                        "org_id": org["id"],
-                        "workspace_id": org["workspace_id"],
-                        "targets": {
-                            "domains": org["domains"] + org["root_domains"],
-                        },
-                        "config": {
-                            "scan_type": "quick",
-                            "severities": ["critical", "high"],
-                            "modules": ["discovery", "nuclei"],
-                        },
-                        "triggered_by": "scheduler",
+                await self._create_scheduled_scan(
+                    org["id"],
+                    org["workspace_id"],
+                    "quick",
+                    targets={
+                        "domains": org["domains"] + org["root_domains"],
+                    },
+                    config={
+                        "scan_type": "quick",
+                        "severities": ["critical", "high"],
+                        "modules": ["discovery", "nuclei"],
                     },
                     priority=3,
                 )
@@ -454,6 +446,9 @@ class ScanScheduler:
         org_id: str,
         workspace_id: str,
         scan_type: str,
+        targets: dict,
+        config: dict,
+        priority: int,
     ) -> str:
         """Create a scan record and return its ID."""
         import uuid
@@ -476,16 +471,35 @@ class ScanScheduler:
 
         async with get_session() as db:
             from sqlalchemy.dialects.postgresql import insert as pg_insert
+            from workers.db_models import OutboxEvent
+
             await db.execute(
                 pg_insert(Scan.__table__).values(
                     id=scan_id,
                     org_id=org_id,
                     workspace_id=workspace_id,
                     scan_type=scan_type,
-                    status="pending",
+                    status="queued",
                     total_tasks=total_tasks,
                     modules=modules,
-                    config={"triggered_by": "scheduler"},
+                    config={**config, "triggered_by": "scheduler"},
+                )
+            )
+            db.add(
+                OutboxEvent(
+                    event_type="queue.publish",
+                    routing_key="scan.discovery",
+                    payload={
+                        "scan_id": scan_id,
+                        "org_id": org_id,
+                        "workspace_id": workspace_id,
+                        "targets": targets,
+                        "config": config,
+                        "triggered_by": "scheduler",
+                    },
+                    priority=priority,
+                    aggregate_type="scan",
+                    aggregate_id=scan_id,
                 )
             )
             await db.commit()

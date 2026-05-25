@@ -451,7 +451,7 @@ class Finding(TimestampMixin, SoftDeleteMixin, Base):
     __table_args__ = (
         Index("ix_finding_org_severity", "org_id", "severity"),
         Index("ix_finding_org_status", "org_id", "status"),
-        Index("ix_finding_fingerprint", "fingerprint", "org_id"),
+        UniqueConstraint("fingerprint", "org_id", name="uq_finding_fingerprint_org"),
     )
 
     # Relationships
@@ -523,7 +523,7 @@ class Scan(TimestampMixin, Base):
 
     # Scan config
     scan_type = Column(String(50), nullable=False)  # full, discovery, vuln, quick
-    status = Column(String(50), nullable=False, default="pending", index=True)
+    status = Column(String(50), nullable=False, default="pending", index=True)  # pending, queued, running, completed, failed, cancelled
     modules = Column(ARRAY(String), nullable=False, default=list)
     config = Column(JSONB, nullable=False, default=dict)
 
@@ -571,6 +571,33 @@ class ScanFinding(Base):
     # Relationships
     scan = relationship("Scan", back_populates="scan_findings")
     finding = relationship("Finding", back_populates="scan_findings")
+
+
+# ============================================================
+# OUTBOX EVENTS
+# ============================================================
+
+class OutboxEvent(TimestampMixin, Base):
+    __tablename__ = "outbox_events"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    event_type = Column(String(100), nullable=False, index=True)
+    status = Column(String(50), nullable=False, default="pending", index=True)  # pending, publishing, published, failed
+    payload = Column(JSONB, nullable=False, default=dict)
+    headers = Column(JSONB, nullable=False, default=dict)
+    routing_key = Column(String(255), nullable=True, index=True)
+    priority = Column(Integer, nullable=False, default=5)
+    attempt_count = Column(Integer, nullable=False, default=0)
+    max_attempts = Column(Integer, nullable=False, default=10)
+    next_attempt_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    published_at = Column(DateTime(timezone=True), nullable=True)
+    last_error = Column(Text, nullable=True)
+    aggregate_type = Column(String(100), nullable=True, index=True)
+    aggregate_id = Column(String(255), nullable=True, index=True)
+
+    __table_args__ = (
+        Index("ix_outbox_pending", "status", "next_attempt_at"),
+    )
 
 
 # ============================================================

@@ -10,6 +10,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { formatDistanceToNow } from "date-fns";
 import { motion } from "framer-motion";
 import { apiClient } from "@/lib/api";
+import { useRealtimeEvents } from "@/lib/useRealtimeEvents";
 import { useWorkspaceStore } from "@/store/workspace";
 import { cn, formatRelative } from "@/lib/utils";
 
@@ -48,6 +49,7 @@ function getPhaseLabel(progress: number, status: string): string {
 export default function ScansPage() {
   const { activeOrg } = useWorkspaceStore();
   const queryClient = useQueryClient();
+  useRealtimeEvents(activeOrg?.id);
 
   const [statusFilter, setStatusFilter] = useState<string>("");
   const [search, setSearch] = useState("");
@@ -145,6 +147,8 @@ export default function ScansPage() {
                 {data.items.map((scan: any) => {
                   const cfg = STATUS_CONFIG[scan.status] || STATUS_CONFIG.pending;
                   const StatusIcon = cfg.icon;
+                  const progress = Math.max(0, Math.min(100, Math.round(scan.progress_pct ?? 0)));
+                  const startedAt = scan.started_at || scan.created_at;
                   return (
                     <tr key={scan.id} className="border-b border-border/30 hover:bg-surface-700/20 transition-colors">
                       <td className="px-4 py-3">
@@ -164,16 +168,21 @@ export default function ScansPage() {
                           <div className="flex-1 h-1.5 bg-surface-700 rounded-full overflow-hidden">
                             <div
                               className={cn("h-full rounded-full transition-all duration-500", cfg.color.replace("text", "bg"))}
-                              style={{ width: `${scan.progress_pct}%` }}
+                              style={{ width: `${progress}%` }}
                             />
                           </div>
                           <span className="text-xs text-muted-foreground w-8 text-right">
-                            {scan.progress_pct}%
+                            {progress}%
                           </span>
                         </div>
                         {scan.status === "running" && (
                           <span className="text-[10px] text-muted-foreground/70 mt-0.5 block">
-                            {getPhaseLabel(scan.progress_pct, scan.status)}
+                            {getPhaseLabel(progress, scan.status)}
+                          </span>
+                        )}
+                        {scan.status === "failed" && scan.error_message && (
+                          <span className="text-[10px] text-red-400/80 mt-0.5 block truncate max-w-[180px]" title={scan.error_message}>
+                            {scan.error_message}
                           </span>
                         )}
                       </td>
@@ -184,7 +193,7 @@ export default function ScansPage() {
                         {scan.findings_found ?? "—"}
                       </td>
                       <td className="px-4 py-3 text-right text-xs text-muted-foreground whitespace-nowrap">
-                        {scan.created_at ? formatRelative(scan.created_at) : "—"}
+                        {startedAt ? formatRelative(startedAt) : "—"}
                       </td>
                       <td className="px-4 py-3 text-right">
                         {["pending", "running", "queued"].includes(scan.status) && (

@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from workers.base_worker import BaseWorker
 from workers.db import get_session
 from workers.queue_client import QueueClient
+from workers.scan_state import mark_scan_completed, should_process_scan
 
 log = structlog.get_logger()
 
@@ -62,6 +63,10 @@ class CorrelationWorker(BaseWorker):
         log.info("correlation_started", scan_id=scan_id, org_id=org_id)
 
         async with get_session() as db:
+            if not await should_process_scan(db, scan_id):
+                log.info("correlation_skipped_inactive_scan", scan_id=scan_id)
+                return
+
             # ── Step 1: Asset Deduplication ───────────────────
             await self._deduplicate_assets(db, org_id)
 
@@ -580,17 +585,9 @@ class CorrelationWorker(BaseWorker):
     # ── Queue Operations ──────────────────────────────────────
 
     async def _complete_scan(self, db, scan_id: str) -> None:
-        from workers.db_models import Scan
-        from datetime import datetime, timezone
-        await db.execute(
-            update(Scan).where(Scan.id == scan_id).values(
-                status="completed",
-                progress_pct=func.greatest(Scan.progress_pct, 100),
-                completed_tasks=Scan.total_tasks,
-                completed_at=datetime.now(timezone.utc),
-            )
-        )
-        await db.commit()
+        completed = await mark_scan_completed(db, scan_id)
+        if not completed:
+            log.info("scan_complete_skipped_inactive_scan", scan_id=scan_id)
 
     async def _queue_risk_computation(
         self,

@@ -196,8 +196,10 @@ def is_valid_domain(domain: str) -> bool:
 def is_valid_cidr(cidr: str) -> bool:
     """Validate a CIDR range."""
     import ipaddress
+    if "/" not in cidr:
+        return False
     try:
-        ipaddress.ip_network(cidr, strict=False)
+        ipaddress.ip_network(cidr, strict=True)
         return True
     except ValueError:
         return False

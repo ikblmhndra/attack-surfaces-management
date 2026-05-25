@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import os
+import shutil
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +17,7 @@ import structlog
 from workers.base_worker import BaseWorker
 from workers.db import get_session
 from workers.queue_client import QueueClient
+from workers.scan_state import mark_scan_running
 
 log = structlog.get_logger()
 
@@ -51,6 +53,42 @@ CATEGORY_MAP = {
 # Template severity allow-list (don't run info templates by default)
 DEFAULT_SEVERITIES = ["critical", "high", "medium", "low"]
 
+TECH_TAG_ALIASES = {
+    "apache http server": "apache",
+    "apache": "apache",
+    "nginx": "nginx",
+    "microsoft iis": "iis",
+    "iis": "iis",
+    "php": "php",
+    "wordpress": "wordpress",
+    "drupal": "drupal",
+    "joomla": "joomla",
+    "magento": "magento",
+    "shopify": "shopify",
+    "react": "react",
+    "next.js": "nextjs",
+    "nextjs": "nextjs",
+    "angular": "angular",
+    "vue.js": "vuejs",
+    "vuejs": "vuejs",
+    "node.js": "nodejs",
+    "nodejs": "nodejs",
+    "express": "express",
+    "django": "django",
+    "flask": "flask",
+    "laravel": "laravel",
+    "spring": "spring",
+    "apache tomcat": "tomcat",
+    "tomcat": "tomcat",
+    "jenkins": "jenkins",
+    "gitlab": "gitlab",
+    "jira": "jira",
+    "confluence": "confluence",
+    "grafana": "grafana",
+    "kibana": "kibana",
+    "elasticsearch": "elasticsearch",
+}
+
 
 class NucleiWorker(BaseWorker):
     """
@@ -68,7 +106,7 @@ class NucleiWorker(BaseWorker):
 
     QUEUE = "scan.nuclei"
     CONCURRENCY = int(os.getenv("WORKER_CONCURRENCY", "2"))
-    TEMPLATES_PATH = os.getenv("NUCLEI_TEMPLATES_PATH", "/opt/nuclei-templates")
+    TEMPLATES_PATH = os.getenv("NUCLEI_TEMPLATES_PATH", "/root/nuclei-templates")
     RATE_LIMIT = int(os.getenv("NUCLEI_RATE_LIMIT", "150"))
 
     async def process(self, message: Dict[str, Any]) -> None:
@@ -79,32 +117,25 @@ class NucleiWorker(BaseWorker):
         config = message.get("config", {})
         tech_map = message.get("tech_map", {})  # {url: [tech_names]}
 
-        # Update scan status to running (handles manual nuclei scans too)
         async with get_session() as db:
-            from sqlalchemy import update, func
-            from workers.db_models import Scan
-            from datetime import datetime, timezone
-            await db.execute(
-                update(Scan).where(Scan.id == scan_id).values(
-                    status="running",
-                    started_at=datetime.now(timezone.utc),
-                    progress_pct=func.greatest(Scan.progress_pct, 10),
-                )
-            )
-            await db.commit()
+            if not await mark_scan_running(db, scan_id, progress_floor=10):
+                log.info("nuclei_skipped_inactive_scan", scan_id=scan_id)
+                return
 
         if not targets:
             log.warning("nuclei_no_targets", scan_id=scan_id)
+            await self._queue_correlation(scan_id, org_id, workspace_id)
             return
 
         log.info("nuclei_scan_started", scan_id=scan_id, targets=len(targets), org_id=org_id)
 
-        # Collect unique tech tags from tech_map for template filtering
+        # Optional tech tags are curated so detection can guide nuclei without
+        # expanding into every Wappalyzer label.
         all_techs = set()
-        if tech_map:
+        if tech_map and config.get("use_tech_tags", True):
             for url, techs in tech_map.items():
                 if techs:
-                    all_techs.update(t.lower().replace(" ", "-") for t in techs if isinstance(t, str))
+                    all_techs.update(self._tech_tags(techs))
             if all_techs:
                 existing_tags = config.get("tags", [])
                 config["tags"] = list(set(existing_tags) | all_techs)
@@ -140,11 +171,28 @@ class NucleiWorker(BaseWorker):
             else:
                 log.info("nuclei_no_findings", scan_id=scan_id, targets=len(targets))
 
+            async with get_session() as db:
+                await self._mark_nuclei_task_complete(db, scan_id)
+
             # Queue correlation — ALWAYS called, even with zero findings.
             # This increments nuclei_done and checks for terminal condition.
             await self._queue_correlation(scan_id, org_id, workspace_id)
 
         log.info("nuclei_scan_completed", scan_id=scan_id, findings=len(findings))
+
+    def _tech_tags(self, techs: List[Any]) -> List[str]:
+        tags = []
+        for tech in techs:
+            if not isinstance(tech, str):
+                continue
+            normalized = tech.lower().strip()
+            for sep in ("/", ":", "@"):
+                normalized = normalized.split(sep, 1)[0]
+            normalized = " ".join(normalized.replace("_", " ").split())
+            tag = TECH_TAG_ALIASES.get(normalized)
+            if tag:
+                tags.append(tag)
+        return tags
 
     async def _run_nuclei(
         self,
@@ -159,11 +207,15 @@ class NucleiWorker(BaseWorker):
         templates = config.get("templates", [])
         exclude_tags = config.get("exclude_tags", ["dos", "fuzz", "intrusive"])
         rate_limit = config.get("rate_limit", self.RATE_LIMIT)
-        bulk_size = config.get("bulk_size", 25)
-        concurrency = config.get("concurrency", 25)
+        bulk_size = config.get("bulk_size", 10)
+        concurrency = config.get("concurrency", 10)
+        template_timeout = int(config.get("template_timeout", 8))
+        retries = int(config.get("retries", 0))
+        scan_timeout = int(config.get("scan_timeout", 600))
+        nuclei_path = shutil.which("nuclei") or "/go/bin/nuclei"
 
         cmd = [
-            "nuclei",
+            nuclei_path,
             "-l", str(target_file),
             "-json-export", str(output_file),
             "-silent",
@@ -171,8 +223,8 @@ class NucleiWorker(BaseWorker):
             "-rate-limit", str(rate_limit),
             "-bulk-size", str(bulk_size),
             "-c", str(concurrency),
-            "-timeout", "10",
-            "-retries", "1",
+            "-timeout", str(template_timeout),
+            "-retries", str(retries),
             "-follow-redirects",
             "-max-redirects", "3",
             "-disable-update-check",
@@ -180,6 +232,9 @@ class NucleiWorker(BaseWorker):
 
         # Template selection based on vuln_depth
         vuln_depth = config.get("vuln_depth", "default")
+        automatic_scan = bool(config.get("automatic_scan", vuln_depth in {"default", "full"}))
+        if automatic_scan:
+            cmd.append("-as")
 
         # Severity filter (restrict further for critical-only depth)
         if vuln_depth == "critical":
@@ -190,29 +245,38 @@ class NucleiWorker(BaseWorker):
         # Map depth → template directories
         TEMPLATE_DIRS_BY_DEPTH = {
             "critical": [
-                "cves",  # Includes all CVE templates (severity-filtered below)
+                "http/cves",
+                "network/cves",
             ],
             "default": [
-                "cves",
-                "vulnerabilities",
-                "exposures",
-                "misconfiguration",
-                "default-logins",
-                "takeovers",
+                "http/exposures",
+                "http/misconfiguration",
+                "http/default-logins",
+                "http/takeovers",
                 "dns",
                 "ssl",
-                "exposed-panels",
-                "network",
+                "http/exposed-panels",
+                "network/exposures",
             ],
-            "full": [],
+            "full": [
+                "http/cves",
+                "http/vulnerabilities",
+                "http/exposures",
+                "http/misconfiguration",
+                "http/default-logins",
+                "http/takeovers",
+                "dns",
+                "ssl",
+                "http/exposed-panels",
+                "network/cves",
+                "network/vulnerabilities",
+                "network/exposures",
+            ],
         }
 
         if templates:
             for tmpl in templates:
                 cmd.extend(["-t", tmpl])
-        elif vuln_depth == "full":
-            # All template directories (no path filter)
-            pass
         else:
             dirs = TEMPLATE_DIRS_BY_DEPTH.get(vuln_depth, TEMPLATE_DIRS_BY_DEPTH["default"])
             for tmpl_dir in dirs:
@@ -244,7 +308,7 @@ class NucleiWorker(BaseWorker):
                 stderr=asyncio.subprocess.PIPE,
                 env={**os.environ},
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=3600)
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=scan_timeout)
 
             if proc.returncode not in (0, 1):  # nuclei returns 1 if findings exist
                 log.error("nuclei_error", stderr=stderr.decode()[:500], scan_id=scan_id)
@@ -253,6 +317,7 @@ class NucleiWorker(BaseWorker):
             log.error("nuclei_timeout", scan_id=scan_id)
             try:
                 proc.kill()
+                await proc.wait()
             except Exception:
                 pass
             return []
@@ -516,6 +581,16 @@ class NucleiWorker(BaseWorker):
         await db.execute(
             update(Scan).where(Scan.id == scan_id).values(
                 findings_found=Scan.findings_found + count,
+                progress_pct=func.greatest(Scan.progress_pct, 75),
+            )
+        )
+        await db.commit()
+
+    async def _mark_nuclei_task_complete(self, db, scan_id: str) -> None:
+        from sqlalchemy import update, func
+        from workers.db_models import Scan
+        await db.execute(
+            update(Scan).where(Scan.id == scan_id).values(
                 completed_tasks=Scan.completed_tasks + 1,
                 progress_pct=func.greatest(Scan.progress_pct, 75),
             )

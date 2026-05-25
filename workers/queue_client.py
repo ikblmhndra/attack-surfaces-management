@@ -25,6 +25,15 @@ ROUTING_CONFIG = {
     "report.daily":        {"exchange": "asm.report",       "type": aio_pika.ExchangeType.DIRECT},
 }
 
+QUEUE_CONFIG = {
+    routing_key: {
+        "exchange": config["exchange"],
+        "type": config["type"],
+        "binding_key": routing_key,
+    }
+    for routing_key, config in ROUTING_CONFIG.items()
+}
+
 
 class QueueClient:
     """Async RabbitMQ publisher with connection management."""
@@ -55,7 +64,40 @@ class QueueClient:
                 )
                 self._exchanges[exchange_name] = exchange
 
+        await self._declare_queues()
+
         log.info("queue_client_connected")
+
+    async def _declare_queues(self) -> None:
+        dlx = await self.channel.declare_exchange(
+            "asm.dlx",
+            aio_pika.ExchangeType.DIRECT,
+            durable=True,
+        )
+
+        for queue_name, config in QUEUE_CONFIG.items():
+            dlq = await self.channel.declare_queue(
+                f"{queue_name}.dlq",
+                durable=True,
+                arguments={
+                    "x-message-ttl": 7 * 24 * 60 * 60 * 1000,
+                    "x-max-length": 10_000,
+                },
+            )
+            await dlq.bind(dlx, routing_key=queue_name)
+
+            queue = await self.channel.declare_queue(
+                queue_name,
+                durable=True,
+                arguments={
+                    "x-dead-letter-exchange": "asm.dlx",
+                    "x-dead-letter-routing-key": queue_name,
+                    "x-max-priority": 10,
+                    "x-message-ttl": 24 * 60 * 60 * 1000,
+                },
+            )
+            exchange = self._exchanges[config["exchange"]]
+            await queue.bind(exchange, routing_key=config["binding_key"])
 
     async def publish(
         self,

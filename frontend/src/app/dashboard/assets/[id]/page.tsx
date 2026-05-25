@@ -47,6 +47,7 @@ export default function AssetDetailPage() {
 
   const sub = asset?.subdomain;
   const ip = asset?.ip;
+  const ports = asset?.ports || [];
 
   const TABS: { id: "overview" | "findings" | "screenshots" | "intel"; label: string; count?: number }[] = [
     { id: "overview", label: "Overview" },
@@ -270,6 +271,23 @@ export default function AssetDetailPage() {
                     {ip.is_vpn && <span className="text-xs bg-yellow-500/10 text-yellow-400 border border-yellow-500/20 px-2 py-0.5 rounded">VPN</span>}
                     {ip.is_tor && <span className="text-xs bg-red-500/10 text-red-400 border border-red-500/20 px-2 py-0.5 rounded">Tor Exit Node</span>}
                   </div>
+
+                  {ports.length > 0 && (
+                    <div>
+                      <p className="text-xs text-muted-foreground mb-2">Open Ports</p>
+                      <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
+                        {ports.map((port: any) => (
+                          <div key={`${port.protocol}-${port.port}`} className="rounded-lg border border-surface-700 bg-surface-800/60 px-3 py-2">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-sm font-mono font-semibold text-foreground">{port.port}</span>
+                              <span className="text-[10px] uppercase text-emerald-400">{port.state}</span>
+                            </div>
+                            <p className="text-xs text-muted-foreground truncate">{port.service || port.protocol}</p>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -413,9 +431,21 @@ export default function AssetDetailPage() {
 
           {/* Ports */}
           {ip?.open_ports_count > 0 && (
-            <div className="glass-card p-4">
+            <div className="glass-card p-4 space-y-3">
               <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-3">Open Ports</h3>
               <p className="text-sm text-foreground font-bold tabular-nums">{ip.open_ports_count} ports</p>
+              {ports.length > 0 && (
+                <div className="flex flex-wrap gap-1.5">
+                  {ports.slice(0, 12).map((port: any) => (
+                    <span key={`${port.protocol}-${port.port}`} className="text-xs font-mono bg-surface-800 text-muted-foreground border border-surface-700 px-2 py-1 rounded">
+                      {port.port}/{port.protocol}
+                    </span>
+                  ))}
+                  {ports.length > 12 && (
+                    <span className="text-xs text-muted-foreground px-2 py-1">+{ports.length - 12}</span>
+                  )}
+                </div>
+              )}
             </div>
           )}
 

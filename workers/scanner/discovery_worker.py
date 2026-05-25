@@ -4,6 +4,7 @@ Runs subdomain discovery, DNS enumeration, HTTP probing, endpoint crawling, and 
 Integrates: subfinder, amass, assetfinder, dnsx, httpx, naabu, katana, ffuf
 """
 import asyncio
+import re
 import hashlib
 import json
 import os
@@ -21,17 +22,40 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from workers.base_worker import BaseWorker
 from workers.db import get_session
 from workers.queue_client import QueueClient
+from workers.scan_state import mark_scan_running
 
 log = structlog.get_logger()
 
 # Tool availability cache
 _TOOL_CACHE: Dict[str, bool] = {}
 
+TECH_VERSION_RE = re.compile(r"^(.+?)[/:@ ]v?([0-9][A-Za-z0-9._+-]*)$")
+
 
 def tool_available(name: str) -> bool:
     if name not in _TOOL_CACHE:
         _TOOL_CACHE[name] = shutil.which(name) is not None
     return _TOOL_CACHE[name]
+
+
+def normalize_technology(raw: Any) -> Optional[Dict[str, Optional[str]]]:
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip()
+    if not value:
+        return None
+
+    version = None
+    name = value
+    match = TECH_VERSION_RE.match(value)
+    if match:
+        name = match.group(1).strip()
+        version = match.group(2).strip()
+
+    name = " ".join(name.replace("_", " ").split())
+    if not name:
+        return None
+    return {"name": name[:255], "version": version[:100] if version else ""}
 
 
 class DiscoveryWorker(BaseWorker):
@@ -60,7 +84,9 @@ class DiscoveryWorker(BaseWorker):
         log.info("discovery_started", scan_id=scan_id, org_id=org_id, targets=targets)
 
         async with get_session() as db:
-            await self._update_scan_status(db, scan_id, "running")
+            if not await mark_scan_running(db, scan_id, progress_floor=10):
+                log.info("discovery_skipped_inactive_scan", scan_id=scan_id)
+                return
 
         # For targeted scans (e.g. vuln-only), skip discovery phase and
         # queue downstream tasks directly with the input targets.
@@ -620,7 +646,7 @@ class DiscoveryWorker(BaseWorker):
         """Upsert discovered assets into the database."""
         from sqlalchemy import select, update
         from sqlalchemy.dialects.postgresql import insert as pg_insert
-        from workers.db_models import Asset, Subdomain
+        from workers.db_models import Asset, Subdomain, Technology
 
         new_count = 0
         now = datetime.now(timezone.utc)
@@ -655,6 +681,18 @@ class DiscoveryWorker(BaseWorker):
             dns_info = dns_data.get(host, {})
             tls = http_data.get("tls", {})
 
+            technologies = []
+            seen_tech = set()
+            for raw_tech in http_data.get("technologies", []):
+                tech = normalize_technology(raw_tech)
+                if not tech:
+                    continue
+                key = (tech["name"].lower(), tech["version"] or "")
+                if key in seen_tech:
+                    continue
+                seen_tech.add(key)
+                technologies.append(tech)
+
             subdomain_values = {
                 "asset_id": asset_id,
                 "org_id": org_id,
@@ -675,7 +713,7 @@ class DiscoveryWorker(BaseWorker):
                 "http_server": http_data.get("webserver", "")[:255],
                 "content_length": http_data.get("content_length"),
                 "response_hash": http_data.get("hash", "")[:64],
-                "technologies": http_data.get("technologies", []),
+                "technologies": [tech["name"] for tech in technologies],
                 "cdn_provider": http_data.get("cdn_name", "")[:100] or None,
                 "tls_info": tls if tls else None,
                 "tls_expiry": self._parse_tls_expiry(tls),
@@ -695,6 +733,36 @@ class DiscoveryWorker(BaseWorker):
                 set_={k: v for k, v in subdomain_values.items() if k != "asset_id"},
             )
             await db.execute(sub_stmt)
+
+            for tech in technologies:
+                tech_values = {
+                    "asset_id": asset_id,
+                    "org_id": org_id,
+                    "name": tech["name"],
+                    "version": tech["version"] or "",
+                    "category": None,
+                    "confidence": 1.0,
+                    "detection_method": "httpx-tech-detect",
+                    "metadata": {
+                        "source": "httpx",
+                        "fingerprint": "wappalyzer-compatible",
+                    },
+                    "last_detected": now,
+                }
+                tech_stmt = pg_insert(Technology.__table__).values(
+                    **tech_values,
+                    first_detected=now,
+                )
+                tech_stmt = tech_stmt.on_conflict_do_update(
+                    constraint="uq_tech_asset_name_version",
+                    set_={
+                        "confidence": tech_values["confidence"],
+                        "detection_method": tech_values["detection_method"],
+                        "metadata": tech_values["metadata"],
+                        "last_detected": now,
+                    },
+                )
+                await db.execute(tech_stmt)
 
         await db.commit()
         log.info("assets_persisted", org_id=org_id, total=len(alive_hosts), new=new_count)
@@ -727,6 +795,7 @@ class DiscoveryWorker(BaseWorker):
             batch_size = 100
             for i in range(0, len(ips), batch_size):
                 ip_batch = ips[i:i + batch_size]
+                await coord.add_port_expected(scan_id)
                 await queue.publish(
                     routing_key="scan.port",
                     message={
@@ -774,8 +843,9 @@ class DiscoveryWorker(BaseWorker):
                         if info and info.get("url"):
                             tech_map[info["url"]] = info.get("technologies", [])
 
-            for i in range(0, len(nuclei_targets), 50):
-                batch = nuclei_targets[i:i + 50]
+            batch_size = max(1, min(int(config.get("nuclei_batch_size", 25)), 50))
+            for i in range(0, len(nuclei_targets), batch_size):
+                batch = nuclei_targets[i:i + batch_size]
                 msg = {
                     "scan_id": scan_id,
                     "org_id": org_id,
@@ -785,11 +855,11 @@ class DiscoveryWorker(BaseWorker):
                 }
                 if tech_map:
                     msg["tech_map"] = tech_map
+                await coord.add_nuclei_expected(scan_id)
                 await queue.publish(
                     routing_key="scan.nuclei",
                     message=msg,
                 )
-                await coord.add_nuclei_expected(scan_id)
                 nuclei_queued = True
 
         # Screenshot task
@@ -844,21 +914,6 @@ class DiscoveryWorker(BaseWorker):
         except Exception:
             pass
         return None
-
-    async def _update_scan_status(self, db: AsyncSession, scan_id: str, status: str) -> None:
-        from sqlalchemy import update, func
-        from workers.db_models import Scan
-        values = {
-            "status": status,
-            "progress_pct": func.greatest(Scan.progress_pct, 10),
-        }
-        # Only set started_at when transitioning to running, never reset to None
-        if status == "running":
-            values["started_at"] = datetime.now(timezone.utc)
-        await db.execute(
-            update(Scan).where(Scan.id == scan_id).values(**values)
-        )
-        await db.commit()
 
     async def _update_scan_progress(
         self,

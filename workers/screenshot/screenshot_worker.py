@@ -19,6 +19,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from workers.base_worker import BaseWorker
 from workers.db import get_session
 from workers.queue_client import QueueClient
+from workers.scan_state import mark_scan_running
 
 log = structlog.get_logger()
 
@@ -106,6 +107,11 @@ class ScreenshotWorker(BaseWorker):
         org_id = message["org_id"]
         workspace_id = message["workspace_id"]
         targets = message.get("targets", [])
+
+        async with get_session() as db:
+            if not await mark_scan_running(db, scan_id, progress_floor=75):
+                log.info("screenshot_skipped_inactive_scan", scan_id=scan_id)
+                return
 
         if not targets:
             log.info("screenshot_no_targets", scan_id=scan_id)

@@ -319,12 +319,23 @@ class RiskScoringEngine:
             weighted_total += cat_score.weighted_score
             category_scores[cat.value] = cat_score
 
+        critical_penalty = sum(
+            penalty["penalty"]
+            for cat_score in category_scores.values()
+            for penalty in cat_score.penalties
+            if penalty["severity"].lower() == Severity.CRITICAL.value
+        )
+
         # Apply bonus for assets with no findings (healthy org)
         if total_assets > 0 and len(active_findings) == 0:
             bonus = min(5, 100 - weighted_total)
             weighted_total = min(100, weighted_total + bonus)
 
         overall_score = max(0, min(100, round(weighted_total)))
+        if critical_penalty >= 75:
+            overall_score = min(overall_score, 60)
+        elif critical_penalty >= 20:
+            overall_score = min(overall_score, 79)
         grade = score_to_grade(overall_score)
 
         # Build score factors (human-readable impact statements)

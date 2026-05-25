@@ -222,13 +222,10 @@ class BaseWorker(ABC):
                     log.info("worker_shutdown_consuming", worker=self.worker_type)
                     break
 
-                # Acquire semaphore slot (concurrency control)
-                async with self._semaphore:
-                    task = asyncio.create_task(
-                        self._handle_message(message)
-                    )
-                    self._active_tasks.add(task)
-                    task.add_done_callback(self._active_tasks.discard)
+                await self._semaphore.acquire()
+                task = asyncio.create_task(self._handle_message_limited(message))
+                self._active_tasks.add(task)
+                task.add_done_callback(self._active_tasks.discard)
 
         # Wait for in-flight tasks
         if self._active_tasks:
@@ -243,6 +240,8 @@ class BaseWorker(ABC):
         # Extract retry count from headers
         headers = message.headers or {}
         retry_count = int(headers.get("x-retry-count", 0))
+
+        body = None
 
         try:
             # Decode JSON body
@@ -341,11 +340,37 @@ class BaseWorker(ABC):
                     retries=retry_count,
                     error=str(e),
                 )
+                scan_id = body.get("scan_id") if isinstance(body, dict) else None
+                if scan_id:
+                    try:
+                        from workers.db import get_session
+                        from workers.scan_state import mark_scan_failed
+
+                        async with get_session() as db:
+                            await mark_scan_failed(
+                                db,
+                                scan_id,
+                                f"{self.worker_type} failed after {self.MAX_RETRIES} retries: {str(e)}",
+                            )
+                    except Exception as state_err:
+                        log.warning(
+                            "scan_failed_state_update_failed",
+                            worker=self.worker_type,
+                            scan_id=scan_id,
+                            error=str(state_err),
+                        )
                 try:
                     await message.reject(requeue=False)
                 except Exception:
                     pass
                 MESSAGES_FAILED.labels(worker_type=self.worker_type, reason="max_retries").inc()
+
+    async def _handle_message_limited(self, message: aio_pika.IncomingMessage) -> None:
+        """Process one message and release the worker concurrency slot."""
+        try:
+            await self._handle_message(message)
+        finally:
+            self._semaphore.release()
 
     # ── Abstract interface ─────────────────────────────────────
 
