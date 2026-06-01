@@ -13,7 +13,7 @@ class ScanTemplateCreate(BaseModel):
     name: str
     description: Optional[str] = None
     scan_type: str = "full"
-    modules: List[str] = ["discovery", "dns", "probe", "port", "nuclei", "screenshot", "enrich"]
+    modules: List[str] = ["discovery", "dns", "probe", "port", "crawl", "nuclei", "screenshot", "enrich"]
     config: dict = {}
     severities: List[str] = ["critical", "high", "medium", "low"]
     tags: List[str] = []
@@ -147,4 +147,3 @@ async def delete_template(
         raise HTTPException(404, "Template not found")
     await db.delete(t)
     await db.commit()
-

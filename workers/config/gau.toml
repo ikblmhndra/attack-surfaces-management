@@ -1,0 +1,38 @@
+threads = 5
+verbose = false
+retries = 3
+subdomains = true
+parameters = false
+providers = ["wayback", "commoncrawl", "otx", "urlscan"]
+blacklist = [
+  "css",
+  "gif",
+  "ico",
+  "jpeg",
+  "jpg",
+  "png",
+  "svg",
+  "ttf",
+  "webp",
+  "woff",
+  "woff2"
+]
+json = false
+
+[urlscan]
+apikey = ""
+
+[filters]
+from = ""
+to = ""
+matchstatuscodes = []
+matchmimetypes = []
+filterstatuscodes = []
+filtermimetypes = [
+  "image/gif",
+  "image/jpeg",
+  "image/png",
+  "image/svg+xml",
+  "image/webp",
+  "text/css"
+]

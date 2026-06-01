@@ -29,6 +29,7 @@ from app.db.models.models import (
     NotificationRule,
     Notification,
     Screenshot,
+    WebEndpoint,
     ThreatIntel,
     AssetRelationship,
 )
@@ -38,5 +39,5 @@ __all__ = [
     "Organization", "Asset", "Subdomain", "IPAddress", "Port",
     "Technology", "Finding", "RiskScore", "Scan", "ScanFinding", "OutboxEvent",
     "NotificationRule", "Notification", "Screenshot", "ThreatIntel",
-    "AssetRelationship",
+    "WebEndpoint", "AssetRelationship",
 ]

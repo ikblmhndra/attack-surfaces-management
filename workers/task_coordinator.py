@@ -23,13 +23,15 @@ local nuclei_expected = redis.call('GET', KEYS[1]) or 0
 local nuclei_done = redis.call('GET', KEYS[2]) or 0
 local port_expected = redis.call('GET', KEYS[3]) or 0
 local port_done = redis.call('GET', KEYS[4]) or 0
-local screenshot_done = redis.call('GET', KEYS[5]) or 0
-local terminal_marked = redis.call('GET', KEYS[6])
+local crawl_expected = redis.call('GET', KEYS[5]) or 0
+local crawl_done = redis.call('GET', KEYS[6]) or 0
+local screenshot_done = redis.call('GET', KEYS[7]) or 0
+local terminal_marked = redis.call('GET', KEYS[8])
 if terminal_marked == '1' then
     return 0
 end
-if tonumber(nuclei_done) >= tonumber(nuclei_expected) and tonumber(port_done) >= tonumber(port_expected) and tonumber(screenshot_done) == 1 then
-    redis.call('SETEX', KEYS[6], 300, '1')
+if tonumber(nuclei_done) >= tonumber(nuclei_expected) and tonumber(port_done) >= tonumber(port_expected) and tonumber(crawl_done) >= tonumber(crawl_expected) and tonumber(screenshot_done) == 1 then
+    redis.call('SETEX', KEYS[8], 300, '1')
     return 1
 end
 return 0
@@ -45,6 +47,8 @@ class TaskCoordinator:
       scan:{scan_id}:nuclei_done       — nuclei batches completed
       scan:{scan_id}:port_expected     — total port batches published
       scan:{scan_id}:port_done         — port batches completed
+      scan:{scan_id}:crawl_expected    — total crawl batches published
+      scan:{scan_id}:crawl_done        — crawl batches completed
       scan:{scan_id}:screenshot_done   — 0/1 flag
       scan:{scan_id}:terminal_marked   — 0/1 flag (atomic guard)
     """
@@ -102,6 +106,20 @@ class TaskCoordinator:
         await r.expire(key, REDIS_KEY_TTL)
         return val
 
+    async def add_crawl_expected(self, scan_id: str, count: int = 1) -> int:
+        r = await self._get_redis()
+        key = f"scan:{scan_id}:crawl_expected"
+        val = await r.incrby(key, count)
+        await r.expire(key, REDIS_KEY_TTL)
+        return val
+
+    async def incr_crawl_done(self, scan_id: str) -> int:
+        r = await self._get_redis()
+        key = f"scan:{scan_id}:crawl_done"
+        val = await r.incr(key)
+        await r.expire(key, REDIS_KEY_TTL)
+        return val
+
     async def set_screenshot_done(self, scan_id: str) -> None:
         r = await self._get_redis()
         key = f"scan:{scan_id}:screenshot_done"
@@ -117,6 +135,8 @@ class TaskCoordinator:
                 f"scan:{scan_id}:nuclei_done",
                 f"scan:{scan_id}:port_expected",
                 f"scan:{scan_id}:port_done",
+                f"scan:{scan_id}:crawl_expected",
+                f"scan:{scan_id}:crawl_done",
                 f"scan:{scan_id}:screenshot_done",
                 f"scan:{scan_id}:terminal_marked",
             ],
@@ -130,8 +150,10 @@ class TaskCoordinator:
         done = int(await r.get(f"scan:{scan_id}:nuclei_done") or 0)
         port_expected = int(await r.get(f"scan:{scan_id}:port_expected") or 0)
         port_done = int(await r.get(f"scan:{scan_id}:port_done") or 0)
+        crawl_expected = int(await r.get(f"scan:{scan_id}:crawl_expected") or 0)
+        crawl_done = int(await r.get(f"scan:{scan_id}:crawl_done") or 0)
         screenshot = int(await r.get(f"scan:{scan_id}:screenshot_done") or 0)
-        return done >= expected and port_done >= port_expected and screenshot == 1
+        return done >= expected and port_done >= port_expected and crawl_done >= crawl_expected and screenshot == 1
 
     async def cleanup(self, scan_id: str) -> None:
         r = await self._get_redis()
@@ -140,6 +162,8 @@ class TaskCoordinator:
             f"scan:{scan_id}:nuclei_done",
             f"scan:{scan_id}:port_expected",
             f"scan:{scan_id}:port_done",
+            f"scan:{scan_id}:crawl_expected",
+            f"scan:{scan_id}:crawl_done",
             f"scan:{scan_id}:screenshot_done",
             f"scan:{scan_id}:terminal_marked",
         )

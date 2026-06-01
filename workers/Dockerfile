@@ -55,6 +55,7 @@ RUN go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest 
     && go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest \
     && go install -v github.com/projectdiscovery/katana/cmd/katana@latest \
     && go install -v github.com/projectdiscovery/chaos-client/cmd/chaos@latest \
+    && go install -v github.com/lc/gau/v2/cmd/gau@latest \
     && go install -v github.com/tomnomnom/assetfinder@latest \
     && go install -v github.com/owasp-amass/amass/v4/...@master
 
@@ -62,13 +63,19 @@ RUN go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest 
 RUN nuclei -update-templates -silent || true
 ENV NUCLEI_TEMPLATES_PATH=/root/nuclei-templates
 
+# ── Tool configuration ─────────────────────────────────────────
+COPY config/gau.toml /root/.gau.toml
+
 # ── Python dependencies ────────────────────────────────────────
 WORKDIR /app
 
 COPY requirements-workers.txt .
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements-workers.txt \
-    && rm -f /usr/local/bin/httpx
+    && rm -f /usr/local/bin/httpx \
+    && ln -sf /go/bin/httpx /usr/local/bin/httpx \
+    && ln -sf /go/bin/katana /usr/local/bin/katana \
+    && ln -sf /go/bin/gau /usr/local/bin/gau
 
 # ── tldextract data ────────────────────────────────────────────
 RUN python -c "import tldextract; tldextract.extract('example.com')"

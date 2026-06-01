@@ -188,6 +188,27 @@ export interface IPDetail {
   open_ports_count: number;
 }
 
+export interface WebEndpoint {
+  id: string;
+  asset_id: string;
+  org_id: string;
+  workspace_id: string;
+  url: string;
+  host: string;
+  path: string;
+  source: string;
+  http_status?: number;
+  status_class: string;
+  content_type?: string;
+  content_length?: number;
+  title?: string;
+  has_params: boolean;
+  is_api: boolean;
+  is_auth: boolean;
+  is_interesting: boolean;
+  last_seen?: string;
+}
+
 export interface Port {
   port:      number;
   protocol:  string;

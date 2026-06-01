@@ -30,7 +30,7 @@ export default function AssetDetailPage() {
   const router = useRouter();
   const assetId = params.id as string;
 
-  const [activeTab, setActiveTab] = useState<"overview" | "findings" | "screenshots" | "intel">("overview");
+  const [activeTab, setActiveTab] = useState<"overview" | "endpoints" | "findings" | "screenshots" | "intel">("overview");
 
   const { data: asset, isLoading } = useQuery({
     queryKey: ["asset", assetId],
@@ -42,6 +42,12 @@ export default function AssetDetailPage() {
     queryKey: ["asset-findings", assetId],
     queryFn: () => assetsAPI.getFindings(assetId).then(r => r.data),
     enabled: !!assetId && activeTab === "findings",
+  });
+
+  const { data: endpoints } = useQuery({
+    queryKey: ["asset-endpoints", assetId],
+    queryFn: () => assetsAPI.getEndpoints(assetId).then(r => r.data),
+    enabled: !!assetId && activeTab === "endpoints",
   });
 
   const { data: screenshots } = useQuery({
@@ -60,8 +66,9 @@ export default function AssetDetailPage() {
   const ip = asset?.ip;
   const ports = asset?.ports || [];
 
-  const TABS: { id: "overview" | "findings" | "screenshots" | "intel"; label: string; count?: number }[] = [
+  const TABS: { id: "overview" | "endpoints" | "findings" | "screenshots" | "intel"; label: string; count?: number }[] = [
     { id: "overview", label: "Overview" },
+    { id: "endpoints", label: "Endpoints" },
     { id: "findings", label: "Findings", count: asset?.open_findings },
     { id: "screenshots", label: "Screenshots" },
     { id: "intel", label: "Threat Intel" },
@@ -312,6 +319,52 @@ export default function AssetDetailPage() {
                   <p className="text-sm text-muted-foreground">No technologies detected</p>
                 )}
               </div>
+            </div>
+          )}
+
+          {activeTab === "endpoints" && (
+            <div className="space-y-3">
+              {endpoints?.items?.length > 0 ? (
+                endpoints.items.map((endpoint: any) => (
+                  <div key={endpoint.id} className="glass-card p-4 space-y-2">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <a href={endpoint.url} target="_blank" rel="noopener noreferrer"
+                          className="text-sm font-mono text-foreground hover:text-brand-400 break-all">
+                          {endpoint.url}
+                        </a>
+                        <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                          <HttpStatusBadge status={endpoint.http_status} statusClass={endpoint.status_class} />
+                          <span className="text-xs bg-surface-700 text-muted-foreground border border-surface-600 px-1.5 py-0.5 rounded">
+                            {endpoint.source}
+                          </span>
+                          {endpoint.is_interesting && (
+                            <span className="text-xs bg-brand-500/10 text-brand-400 border border-brand-500/20 px-1.5 py-0.5 rounded">
+                              Interesting
+                            </span>
+                          )}
+                          {endpoint.is_api && <span className="text-xs bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 px-1.5 py-0.5 rounded">API</span>}
+                          {endpoint.is_auth && <span className="text-xs bg-sky-500/10 text-sky-400 border border-sky-500/20 px-1.5 py-0.5 rounded">Auth</span>}
+                          {endpoint.has_params && <span className="text-xs bg-amber-500/10 text-amber-400 border border-amber-500/20 px-1.5 py-0.5 rounded">Params</span>}
+                        </div>
+                      </div>
+                      <span className="text-xs text-muted-foreground whitespace-nowrap">
+                        {endpoint.last_seen ? formatRelative(endpoint.last_seen) : "—"}
+                      </span>
+                    </div>
+                    {(endpoint.title || endpoint.content_type) && (
+                      <p className="text-xs text-muted-foreground truncate">
+                        {[endpoint.title, endpoint.content_type].filter(Boolean).join(" · ")}
+                      </p>
+                    )}
+                  </div>
+                ))
+              ) : (
+                <div className="glass-card p-8 text-center text-muted-foreground">
+                  <Globe className="w-8 h-8 mx-auto mb-2 opacity-30" />
+                  <p className="text-sm">No crawled endpoints for this asset</p>
+                </div>
+              )}
             </div>
           )}
 

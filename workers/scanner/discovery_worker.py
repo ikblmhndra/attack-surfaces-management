@@ -835,6 +835,7 @@ class DiscoveryWorker(BaseWorker):
         coord = TaskCoordinator()
         port_batches_queued = 0
         nuclei_batches_queued = 0
+        crawl_batches_queued = 0
         screenshot_queued = False
 
         # Port scan task per IP batch (100 IPs per task)
@@ -855,40 +856,41 @@ class DiscoveryWorker(BaseWorker):
                     },
                 )
 
-        # Crawl alive URLs with katana to discover hidden endpoints
-        crawled_urls = set()
-        if alive_hosts and config.get("crawl", True):
-            alive_urls = [
-                info["url"]
-                for info in alive_hosts.values()
-                if info.get("url") and info.get("status_class") in CRAWL_STATUS_CLASSES
-            ]
-            if alive_urls and tmpdir:
-                crawl_tmpdir = tmpdir.parent / f"{tmpdir.name}-katana"
-                crawl_tmpdir.mkdir(exist_ok=True)
-                crawled = await self._crawl_endpoints(alive_urls, crawl_tmpdir, config)
-                crawled_urls.update(crawled)
-
-        # Fuzz URLs with ffuf to discover hidden endpoints (optional, off by default)
-        fuzzed_urls = set()
-        if alive_hosts and config.get("fuzz", False) and tmpdir:
-            alive_urls = [
-                info["url"]
-                for info in alive_hosts.values()
-                if info.get("url") and info.get("status_class") in CRAWL_STATUS_CLASSES
-            ]
-            if alive_urls:
-                fuzz_tmpdir = tmpdir.parent / f"{tmpdir.name}-ffuf"
-                fuzz_tmpdir.mkdir(exist_ok=True)
-                fuzzed = await self._fuzz_endpoints(alive_urls, fuzz_tmpdir, config)
-                fuzzed_urls.update(fuzzed)
+        crawl_targets = []
+        if "crawl" in modules and alive_hosts and config.get("crawl", True):
+            for host in subdomains:
+                info = alive_hosts.get(host)
+                if not info or not info.get("url"):
+                    continue
+                if info.get("status_class") not in CRAWL_STATUS_CLASSES:
+                    continue
+                crawl_targets.append({
+                    "host": host,
+                    "url": info["url"],
+                    "status_code": info.get("status_code"),
+                    "status_class": info.get("status_class"),
+                    "technologies": info.get("technologies", []),
+                })
+            if crawl_targets:
+                await coord.add_crawl_expected(scan_id)
+                crawl_batches_queued += 1
+                await queue.publish(
+                    routing_key="scan.crawl",
+                    message={
+                        "scan_id": scan_id,
+                        "org_id": org_id,
+                        "workspace_id": workspace_id,
+                        "targets": crawl_targets,
+                        "config": config,
+                    },
+                )
 
         nuclei_queued = False
 
         # Nuclei scan per subdomain batch (50 per task)
         if "nuclei" in modules:
             if direct_targets:
-                standard_targets = list(direct_targets) + list(crawled_urls) + list(fuzzed_urls)
+                standard_targets = list(direct_targets)
                 limited_targets = []
                 tech_map = {}
             else:
@@ -907,8 +909,6 @@ class DiscoveryWorker(BaseWorker):
                             limited_targets.append(host)
                         if info.get("url"):
                             tech_map[info["url"]] = info.get("technologies", [])
-                standard_targets.extend(crawled_urls)
-                standard_targets.extend(fuzzed_urls)
 
             batch_size = max(1, min(int(config.get("nuclei_batch_size", 25)), 50))
             limited_config = {
@@ -980,7 +980,7 @@ class DiscoveryWorker(BaseWorker):
 
         await self._update_total_tasks(
             scan_id,
-            total_tasks=1 + port_batches_queued + nuclei_batches_queued + int(screenshot_queued),
+            total_tasks=1 + port_batches_queued + crawl_batches_queued + nuclei_batches_queued + int(screenshot_queued),
         )
 
         await queue.close()

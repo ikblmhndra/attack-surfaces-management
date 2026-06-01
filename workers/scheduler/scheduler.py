@@ -176,7 +176,7 @@ class ScanScheduler:
                     config={
                         "scan_type": "full",
                         "severities": ["critical", "high", "medium", "low"],
-                        "modules": ["discovery", "port", "nuclei", "screenshot"],
+                        "modules": ["discovery", "port", "crawl", "nuclei", "screenshot"],
                         "use_amass": False,
                         "ports": "top-1000",
                     },
@@ -209,7 +209,7 @@ class ScanScheduler:
                     config={
                         "scan_type": "quick",
                         "severities": ["critical", "high"],
-                        "modules": ["discovery", "nuclei"],
+                        "modules": ["discovery", "crawl", "nuclei"],
                     },
                     priority=3,
                 )
@@ -471,9 +471,9 @@ class ScanScheduler:
 
         # Estimate total tasks for progress tracking
         modules = config.get("modules") or (
-            ["discovery", "nuclei"]
+            ["discovery", "crawl", "nuclei"]
             if scan_type == "quick"
-            else ["discovery", "port", "nuclei", "screenshot"]
+            else ["discovery", "port", "crawl", "nuclei", "screenshot"]
         )
         total_tasks = len(modules)
         recency_hours = QUICK_SCAN_INTERVAL_HOURS if scan_type == "quick" else SCAN_INTERVAL_HOURS

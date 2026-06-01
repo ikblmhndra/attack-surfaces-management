@@ -158,6 +158,14 @@ services:
     cap_add:
       - NET_RAW
 
+  worker-crawl:
+    <<: *worker-base
+    command: python -m workers.crawler.web_crawl_worker
+    environment:
+      <<: *common-env
+      WORKER_TYPE: crawl
+      CRAWL_CONCURRENCY: ${CRAWL_CONCURRENCY:-2}
+
   worker-nuclei:
     <<: *worker-base
     command: python -m workers.scanner.nuclei_worker

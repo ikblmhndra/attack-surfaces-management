@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.v1.dependencies.auth import get_current_user, get_db, get_workspace_id, RequireRole
 from app.db.models.models import (
     Asset, AssetRelationship, Finding, IPAddress, Port,
-    Screenshot, Subdomain, Technology, ThreatIntel, User,
+    Screenshot, Subdomain, Technology, ThreatIntel, User, WebEndpoint,
 )
 
 log = structlog.get_logger()
@@ -270,6 +270,32 @@ async def get_asset(
     })
 
     return result
+
+
+@router.get("/{asset_id}/endpoints")
+async def get_asset_endpoints(
+    asset_id: UUID,
+    interesting: Optional[bool] = Query(None),
+    source: Optional[str] = Query(None),
+    status_class: Optional[str] = Query(None),
+    limit: int = Query(200, ge=1, le=1000),
+    workspace_id: UUID = Depends(get_workspace_id),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List crawled web endpoints for an asset."""
+    asset = await _get_asset_or_404(db, asset_id, workspace_id)
+    query = select(WebEndpoint).where(WebEndpoint.asset_id == asset.id)
+    if interesting is not None:
+        query = query.where(WebEndpoint.is_interesting == interesting)
+    if source:
+        query = query.where(WebEndpoint.source == source)
+    if status_class:
+        query = query.where(WebEndpoint.status_class == status_class)
+    rows = (await db.execute(
+        query.order_by(WebEndpoint.is_interesting.desc(), WebEndpoint.last_seen.desc()).limit(limit)
+    )).scalars().all()
+    return {"items": [_endpoint_to_dict(row) for row in rows], "total": len(rows)}
 
 
 @router.get("/{asset_id}/findings")
@@ -568,6 +594,29 @@ def _port_to_dict(port) -> dict:
         "banner": port.banner[:200] if port.banner else None,
         "first_seen": port.first_seen.isoformat(),
         "last_seen": port.last_seen.isoformat(),
+    }
+
+
+def _endpoint_to_dict(endpoint) -> dict:
+    return {
+        "id": str(endpoint.id),
+        "asset_id": str(endpoint.asset_id),
+        "org_id": str(endpoint.org_id),
+        "workspace_id": str(endpoint.workspace_id),
+        "url": endpoint.url,
+        "host": endpoint.host,
+        "path": endpoint.path,
+        "source": endpoint.source,
+        "http_status": endpoint.http_status,
+        "status_class": endpoint.status_class,
+        "content_type": endpoint.content_type,
+        "content_length": endpoint.content_length,
+        "title": endpoint.title,
+        "has_params": endpoint.has_params,
+        "is_api": endpoint.is_api,
+        "is_auth": endpoint.is_auth,
+        "is_interesting": endpoint.is_interesting,
+        "last_seen": endpoint.last_seen.isoformat() if endpoint.last_seen else None,
     }
 
 

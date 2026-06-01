@@ -192,6 +192,7 @@ export const organizationsAPI = {
 export const assetsAPI = {
   list: (params?: Record<string, any>) => api.get("/assets", { params }),
   get: (id: string) => api.get(`/assets/${id}`),
+  getEndpoints: (id: string, params?: Record<string, any>) => api.get(`/assets/${id}/endpoints`, { params }),
   getFindings: (id: string) => api.get(`/assets/${id}/findings`),
   getTechnologies: (id: string) => api.get(`/assets/${id}/technologies`),
   getScreenshots: (id: string) => api.get(`/assets/${id}/screenshots`),

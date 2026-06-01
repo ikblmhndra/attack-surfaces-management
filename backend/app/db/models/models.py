@@ -291,6 +291,43 @@ class Subdomain(TimestampMixin, Base):
     asset = relationship("Asset", back_populates="subdomain")
 
 
+class WebEndpoint(TimestampMixin, Base):
+    __tablename__ = "web_endpoints"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    asset_id = Column(UUID(as_uuid=True), ForeignKey("assets.id", ondelete="CASCADE"), nullable=False, index=True)
+    org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True)
+    workspace_id = Column(UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    url = Column(String(2000), nullable=False)
+    host = Column(String(500), nullable=False, index=True)
+    path = Column(String(1500), nullable=False, default="/")
+    source = Column(String(50), nullable=False, default="katana")
+
+    http_status = Column(Integer, nullable=True)
+    status_class = Column(String(50), nullable=False, default="probe_failed", index=True)
+    content_type = Column(String(255), nullable=True)
+    content_length = Column(Integer, nullable=True)
+    title = Column(String(500), nullable=True)
+
+    has_params = Column(Boolean, nullable=False, default=False, index=True)
+    is_api = Column(Boolean, nullable=False, default=False, index=True)
+    is_auth = Column(Boolean, nullable=False, default=False, index=True)
+    is_interesting = Column(Boolean, nullable=False, default=False, index=True)
+    metadata_ = Column("metadata", JSONB, nullable=False, default=dict)
+
+    first_seen = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    last_seen = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("org_id", "url", name="uq_web_endpoint_org_url"),
+        Index("ix_web_endpoint_asset_interesting", "asset_id", "is_interesting"),
+        Index("ix_web_endpoint_org_source", "org_id", "source"),
+    )
+
+    asset = relationship("Asset")
+
+
 class IPAddress(TimestampMixin, Base):
     __tablename__ = "ip_addresses"
 

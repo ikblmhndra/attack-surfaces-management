@@ -14,8 +14,8 @@ from app.services.outbox_service import create_queue_event, dispatch_pending_out
 log = structlog.get_logger()
 
 DEFAULT_MODULES = {
-    "full":      ["discovery", "port", "nuclei", "screenshot"],
-    "quick":     ["discovery", "nuclei"],
+    "full":      ["discovery", "port", "crawl", "nuclei", "screenshot"],
+    "quick":     ["discovery", "crawl", "nuclei"],
     "discovery": ["discovery"],
     "vuln":      ["nuclei"],
 }
