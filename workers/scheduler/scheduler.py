@@ -6,7 +6,7 @@ Also handles TLS expiry pre-checks, enrichment refreshes, and cleanup tasks.
 import asyncio
 import os
 from datetime import datetime, timedelta, timezone
-from typing import List
+from typing import List, Optional
 
 import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -20,9 +20,12 @@ from workers.queue_client import QueueClient
 log = structlog.get_logger()
 
 SCAN_INTERVAL_HOURS = int(os.getenv("SCAN_INTERVAL_HOURS", "24"))
+RUN_FULL_SCAN_ON_START = os.getenv("RUN_FULL_SCAN_ON_START", "false").lower() in {"1", "true", "yes"}
 TLS_CHECK_INTERVAL_HOURS = 12
 CLEANUP_INTERVAL_HOURS = 6
 ENRICHMENT_REFRESH_HOURS = 48
+QUICK_SCAN_INTERVAL_HOURS = 6
+ACTIVE_SCAN_STATUSES = ("queued", "pending", "running")
 
 
 class ScanScheduler:
@@ -88,13 +91,17 @@ class ScanScheduler:
             trigger=IntervalTrigger(hours=SCAN_INTERVAL_HOURS),
             id="full_scans",
             name="Schedule full scans for all active organizations",
-            next_run_time=datetime.now(timezone.utc) + timedelta(minutes=2),
+            next_run_time=(
+                datetime.now(timezone.utc) + timedelta(minutes=2)
+                if RUN_FULL_SCAN_ON_START
+                else None
+            ),
         )
 
         # ── Quick scans (DNS/TLS/headers only) ────────────────
         self.scheduler.add_job(
             self._schedule_quick_scans,
-            trigger=IntervalTrigger(hours=6),
+            trigger=IntervalTrigger(hours=QUICK_SCAN_INTERVAL_HOURS),
             id="quick_scans",
             name="Quick scans: DNS, TLS, security headers",
         )
@@ -157,7 +164,7 @@ class ScanScheduler:
         queued = 0
         for org in orgs:
             try:
-                await self._create_scheduled_scan(
+                scan_id = await self._create_scheduled_scan(
                     org["id"],
                     org["workspace_id"],
                     "full",
@@ -175,7 +182,8 @@ class ScanScheduler:
                     },
                     priority=5,
                 )
-                queued += 1
+                if scan_id:
+                    queued += 1
             except Exception as e:
                 log.error("scan_queue_error", org_id=org["id"], error=str(e))
 
@@ -188,9 +196,10 @@ class ScanScheduler:
         async with get_session() as db:
             orgs = await self._get_active_organizations(db)
 
+        queued = 0
         for org in orgs:
             try:
-                await self._create_scheduled_scan(
+                scan_id = await self._create_scheduled_scan(
                     org["id"],
                     org["workspace_id"],
                     "quick",
@@ -204,8 +213,11 @@ class ScanScheduler:
                     },
                     priority=3,
                 )
+                if scan_id:
+                    queued += 1
             except Exception as e:
                 log.error("quick_scan_queue_error", org_id=org["id"], error=str(e))
+        log.info("quick_scans_queued", count=queued)
 
     async def _check_tls_expiry(self) -> None:
         """Find certificates expiring soon and create findings/notifications."""
@@ -426,6 +438,7 @@ class ScanScheduler:
         orgs = [
             org for org, ws_settings in rows
             if ws_settings.get("auto_scan_enabled", True)
+            and getattr(org, "auto_scan_enabled", True)
         ]
 
         return [
@@ -449,7 +462,7 @@ class ScanScheduler:
         targets: dict,
         config: dict,
         priority: int,
-    ) -> str:
+    ) -> Optional[str]:
         """Create a scan record and return its ID."""
         import uuid
         from workers.db_models import Scan
@@ -457,21 +470,21 @@ class ScanScheduler:
         scan_id = str(uuid.uuid4())
 
         # Estimate total tasks for progress tracking
-        if scan_type == "quick":
-            modules = ["discovery", "nuclei"]
-        else:
-            modules = ["discovery", "port", "nuclei", "screenshot"]
-        total_tasks = 1  # discovery
-        if "port" in modules:
-            total_tasks += 1
-        if "nuclei" in modules:
-            total_tasks += 1
-        if "screenshot" in modules:
-            total_tasks += 1
+        modules = config.get("modules") or (
+            ["discovery", "nuclei"]
+            if scan_type == "quick"
+            else ["discovery", "port", "nuclei", "screenshot"]
+        )
+        total_tasks = len(modules)
+        recency_hours = QUICK_SCAN_INTERVAL_HOURS if scan_type == "quick" else SCAN_INTERVAL_HOURS
 
         async with get_session() as db:
             from sqlalchemy.dialects.postgresql import insert as pg_insert
             from workers.db_models import OutboxEvent
+
+            if await self._has_recent_or_active_scan(db, org_id, scan_type, recency_hours):
+                log.info("scheduled_scan_skipped_recent_or_active", org_id=org_id, scan_type=scan_type)
+                return None
 
             await db.execute(
                 pg_insert(Scan.__table__).values(
@@ -504,7 +517,41 @@ class ScanScheduler:
             )
             await db.commit()
 
+        try:
+            from app.services.outbox_service import dispatch_pending_outbox_once
+            await dispatch_pending_outbox_once(limit=5)
+        except Exception as exc:
+            log.warning("scheduled_scan_outbox_dispatch_deferred", scan_id=scan_id, error=str(exc))
+
         return scan_id
+
+    async def _has_recent_or_active_scan(
+        self,
+        db,
+        org_id: str,
+        scan_type: str,
+        recency_hours: int,
+    ) -> bool:
+        """Avoid duplicate automated scans on restart or scheduler catch-up."""
+        from workers.db_models import Scan
+
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=recency_hours)
+        result = await db.execute(
+            select(Scan.id)
+            .where(
+                Scan.org_id == org_id,
+                Scan.scan_type == scan_type,
+                (
+                    Scan.status.in_(ACTIVE_SCAN_STATUSES)
+                    | (
+                        (Scan.status == "completed")
+                        & (Scan.created_at >= cutoff)
+                    )
+                ),
+            )
+            .limit(1)
+        )
+        return result.scalar_one_or_none() is not None
 
     async def _health_check(self) -> None:
         """Log scheduler health metrics."""

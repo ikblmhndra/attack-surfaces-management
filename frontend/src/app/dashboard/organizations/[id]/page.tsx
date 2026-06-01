@@ -5,7 +5,7 @@ import { useParams, useRouter } from "next/navigation";
 import {
   Building2, ArrowLeft, RefreshCw, Scan, Edit, AlertTriangle,
   Layers, Globe, Clock, Activity, TrendingUp, TrendingDown,
-  ChevronRight, X, Save, Loader2
+  ChevronRight, X, Save, Loader2, Timer
 } from "lucide-react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { formatDistanceToNow } from "date-fns";
@@ -36,6 +36,7 @@ export default function OrganizationDetailPage() {
   const [editForm, setEditForm] = useState({
     name: "", description: "", domains: "", ip_ranges: "", asns: "",
     company_name: "", industry: "", criticality: 3, environment: "production",
+    auto_scan_enabled: true,
   });
 
   const updateOrg = useMutation({
@@ -59,6 +60,7 @@ export default function OrganizationDetailPage() {
       industry: org?.industry || "",
       criticality: org?.criticality || 3,
       environment: org?.environment || "production",
+      auto_scan_enabled: org?.auto_scan_enabled ?? true,
     });
     setEditing(true);
   };
@@ -134,6 +136,7 @@ export default function OrganizationDetailPage() {
               <span>{org.domains?.length || 0} domains</span>
               <span>{org.total_assets?.toLocaleString() || 0} assets</span>
               <span>{org.total_findings} findings</span>
+              <span>{org.auto_scan_enabled ? "Auto scan on" : "Auto scan off"}</span>
               {org.last_scan_at && (
                 <span>Last scan {formatDistanceToNow(new Date(org.last_scan_at), { addSuffix: true })}</span>
               )}
@@ -384,6 +387,7 @@ export default function OrganizationDetailPage() {
                   industry: editForm.industry || null,
                   criticality: editForm.criticality,
                   environment: editForm.environment,
+                  auto_scan_enabled: editForm.auto_scan_enabled,
                 })}}
                 className="p-5 space-y-4 max-h-[60vh] overflow-y-auto"
               >
@@ -464,6 +468,23 @@ export default function OrganizationDetailPage() {
                     </select>
                   </div>
                 </div>
+                <label className="flex items-center justify-between gap-4 rounded-lg border border-surface-700 bg-surface-800/60 px-3 py-3">
+                  <div className="flex items-start gap-3">
+                    <Timer className="mt-0.5 h-4 w-4 text-emerald-400" />
+                    <div>
+                      <p className="text-sm font-medium text-foreground">Automatic scheduled scans</p>
+                      <p className="text-xs text-muted-foreground mt-0.5">
+                        Include this organization in default scheduler runs.
+                      </p>
+                    </div>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={editForm.auto_scan_enabled}
+                    onChange={(e) => setEditForm(f => ({...f, auto_scan_enabled: e.target.checked}))}
+                    className="h-4 w-4 rounded border-border bg-surface-900 text-brand-500 focus:ring-brand-500"
+                  />
+                </label>
 
                 <div className="flex items-center gap-3 pt-2">
                   <button type="button" onClick={() => setEditing(false)}

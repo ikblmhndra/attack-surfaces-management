@@ -173,6 +173,7 @@ class Organization(TimestampMixin, SoftDeleteMixin, Base):
     total_findings = Column(Integer, nullable=False, default=0)
     last_scan_at = Column(DateTime(timezone=True), nullable=True)
     is_monitoring_active = Column(Boolean, nullable=False, default=True)
+    auto_scan_enabled = Column(Boolean, nullable=False, default=True)
 
     __table_args__ = (
         UniqueConstraint("workspace_id", "slug", name="uq_org_workspace_slug"),

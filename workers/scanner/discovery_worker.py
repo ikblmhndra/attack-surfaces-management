@@ -30,6 +30,9 @@ log = structlog.get_logger()
 _TOOL_CACHE: Dict[str, bool] = {}
 
 TECH_VERSION_RE = re.compile(r"^(.+?)[/:@ ]v?([0-9][A-Za-z0-9._+-]*)$")
+CRAWL_STATUS_CLASSES = {"ok", "redirect"}
+NUCLEI_STANDARD_STATUS_CLASSES = {"ok", "redirect"}
+NUCLEI_LIMITED_STATUS_CLASSES = {"auth_required", "server_error", "rate_limited"}
 
 
 def tool_available(name: str) -> bool:
@@ -56,6 +59,39 @@ def normalize_technology(raw: Any) -> Optional[Dict[str, Optional[str]]]:
     if not name:
         return None
     return {"name": name[:255], "version": version[:100] if version else ""}
+
+
+def classify_http_status(status_code: Optional[int]) -> str:
+    if status_code is None:
+        return "probe_failed"
+    try:
+        status = int(status_code)
+    except (TypeError, ValueError):
+        return "probe_failed"
+    if 200 <= status < 300:
+        return "ok"
+    if 300 <= status < 400:
+        return "redirect"
+    if status in {401, 403}:
+        return "auth_required"
+    if status == 404:
+        return "not_found"
+    if status == 429:
+        return "rate_limited"
+    if 500 <= status < 600:
+        return "server_error"
+    return "other"
+
+
+def dedupe_preserve_order(values: List[str]) -> List[str]:
+    seen = set()
+    deduped = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
 
 
 class DiscoveryWorker(BaseWorker):
@@ -614,6 +650,7 @@ class DiscoveryWorker(BaseWorker):
                     alive[host] = {
                         "url": url,
                         "status_code": data.get("status_code"),
+                        "status_class": classify_http_status(data.get("status_code")),
                         "title": data.get("title", ""),
                         "webserver": data.get("webserver", ""),
                         "content_length": data.get("content_length"),
@@ -629,6 +666,13 @@ class DiscoveryWorker(BaseWorker):
                     }
                 except json.JSONDecodeError:
                     continue
+
+        status_counts: Dict[str, int] = {}
+        for item in alive.values():
+            status_class = item.get("status_class", "probe_failed")
+            status_counts[status_class] = status_counts.get(status_class, 0) + 1
+        if status_counts:
+            log.info("http_status_classified", counts=status_counts)
 
         return alive
 
@@ -789,6 +833,9 @@ class DiscoveryWorker(BaseWorker):
         await queue.connect()
 
         coord = TaskCoordinator()
+        port_batches_queued = 0
+        nuclei_batches_queued = 0
+        screenshot_queued = False
 
         # Port scan task per IP batch (100 IPs per task)
         if "port" in modules:
@@ -796,6 +843,7 @@ class DiscoveryWorker(BaseWorker):
             for i in range(0, len(ips), batch_size):
                 ip_batch = ips[i:i + batch_size]
                 await coord.add_port_expected(scan_id)
+                port_batches_queued += 1
                 await queue.publish(
                     routing_key="scan.port",
                     message={
@@ -810,7 +858,11 @@ class DiscoveryWorker(BaseWorker):
         # Crawl alive URLs with katana to discover hidden endpoints
         crawled_urls = set()
         if alive_hosts and config.get("crawl", True):
-            alive_urls = [info["url"] for info in alive_hosts.values() if info.get("url")]
+            alive_urls = [
+                info["url"]
+                for info in alive_hosts.values()
+                if info.get("url") and info.get("status_class") in CRAWL_STATUS_CLASSES
+            ]
             if alive_urls and tmpdir:
                 crawl_tmpdir = tmpdir.parent / f"{tmpdir.name}-katana"
                 crawl_tmpdir.mkdir(exist_ok=True)
@@ -820,7 +872,11 @@ class DiscoveryWorker(BaseWorker):
         # Fuzz URLs with ffuf to discover hidden endpoints (optional, off by default)
         fuzzed_urls = set()
         if alive_hosts and config.get("fuzz", False) and tmpdir:
-            alive_urls = [info["url"] for info in alive_hosts.values() if info.get("url")]
+            alive_urls = [
+                info["url"]
+                for info in alive_hosts.values()
+                if info.get("url") and info.get("status_class") in CRAWL_STATUS_CLASSES
+            ]
             if alive_urls:
                 fuzz_tmpdir = tmpdir.parent / f"{tmpdir.name}-ffuf"
                 fuzz_tmpdir.mkdir(exist_ok=True)
@@ -832,53 +888,100 @@ class DiscoveryWorker(BaseWorker):
         # Nuclei scan per subdomain batch (50 per task)
         if "nuclei" in modules:
             if direct_targets:
-                nuclei_targets = list(direct_targets) + list(crawled_urls) + list(fuzzed_urls)
+                standard_targets = list(direct_targets) + list(crawled_urls) + list(fuzzed_urls)
+                limited_targets = []
                 tech_map = {}
             else:
-                nuclei_targets = list(subdomains) + list(crawled_urls) + list(fuzzed_urls)
+                standard_targets = []
+                limited_targets = []
                 tech_map = {}
                 if alive_hosts:
                     for host in list(subdomains):
                         info = alive_hosts.get(host)
-                        if info and info.get("url"):
+                        if not info:
+                            continue
+                        status_class = info.get("status_class") or classify_http_status(info.get("status_code"))
+                        if status_class in NUCLEI_STANDARD_STATUS_CLASSES:
+                            standard_targets.append(host)
+                        elif status_class in NUCLEI_LIMITED_STATUS_CLASSES:
+                            limited_targets.append(host)
+                        if info.get("url"):
                             tech_map[info["url"]] = info.get("technologies", [])
+                standard_targets.extend(crawled_urls)
+                standard_targets.extend(fuzzed_urls)
 
             batch_size = max(1, min(int(config.get("nuclei_batch_size", 25)), 50))
-            for i in range(0, len(nuclei_targets), batch_size):
-                batch = nuclei_targets[i:i + batch_size]
-                msg = {
-                    "scan_id": scan_id,
-                    "org_id": org_id,
-                    "workspace_id": workspace_id,
-                    "targets": batch,
-                    "config": config,
-                }
-                if tech_map:
-                    msg["tech_map"] = tech_map
-                await coord.add_nuclei_expected(scan_id)
-                await queue.publish(
-                    routing_key="scan.nuclei",
-                    message=msg,
+            limited_config = {
+                **config,
+                "automatic_scan": False,
+                "vuln_depth": "default",
+                "severities": ["critical", "high", "medium"],
+                "scan_timeout": min(int(config.get("scan_timeout", 600)), 300),
+            }
+            for target_group, group_config, profile in (
+                (standard_targets, config, "standard"),
+                (limited_targets, limited_config, "limited"),
+            ):
+                target_group = dedupe_preserve_order(target_group)
+                if not target_group:
+                    continue
+                log.info(
+                    "nuclei_targets_selected",
+                    scan_id=scan_id,
+                    profile=profile,
+                    targets=len(target_group),
                 )
-                nuclei_queued = True
+                for i in range(0, len(target_group), batch_size):
+                    batch = target_group[i:i + batch_size]
+                    msg = {
+                        "scan_id": scan_id,
+                        "org_id": org_id,
+                        "workspace_id": workspace_id,
+                        "targets": batch,
+                        "config": group_config,
+                    }
+                    if tech_map:
+                        msg["tech_map"] = tech_map
+                    await coord.add_nuclei_expected(scan_id)
+                    nuclei_batches_queued += 1
+                    await queue.publish(
+                        routing_key="scan.nuclei",
+                        message=msg,
+                    )
+                    nuclei_queued = True
+
+        screenshot_targets = subdomains
+        if alive_hosts:
+            screenshot_targets = [
+                host for host in subdomains
+                if alive_hosts.get(host, {}).get("status_class") in (
+                    CRAWL_STATUS_CLASSES | NUCLEI_LIMITED_STATUS_CLASSES
+                )
+            ]
 
         # Screenshot task
-        if "screenshot" in modules and subdomains:
+        if "screenshot" in modules and screenshot_targets:
             await queue.publish(
                 routing_key="scan.screenshot",
                 message={
                     "scan_id": scan_id,
                     "org_id": org_id,
                     "workspace_id": workspace_id,
-                    "targets": subdomains[:200],  # Limit screenshots
+                    "targets": screenshot_targets[:200],  # Limit screenshots
                     "config": config,
                 },
             )
-        elif "screenshot" not in modules:
-            # No screenshot worker in pipeline — mark screenshot as done
-            # so the terminal check (nuclei_done >= expected && screenshot_done == 1)
-            # can pass without waiting for a non-existent worker.
+            screenshot_queued = True
+        else:
+            # No screenshot work was queued. Mark it done so terminal
+            # coordination does not wait for a worker message that will
+            # never exist.
             await coord.set_screenshot_done(scan_id)
+
+        await self._update_total_tasks(
+            scan_id,
+            total_tasks=1 + port_batches_queued + nuclei_batches_queued + int(screenshot_queued),
+        )
 
         await queue.close()
         await coord.close()
@@ -931,6 +1034,18 @@ class DiscoveryWorker(BaseWorker):
             )
         )
         await db.commit()
+
+    async def _update_total_tasks(self, scan_id: str, total_tasks: int) -> None:
+        from sqlalchemy import update
+        from workers.db_models import Scan
+
+        async with get_session() as db:
+            await db.execute(
+                update(Scan)
+                .where(Scan.id == scan_id)
+                .values(total_tasks=max(1, total_tasks))
+            )
+            await db.commit()
 
     async def _finalize_if_no_work(
         self,

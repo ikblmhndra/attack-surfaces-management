@@ -42,6 +42,7 @@ class OrgCreateRequest(BaseModel):
     tags: List[str] = Field(default_factory=list)
     criticality: int = Field(default=3, ge=1, le=5)
     environment: str = Field(default="production")
+    auto_scan_enabled: bool = True
 
 
 class OrgUpdateRequest(BaseModel):
@@ -57,6 +58,7 @@ class OrgUpdateRequest(BaseModel):
     criticality: Optional[int] = Field(None, ge=1, le=5)
     environment: Optional[str] = None
     is_monitoring_active: Optional[bool] = None
+    auto_scan_enabled: Optional[bool] = None
 
 
 class ScanRequest(BaseModel):
@@ -100,6 +102,7 @@ class OrgResponse(BaseModel):
     total_assets: int
     total_findings: int
     is_monitoring_active: bool
+    auto_scan_enabled: bool
     last_scan_at: Optional[str]
     current_score: Optional[dict]
     created_at: str
@@ -191,6 +194,7 @@ async def list_organizations(
             "total_assets": org.total_assets,
             "total_findings": org.total_findings,
             "is_monitoring_active": org.is_monitoring_active,
+            "auto_scan_enabled": org.auto_scan_enabled,
             "last_scan_at": org.last_scan_at.isoformat() if org.last_scan_at else None,
             "current_score": {
                 "overall": latest_score.overall_score,
@@ -255,6 +259,7 @@ async def create_organization(
         tags=request.tags,
         criticality=request.criticality,
         environment=request.environment,
+        auto_scan_enabled=request.auto_scan_enabled,
     )
     db.add(org)
     await db.commit()
@@ -325,6 +330,7 @@ async def get_organization(
         "total_assets": asset_count,
         "total_findings": finding_count,
         "is_monitoring_active": org.is_monitoring_active,
+        "auto_scan_enabled": org.auto_scan_enabled,
         "last_scan_at": org.last_scan_at.isoformat() if org.last_scan_at else None,
         "risk_score": {
             "overall": latest_score.overall_score,

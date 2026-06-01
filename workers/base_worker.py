@@ -145,12 +145,18 @@ class BaseWorker(ABC):
                     heartbeat=heartbeat,
                 )
                 self.channel = await self.connection.channel()
-                await self.channel.set_qos(prefetch_count=self.PREFETCH_COUNT)
+                prefetch_count = min(self.PREFETCH_COUNT, max(1, self.CONCURRENCY))
+                await self.channel.set_qos(prefetch_count=prefetch_count)
 
                 # Declare all required exchanges and queues
                 await self._declare_topology()
 
-                log.info("rabbitmq_connected", queue=self.QUEUE, attempt=attempt)
+                log.info(
+                    "rabbitmq_connected",
+                    queue=self.QUEUE,
+                    attempt=attempt,
+                    prefetch_count=prefetch_count,
+                )
                 return
             except Exception as e:
                 if attempt == 5:

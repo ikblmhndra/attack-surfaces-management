@@ -219,6 +219,7 @@ services:
       <<: *common-env
       WORKER_TYPE: scheduler
       SCAN_INTERVAL_HOURS: ${SCAN_INTERVAL_HOURS:-24}
+      RUN_FULL_SCAN_ON_START: ${RUN_FULL_SCAN_ON_START:-false}
 
   # ============================================================
   # DATABASES & STORAGE

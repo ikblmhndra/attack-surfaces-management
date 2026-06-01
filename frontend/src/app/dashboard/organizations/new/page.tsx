@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import {
-  Building2, ArrowLeft, Save, RefreshCw, Plus, X
+  Building2, ArrowLeft, Save, RefreshCw, Plus, X, Timer
 } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
@@ -23,6 +23,7 @@ export default function NewOrganizationPage() {
   const [rootDomains, setRootDomains] = useState<string[]>([""]);
   const [industry, setIndustry] = useState("");
   const [criticality, setCriticality] = useState(3);
+  const [autoScanEnabled, setAutoScanEnabled] = useState(true);
 
   const qc = useQueryClient();
 
@@ -35,6 +36,7 @@ export default function NewOrganizationPage() {
         root_domains: rootDomains.filter(Boolean),
         industry: industry || undefined,
         criticality,
+        auto_scan_enabled: autoScanEnabled,
       }),
     onSuccess: (res) => {
       toast.success("Organization created");
@@ -208,6 +210,28 @@ export default function NewOrganizationPage() {
             </button>
           </div>
 
+          {/* Automation */}
+          <div className="glass-card p-5 space-y-4">
+            <h2 className="text-sm font-semibold text-foreground flex items-center gap-2">
+              <Timer className="w-4 h-4 text-emerald-400" />
+              Automation
+            </h2>
+            <label className="flex items-center justify-between gap-4">
+              <div>
+                <p className="text-sm font-medium text-foreground">Automatic scheduled scans</p>
+                <p className="text-xs text-muted-foreground mt-0.5">
+                  Include this organization in default quick and full scan schedules.
+                </p>
+              </div>
+              <input
+                type="checkbox"
+                checked={autoScanEnabled}
+                onChange={e => setAutoScanEnabled(e.target.checked)}
+                className="h-4 w-4 rounded border-border bg-surface-800 text-brand-500 focus:ring-brand-500"
+              />
+            </label>
+          </div>
+
           {/* Submit */}
           <div className="flex items-center gap-3">
             <button
@@ -231,4 +255,3 @@ export default function NewOrganizationPage() {
     </div>
   );
 }
-

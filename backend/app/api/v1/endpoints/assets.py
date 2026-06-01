@@ -23,6 +23,52 @@ router = APIRouter()
 require_analyst = RequireRole(["owner", "admin", "analyst"])
 
 
+def _classify_http_status(status_code: Optional[int]) -> str:
+    if status_code is None:
+        return "probe_failed"
+    if 200 <= status_code < 300:
+        return "ok"
+    if 300 <= status_code < 400:
+        return "redirect"
+    if status_code in {401, 403}:
+        return "auth_required"
+    if status_code == 404:
+        return "not_found"
+    if status_code == 429:
+        return "rate_limited"
+    if 500 <= status_code < 600:
+        return "server_error"
+    return "other"
+
+
+def _http_status_conditions(status_class: str) -> list:
+    status_class = status_class.strip().lower()
+    if status_class == "ok":
+        return [and_(Subdomain.http_status >= 200, Subdomain.http_status < 300)]
+    if status_class == "redirect":
+        return [and_(Subdomain.http_status >= 300, Subdomain.http_status < 400)]
+    if status_class == "auth_required":
+        return [Subdomain.http_status.in_([401, 403])]
+    if status_class == "not_found":
+        return [Subdomain.http_status == 404]
+    if status_class == "rate_limited":
+        return [Subdomain.http_status == 429]
+    if status_class == "server_error":
+        return [and_(Subdomain.http_status >= 500, Subdomain.http_status < 600)]
+    if status_class == "probe_failed":
+        return [Subdomain.http_status.is_(None)]
+    if status_class == "other":
+        return [
+            and_(
+                Subdomain.http_status.isnot(None),
+                ~and_(Subdomain.http_status >= 200, Subdomain.http_status < 400),
+                ~Subdomain.http_status.in_([401, 403, 404, 429]),
+                ~and_(Subdomain.http_status >= 500, Subdomain.http_status < 600),
+            )
+        ]
+    return []
+
+
 # ── Asset List ─────────────────────────────────────────────────
 
 @router.get("")
@@ -34,6 +80,7 @@ async def list_assets(
     tags: Optional[str] = Query(None),
     has_findings: Optional[bool] = Query(None),
     technology: Optional[str] = Query(None),
+    http_status_class: Optional[str] = Query(None, description="ok,redirect,auth_required,not_found,rate_limited,server_error,other"),
     cdn_only: Optional[bool] = Query(None),
     cloud_provider: Optional[str] = Query(None),
     criticality: Optional[int] = Query(None, ge=1, le=5),
@@ -85,6 +132,11 @@ async def list_assets(
             Subdomain.technologies.any(technology)
         ).scalar_subquery()
         query = query.where(Asset.id.in_(tech_subq))
+    if http_status_class:
+        status_conditions = _http_status_conditions(http_status_class)
+        if status_conditions:
+            status_subq = select(Subdomain.asset_id).where(or_(*status_conditions)).scalar_subquery()
+            query = query.where(Asset.id.in_(status_subq))
 
     # Count
     count_q = select(func.count()).select_from(query.subquery())
@@ -466,6 +518,7 @@ def _asset_to_dict(asset, sub=None, ip=None, detailed=False) -> dict:
             "root_domain": sub.root_domain,
             "ip_addresses": sub.ip_addresses or [],
             "http_status": sub.http_status,
+            "http_status_class": _classify_http_status(sub.http_status),
             "https_status": sub.https_status,
             "title": sub.http_title,
             "server": sub.http_server,

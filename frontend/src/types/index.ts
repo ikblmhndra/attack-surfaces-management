@@ -151,6 +151,7 @@ export interface SubdomainDetail {
   root_domain:    string;
   ip_addresses:   string[];
   http_status?:   number;
+  http_status_class?: "ok" | "redirect" | "auth_required" | "not_found" | "rate_limited" | "server_error" | "probe_failed" | "other";
   https_status?:  number;
   title?:         string;
   server?:        string;

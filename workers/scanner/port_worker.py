@@ -45,6 +45,7 @@ class PortWorker(BaseWorker):
             log.info("port_scan_no_targets", scan_id=scan_id)
             async with get_session() as db:
                 await self._update_scan_progress(db, scan_id)
+            await self._mark_port_done(scan_id, org_id, workspace_id)
             return
 
         naabu_path = shutil.which("naabu") or "/go/bin/naabu"

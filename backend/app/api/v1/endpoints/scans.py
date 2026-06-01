@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime, timezone
 from uuid import UUID
 from typing import List, Optional
 
@@ -154,5 +155,6 @@ async def cancel_scan(scan_id: UUID, workspace_id: UUID = Depends(get_workspace_
     if scan.status not in ("pending", "running", "queued"):
         raise HTTPException(400, f"Cannot cancel scan in state: {scan.status}")
     scan.status = "cancelled"
+    scan.completed_at = datetime.now(timezone.utc)
     await db.commit()
     return {"message": "Scan cancellation requested"}

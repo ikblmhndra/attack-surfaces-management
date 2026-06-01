@@ -21,11 +21,23 @@ const ASSET_TYPE_CONFIG = {
   url:       { icon: Globe,   color: "#d97706", label: "URLs" },
 };
 
+const HTTP_STATUS_CONFIG: Record<string, { label: string; className: string }> = {
+  ok:            { label: "OK",            className: "bg-emerald-500/10 text-emerald-400 border-emerald-500/20" },
+  redirect:      { label: "Redirect",      className: "bg-yellow-500/10 text-yellow-400 border-yellow-500/20" },
+  auth_required: { label: "Auth",          className: "bg-sky-500/10 text-sky-400 border-sky-500/20" },
+  not_found:     { label: "Not Found",     className: "bg-surface-700 text-muted-foreground border-border" },
+  rate_limited:  { label: "Rate Limited",  className: "bg-amber-500/10 text-amber-400 border-amber-500/20" },
+  server_error:  { label: "Server Error",  className: "bg-red-500/10 text-red-400 border-red-500/20" },
+  probe_failed:  { label: "Probe Failed",  className: "bg-surface-700 text-muted-foreground border-border" },
+  other:         { label: "Other",         className: "bg-surface-700 text-muted-foreground border-border" },
+};
+
 export default function AssetsPage() {
   const { activeOrg } = useWorkspaceStore();
 
   const [typeFilter, setTypeFilter]   = useState<string>("");
   const [statusFilter, setStatusFilter] = useState<string>("active");
+  const [httpStatusFilter, setHttpStatusFilter] = useState<string>("");
   const [search, setSearch]           = useState("");
   const [page, setPage]               = useState(1);
   const [selected, setSelected]       = useState<any>(null);
@@ -36,9 +48,10 @@ export default function AssetsPage() {
     if (activeOrg?.id) p.set("org_id", activeOrg.id);
     if (typeFilter)    p.set("asset_type", typeFilter);
     if (statusFilter)  p.set("status", statusFilter);
+    if (httpStatusFilter) p.set("http_status_class", httpStatusFilter);
     if (search)        p.set("search", search);
     return p.toString();
-  }, [page, typeFilter, statusFilter, search, activeOrg?.id]);
+  }, [page, typeFilter, statusFilter, httpStatusFilter, search, activeOrg?.id]);
 
   const { data, isLoading, refetch } = useQuery({
     queryKey: ["assets", params],
@@ -136,6 +149,17 @@ export default function AssetsPage() {
           <option value="subdomain">Subdomains</option>
           <option value="ip">IP Addresses</option>
           <option value="cidr">CIDR</option>
+        </select>
+        <select value={httpStatusFilter} onChange={e => { setHttpStatusFilter(e.target.value); setPage(1); }}
+          className="px-3 py-1.5 text-sm bg-surface-800 border border-border rounded-lg text-foreground focus:outline-none focus:ring-1 focus:ring-brand-500">
+          <option value="">All HTTP classes</option>
+          <option value="ok">OK</option>
+          <option value="redirect">Redirect</option>
+          <option value="auth_required">Auth Required</option>
+          <option value="not_found">Not Found</option>
+          <option value="rate_limited">Rate Limited</option>
+          <option value="server_error">Server Error</option>
+          <option value="probe_failed">Probe Failed</option>
         </select>
       </div>
 
@@ -245,10 +269,7 @@ function AssetRow({ asset, onClick }: { asset: any; onClick: (a: any) => void })
       </td>
       <td>
         {sub?.http_status ? (
-          <span className={cn("text-xs font-mono font-bold",
-            sub.http_status < 300 ? "text-emerald-400" :
-            sub.http_status < 400 ? "text-yellow-400" : "text-red-400"
-          )}>{sub.http_status}</span>
+          <HttpStatusBadge status={sub.http_status} statusClass={sub.http_status_class} />
         ) : ip?.open_ports_count ? (
           <span className="text-xs text-muted-foreground">{ip.open_ports_count} ports</span>
         ) : <span className="text-xs text-muted-foreground">—</span>}
@@ -288,5 +309,27 @@ function AssetRow({ asset, onClick }: { asset: any; onClick: (a: any) => void })
         </div>
       </td>
     </tr>
+  );
+}
+
+function classifyHttpStatus(status?: number): string {
+  if (!status) return "probe_failed";
+  if (status < 300) return "ok";
+  if (status < 400) return "redirect";
+  if (status === 401 || status === 403) return "auth_required";
+  if (status === 404) return "not_found";
+  if (status === 429) return "rate_limited";
+  if (status >= 500) return "server_error";
+  return "other";
+}
+
+function HttpStatusBadge({ status, statusClass }: { status?: number; statusClass?: string }) {
+  const key = statusClass || classifyHttpStatus(status);
+  const cfg = HTTP_STATUS_CONFIG[key] || HTTP_STATUS_CONFIG.other;
+  return (
+    <span className={cn("inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-xs font-medium", cfg.className)}>
+      <span className="font-mono">{status || "—"}</span>
+      <span>{cfg.label}</span>
+    </span>
   );
 }

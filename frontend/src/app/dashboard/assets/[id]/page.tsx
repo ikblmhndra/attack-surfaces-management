@@ -14,6 +14,17 @@ import { assetsAPI } from "@/lib/api";
 import { SeverityBadge, StatusBadge } from "@/components/ui/SeverityBadge";
 import { cn, formatRelative } from "@/lib/utils";
 
+const HTTP_STATUS_CONFIG: Record<string, { label: string; className: string }> = {
+  ok:            { label: "OK",            className: "bg-emerald-500/10 text-emerald-400 border-emerald-500/20" },
+  redirect:      { label: "Redirect",      className: "bg-yellow-500/10 text-yellow-400 border-yellow-500/20" },
+  auth_required: { label: "Auth Required", className: "bg-sky-500/10 text-sky-400 border-sky-500/20" },
+  not_found:     { label: "Not Found",     className: "bg-surface-700 text-muted-foreground border-border" },
+  rate_limited:  { label: "Rate Limited",  className: "bg-amber-500/10 text-amber-400 border-amber-500/20" },
+  server_error:  { label: "Server Error",  className: "bg-red-500/10 text-red-400 border-red-500/20" },
+  probe_failed:  { label: "Probe Failed",  className: "bg-surface-700 text-muted-foreground border-border" },
+  other:         { label: "Other",         className: "bg-surface-700 text-muted-foreground border-border" },
+};
+
 export default function AssetDetailPage() {
   const params = useParams();
   const router = useRouter();
@@ -146,10 +157,7 @@ export default function AssetDetailPage() {
                     </div>
                     <div>
                       <p className="text-xs text-muted-foreground">HTTP Status</p>
-                      <p className={cn("text-sm font-mono font-bold",
-                        sub.http_status && sub.http_status < 300 ? "text-emerald-400" :
-                        sub.http_status && sub.http_status < 400 ? "text-yellow-400" : "text-muted-foreground"
-                      )}>{sub.http_status || "—"}</p>
+                      <HttpStatusBadge status={sub.http_status} statusClass={sub.http_status_class} />
                     </div>
                     <div>
                       <p className="text-xs text-muted-foreground">HTTPS Status</p>
@@ -494,5 +502,27 @@ export default function AssetDetailPage() {
         </div>
       </div>
     </div>
+  );
+}
+
+function classifyHttpStatus(status?: number): string {
+  if (!status) return "probe_failed";
+  if (status < 300) return "ok";
+  if (status < 400) return "redirect";
+  if (status === 401 || status === 403) return "auth_required";
+  if (status === 404) return "not_found";
+  if (status === 429) return "rate_limited";
+  if (status >= 500) return "server_error";
+  return "other";
+}
+
+function HttpStatusBadge({ status, statusClass }: { status?: number; statusClass?: string }) {
+  const key = statusClass || classifyHttpStatus(status);
+  const cfg = HTTP_STATUS_CONFIG[key] || HTTP_STATUS_CONFIG.other;
+  return (
+    <span className={cn("inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-xs font-medium", cfg.className)}>
+      <span className="font-mono">{status || "—"}</span>
+      <span>{cfg.label}</span>
+    </span>
   );
 }

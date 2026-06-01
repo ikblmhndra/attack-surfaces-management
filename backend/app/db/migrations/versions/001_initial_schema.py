@@ -120,6 +120,7 @@ def upgrade() -> None:
         sa.Column("total_findings", sa.Integer, nullable=False, default=0),
         sa.Column("last_scan_at", sa.DateTime(timezone=True)),
         sa.Column("is_monitoring_active", sa.Boolean, nullable=False, default=True),
+        sa.Column("auto_scan_enabled", sa.Boolean, nullable=False, default=True),
         sa.Column("deleted_at", sa.DateTime(timezone=True)),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
