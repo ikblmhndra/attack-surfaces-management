@@ -75,7 +75,8 @@ RUN pip install --no-cache-dir --upgrade pip \
     && rm -f /usr/local/bin/httpx \
     && ln -sf /go/bin/httpx /usr/local/bin/httpx \
     && ln -sf /go/bin/katana /usr/local/bin/katana \
-    && ln -sf /go/bin/gau /usr/local/bin/gau
+    && ln -sf /go/bin/gau /usr/local/bin/gau \
+    && ln -sf /go/bin/nuclei /usr/local/bin/nuclei
 
 # ── tldextract data ────────────────────────────────────────────
 RUN python -c "import tldextract; tldextract.extract('example.com')"

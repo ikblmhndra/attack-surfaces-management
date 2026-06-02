@@ -4,6 +4,24 @@ All notable changes to this project are documented below, sorted newest-first.
 
 ---
 
+## 2026-06-02 — API Timeline Query & Queue Runtime Fixes
+
+### Fixed: Nuclei timeout reported as zero findings
+- **Files**: `workers/scanner/nuclei_worker.py`, `workers/scanner/discovery_worker.py`, `workers/crawler/web_crawl_worker.py`, `backend/app/services/scan_service.py`, `frontend/src/components/modals/ScanModal.tsx`
+- Nuclei worker now parses partial result files after timeout and treats empty timed-out batches as worker errors instead of silently completing with zero findings.
+- Technology detections are still logged, but no longer become a global `-tags` filter by default. This restores coverage for generic exposure, misconfiguration, takeover, default-login, CVE, and vulnerability templates that manual nuclei runs would include.
+- Full scan defaults now use smaller nuclei batches and longer scan timeout, reducing repeated batch timeouts on large crawled endpoint sets.
+
+### Fixed: PostgreSQL timeline aggregation errors
+- **Files**: `backend/app/api/v1/endpoints/organizations.py`, `backend/app/api/v1/endpoints/assets.py`, `backend/app/api/v1/endpoints/findings.py`
+- Timeline and trend endpoints now use a stable literal date bucket for `date_trunc`, preventing PostgreSQL `GroupingError` failures when frontend refreshes organization metrics after scan execution.
+
+### Fixed: RabbitMQ local disk alarm blocking scan queue publishes
+- **File**: `infrastructure/rabbitmq/rabbitmq.conf`
+- RabbitMQ disk watermark now uses a fixed `2GB` threshold instead of `1.5x` available memory, preventing local/dev environments with usable disk space from blocking AMQP publishers.
+
+---
+
 ## 2026-06-01 — Organization Automation Controls & Tech-Aware Scanning
 
 ### Added: Dedicated endpoint crawling phase

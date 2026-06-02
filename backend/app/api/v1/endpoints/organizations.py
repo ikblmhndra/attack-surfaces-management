@@ -8,7 +8,7 @@ from uuid import UUID
 import structlog
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.dependencies.auth import (
@@ -549,31 +549,34 @@ async def get_attack_surface_timeline(
 
     since = datetime.now(timezone.utc) - timedelta(days=days)
 
+    asset_day = func.date_trunc(text("'day'"), Asset.first_seen)
+    finding_day = func.date_trunc(text("'day'"), Finding.first_seen)
+
     # New assets over time
     new_assets = (await db.execute(
         select(
-            func.date_trunc("day", Asset.first_seen).label("date"),
+            asset_day.label("date"),
             func.count(Asset.id).label("count"),
         ).where(
             Asset.org_id == org_id,
             Asset.first_seen >= since,
-        ).group_by(func.date_trunc("day", Asset.first_seen))
-        .order_by(func.date_trunc("day", Asset.first_seen))
+        ).group_by(asset_day)
+        .order_by(asset_day)
     )).all()
 
     # New findings over time
     new_findings = (await db.execute(
         select(
-            func.date_trunc("day", Finding.first_seen).label("date"),
+            finding_day.label("date"),
             Finding.severity,
             func.count(Finding.id).label("count"),
         ).where(
             Finding.org_id == org_id,
             Finding.first_seen >= since,
         ).group_by(
-            func.date_trunc("day", Finding.first_seen),
+            finding_day,
             Finding.severity,
-        ).order_by(func.date_trunc("day", Finding.first_seen))
+        ).order_by(finding_day)
     )).all()
 
     return {

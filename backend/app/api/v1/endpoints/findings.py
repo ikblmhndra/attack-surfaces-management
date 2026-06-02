@@ -9,7 +9,7 @@ from uuid import UUID
 import structlog
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, func, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.dependencies.auth import (
@@ -497,10 +497,11 @@ async def findings_trend(
 ):
     """Daily new findings trend for timeline chart."""
     since = datetime.now(timezone.utc) - timedelta(days=days)
+    finding_day = func.date_trunc(text("'day'"), Finding.first_seen)
 
     query = (
         select(
-            func.date_trunc("day", Finding.first_seen).label("date"),
+            finding_day.label("date"),
             Finding.severity,
             func.count(Finding.id).label("count"),
         )
@@ -514,9 +515,9 @@ async def findings_trend(
         query = query.where(Finding.org_id == org_id)
 
     query = query.group_by(
-        func.date_trunc("day", Finding.first_seen),
+        finding_day,
         Finding.severity,
-    ).order_by(func.date_trunc("day", Finding.first_seen))
+    ).order_by(finding_day)
 
     rows = (await db.execute(query)).all()
 

@@ -385,7 +385,7 @@ class WebCrawlWorker(BaseWorker):
             "automatic_scan": False,
             "vuln_depth": "default",
             "severities": ["critical", "high", "medium"],
-            "scan_timeout": min(int(config.get("scan_timeout", 600)), 300),
+            "scan_timeout": int(config.get("scan_timeout", 900)),
         }
         for i in range(0, len(targets), batch_size):
             await coord.add_nuclei_expected(scan_id)

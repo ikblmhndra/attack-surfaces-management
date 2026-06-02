@@ -9,7 +9,7 @@ from uuid import UUID
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.dependencies.auth import get_current_user, get_db, get_workspace_id, RequireRole
@@ -488,9 +488,10 @@ async def assets_new_over_time(
 ):
     """Daily new asset discovery trend."""
     since = datetime.now(timezone.utc) - timedelta(days=days)
+    asset_day = func.date_trunc(text("'day'"), Asset.first_seen)
     query = (
         select(
-            func.date_trunc("day", Asset.first_seen).label("date"),
+            asset_day.label("date"),
             Asset.asset_type,
             func.count(Asset.id).label("count"),
         )
@@ -502,8 +503,8 @@ async def assets_new_over_time(
     )
     if org_id:
         query = query.where(Asset.org_id == org_id)
-    query = query.group_by(func.date_trunc("day", Asset.first_seen), Asset.asset_type)
-    query = query.order_by(func.date_trunc("day", Asset.first_seen))
+    query = query.group_by(asset_day, Asset.asset_type)
+    query = query.order_by(asset_day)
     rows = (await db.execute(query)).all()
 
     return {

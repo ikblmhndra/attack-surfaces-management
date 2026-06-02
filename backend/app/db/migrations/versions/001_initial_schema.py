@@ -120,7 +120,6 @@ def upgrade() -> None:
         sa.Column("total_findings", sa.Integer, nullable=False, default=0),
         sa.Column("last_scan_at", sa.DateTime(timezone=True)),
         sa.Column("is_monitoring_active", sa.Boolean, nullable=False, default=True),
-        sa.Column("auto_scan_enabled", sa.Boolean, nullable=False, default=True),
         sa.Column("deleted_at", sa.DateTime(timezone=True)),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
@@ -196,40 +195,6 @@ def upgrade() -> None:
     )
     op.create_index("ix_subdomains_fqdn", "subdomains", ["fqdn"])
     op.create_index("ix_subdomains_org", "subdomains", ["org_id"])
-
-    # ── web_endpoints ─────────────────────────────────────────
-    op.create_table(
-        "web_endpoints",
-        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column("asset_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("assets.id", ondelete="CASCADE"), nullable=False),
-        sa.Column("org_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False),
-        sa.Column("workspace_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False),
-        sa.Column("url", sa.String(2000), nullable=False),
-        sa.Column("host", sa.String(500), nullable=False),
-        sa.Column("path", sa.String(1500), nullable=False, server_default="/"),
-        sa.Column("source", sa.String(50), nullable=False, server_default="katana"),
-        sa.Column("http_status", sa.Integer),
-        sa.Column("status_class", sa.String(50), nullable=False, server_default="probe_failed"),
-        sa.Column("content_type", sa.String(255)),
-        sa.Column("content_length", sa.Integer),
-        sa.Column("title", sa.String(500)),
-        sa.Column("has_params", sa.Boolean, nullable=False, server_default=sa.false()),
-        sa.Column("is_api", sa.Boolean, nullable=False, server_default=sa.false()),
-        sa.Column("is_auth", sa.Boolean, nullable=False, server_default=sa.false()),
-        sa.Column("is_interesting", sa.Boolean, nullable=False, server_default=sa.false()),
-        sa.Column("metadata", postgresql.JSONB, nullable=False, server_default="{}"),
-        sa.Column("first_seen", sa.DateTime(timezone=True), server_default=sa.func.now()),
-        sa.Column("last_seen", sa.DateTime(timezone=True), server_default=sa.func.now()),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
-        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
-        sa.UniqueConstraint("org_id", "url", name="uq_web_endpoint_org_url"),
-    )
-    op.create_index("ix_web_endpoints_asset_id", "web_endpoints", ["asset_id"])
-    op.create_index("ix_web_endpoints_org_id", "web_endpoints", ["org_id"])
-    op.create_index("ix_web_endpoints_workspace_id", "web_endpoints", ["workspace_id"])
-    op.create_index("ix_web_endpoints_host", "web_endpoints", ["host"])
-    op.create_index("ix_web_endpoints_status_class", "web_endpoints", ["status_class"])
-    op.create_index("ix_web_endpoints_is_interesting", "web_endpoints", ["is_interesting"])
 
     # ── ip_addresses ──────────────────────────────────────────
     op.create_table(
@@ -525,7 +490,7 @@ def downgrade() -> None:
     tables = [
         "asset_relationships", "threat_intel", "screenshots", "notifications",
         "notification_rules", "scan_findings", "scans", "risk_scores",
-        "findings", "technologies", "ports", "ip_addresses", "web_endpoints", "subdomains",
+        "findings", "technologies", "ports", "ip_addresses", "subdomains",
         "assets", "organizations", "audit_logs", "api_keys", "users", "workspaces",
     ]
     for table in tables:

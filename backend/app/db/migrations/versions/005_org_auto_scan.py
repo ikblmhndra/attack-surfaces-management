@@ -15,12 +15,13 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column(
-        "organizations",
-        sa.Column("auto_scan_enabled", sa.Boolean(), nullable=False, server_default=sa.true()),
+    op.execute(
+        "ALTER TABLE organizations "
+        "ADD COLUMN IF NOT EXISTS auto_scan_enabled BOOLEAN DEFAULT true"
     )
-    op.alter_column("organizations", "auto_scan_enabled", server_default=None)
+    op.execute("UPDATE organizations SET auto_scan_enabled = true WHERE auto_scan_enabled IS NULL")
+    op.alter_column("organizations", "auto_scan_enabled", nullable=False, server_default=None)
 
 
 def downgrade() -> None:
-    op.drop_column("organizations", "auto_scan_enabled")
+    op.execute("ALTER TABLE organizations DROP COLUMN IF EXISTS auto_scan_enabled")

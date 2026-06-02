@@ -129,17 +129,19 @@ class NucleiWorker(BaseWorker):
 
         log.info("nuclei_scan_started", scan_id=scan_id, targets=len(targets), org_id=org_id)
 
-        # Optional tech tags are curated so detection can guide nuclei without
-        # expanding into every Wappalyzer label.
+        # Optional tech tags are curated for observability. Do not turn them
+        # into a global nuclei -tags filter by default because that narrows
+        # coverage and can skip generic exposure/misconfiguration templates.
         all_techs = set()
         if tech_map and config.get("use_tech_tags", True):
             for url, techs in tech_map.items():
                 if techs:
                     all_techs.update(self._tech_tags(techs))
             if all_techs:
-                existing_tags = config.get("tags", [])
-                config["tags"] = list(set(existing_tags) | all_techs)
                 log.info("nuclei_tech_tags", count=len(all_techs), tags=list(all_techs)[:20], scan_id=scan_id)
+                if config.get("enable_tech_tag_filter", False):
+                    existing_tags = config.get("tags", [])
+                    config["tags"] = list(set(existing_tags) | all_techs)
 
         with tempfile.TemporaryDirectory(prefix="asm-nuclei-") as tmpdir:
             tmpdir = Path(tmpdir)
@@ -151,7 +153,7 @@ class NucleiWorker(BaseWorker):
             output_file = tmpdir / "nuclei_results.json"
 
             # Run nuclei
-            findings_raw = await self._run_nuclei(
+            findings_raw, timed_out = await self._run_nuclei(
                 target_file=target_file,
                 output_file=output_file,
                 config=config,
@@ -169,6 +171,8 @@ class NucleiWorker(BaseWorker):
                     persisted = await self._persist_findings(db, findings, scan_id)
                     await self._update_scan_findings_count(db, scan_id, len(persisted))
             else:
+                if timed_out:
+                    raise RuntimeError(f"nuclei timed out after {config.get('scan_timeout', 600)}s with no parsed findings")
                 log.info("nuclei_no_findings", scan_id=scan_id, targets=len(targets))
 
             async with get_session() as db:
@@ -200,7 +204,7 @@ class NucleiWorker(BaseWorker):
         output_file: Path,
         config: Dict,
         scan_id: str,
-    ) -> List[Dict]:
+    ) -> tuple[List[Dict], bool]:
         """Execute nuclei with configured templates and return raw JSON results."""
         severities = config.get("severities", DEFAULT_SEVERITIES)
         tags = config.get("tags", [])
@@ -211,7 +215,7 @@ class NucleiWorker(BaseWorker):
         concurrency = config.get("concurrency", 10)
         template_timeout = int(config.get("template_timeout", 8))
         retries = int(config.get("retries", 0))
-        scan_timeout = int(config.get("scan_timeout", 600))
+        scan_timeout = int(config.get("scan_timeout", 900))
         nuclei_path = shutil.which("nuclei") or "/go/bin/nuclei"
 
         cmd = [
@@ -284,13 +288,9 @@ class NucleiWorker(BaseWorker):
                 if tmpl_path.exists():
                     cmd.extend(["-t", str(tmpl_path)])
 
-        # Tag filters — always include cve + vulnerabilities so tech filtering
-        # doesn't miss security issues. Tech-specific tags add on top.
+        # Tag filters are only applied when explicitly requested. Broad ASM
+        # coverage comes from template directories plus -as, not tech tags.
         final_tags = list(tags)
-        if tags:
-            for required in ("cve", "vulnerabilities"):
-                if required not in final_tags:
-                    final_tags.append(required)
         if final_tags:
             cmd.extend(["-tags", ",".join(final_tags)])
         if exclude_tags:
@@ -320,15 +320,18 @@ class NucleiWorker(BaseWorker):
                 await proc.wait()
             except Exception:
                 pass
-            return []
+            return self._parse_results_file(output_file), True
         except FileNotFoundError:
             log.error("nuclei_not_found", message="nuclei binary not found in PATH")
-            return []
+            return [], False
         except Exception as e:
             log.error("nuclei_exception", error=str(e), scan_id=scan_id)
-            return []
+            return [], False
 
-        # Parse results
+        return self._parse_results_file(output_file), False
+
+    def _parse_results_file(self, output_file: Path) -> List[Dict]:
+        """Parse nuclei JSON output, including partial files after timeout."""
         results = []
         if output_file.exists():
             for line in output_file.read_text().splitlines():

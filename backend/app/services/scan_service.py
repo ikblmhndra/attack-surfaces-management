@@ -20,6 +20,46 @@ DEFAULT_MODULES = {
     "vuln":      ["nuclei"],
 }
 
+DEFAULT_SCAN_CONFIG = {
+    "full": {
+        "crawl": True,
+        "fuzz": False,
+        "nuclei_batch_size": 15,
+        "crawl_nuclei_batch_size": 15,
+        "scan_timeout": 1800,
+        "template_timeout": 8,
+        "retries": 0,
+        "concurrency": 6,
+        "bulk_size": 6,
+        "automatic_scan": True,
+        "use_tech_tags": True,
+    },
+    "quick": {
+        "crawl": True,
+        "fuzz": False,
+        "nuclei_batch_size": 50,
+        "crawl_nuclei_batch_size": 25,
+        "scan_timeout": 300,
+        "template_timeout": 8,
+        "retries": 0,
+        "concurrency": 15,
+        "bulk_size": 15,
+        "automatic_scan": False,
+        "use_tech_tags": False,
+        "vuln_depth": "critical",
+    },
+    "vuln": {
+        "nuclei_batch_size": 25,
+        "scan_timeout": 900,
+        "template_timeout": 8,
+        "retries": 0,
+        "concurrency": 8,
+        "bulk_size": 8,
+        "automatic_scan": True,
+        "use_tech_tags": True,
+    },
+}
+
 
 class ScanService:
     def __init__(self, db: AsyncSession):
@@ -37,6 +77,10 @@ class ScanService:
     ) -> Scan:
         """Create a scan record in DB and publish discovery task to queue."""
         scan_modules = modules or DEFAULT_MODULES.get(scan_type, DEFAULT_MODULES["full"])
+        effective_config = {
+            **DEFAULT_SCAN_CONFIG.get(scan_type, {}),
+            **(config or {}),
+        }
 
         scan = Scan(
             org_id=org_id,
@@ -45,7 +89,7 @@ class ScanService:
             scan_type=scan_type,
             status="queued",
             modules=scan_modules,
-            config=config,
+            config=effective_config,
             total_tasks=len(scan_modules),
         )
         self.db.add(scan)
@@ -64,7 +108,7 @@ class ScanService:
                         "asns": org.asns or [],
                     },
                     "config": {
-                        **config,
+                        **effective_config,
                         "scan_type": scan_type,
                         "modules": scan_modules,
                     },

@@ -916,7 +916,7 @@ class DiscoveryWorker(BaseWorker):
                 "automatic_scan": False,
                 "vuln_depth": "default",
                 "severities": ["critical", "high", "medium"],
-                "scan_timeout": min(int(config.get("scan_timeout", 600)), 300),
+                "scan_timeout": int(config.get("scan_timeout", 900)),
             }
             for target_group, group_config, profile in (
                 (standard_targets, config, "standard"),
