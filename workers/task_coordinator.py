@@ -89,12 +89,38 @@ class TaskCoordinator:
         await r.expire(key, REDIS_KEY_TTL)
         return val
 
-    async def incr_nuclei_done(self, scan_id: str) -> int:
+    async def incr_nuclei_done(self, scan_id: str, targets_scanned: int = 0, findings_found: int = 0) -> int:
         r = await self._get_redis()
         key = f"scan:{scan_id}:nuclei_done"
         val = await r.incr(key)
         await r.expire(key, REDIS_KEY_TTL)
+        if targets_scanned:
+            targets_key = f"scan:{scan_id}:nuclei_targets_scanned"
+            await r.incrby(targets_key, int(targets_scanned))
+            await r.expire(targets_key, REDIS_KEY_TTL)
+        if findings_found:
+            findings_key = f"scan:{scan_id}:nuclei_findings_found"
+            await r.incrby(findings_key, int(findings_found))
+            await r.expire(findings_key, REDIS_KEY_TTL)
         return val
+
+    async def get_counts(self, scan_id: str) -> dict:
+        r = await self._get_redis()
+        keys = {
+            "nuclei_expected": f"scan:{scan_id}:nuclei_expected",
+            "nuclei_done": f"scan:{scan_id}:nuclei_done",
+            "nuclei_targets_scanned": f"scan:{scan_id}:nuclei_targets_scanned",
+            "nuclei_findings_found": f"scan:{scan_id}:nuclei_findings_found",
+            "port_expected": f"scan:{scan_id}:port_expected",
+            "port_done": f"scan:{scan_id}:port_done",
+            "crawl_expected": f"scan:{scan_id}:crawl_expected",
+            "crawl_done": f"scan:{scan_id}:crawl_done",
+            "enrich_expected": f"scan:{scan_id}:enrich_expected",
+            "enrich_done": f"scan:{scan_id}:enrich_done",
+            "screenshot_done": f"scan:{scan_id}:screenshot_done",
+        }
+        values = await r.mget(list(keys.values()))
+        return {name: int(value or 0) for name, value in zip(keys, values)}
 
     async def add_port_expected(self, scan_id: str, count: int = 1) -> int:
         r = await self._get_redis()
@@ -194,6 +220,8 @@ class TaskCoordinator:
             f"scan:{scan_id}:crawl_done",
             f"scan:{scan_id}:enrich_expected",
             f"scan:{scan_id}:enrich_done",
+            f"scan:{scan_id}:nuclei_targets_scanned",
+            f"scan:{scan_id}:nuclei_findings_found",
             f"scan:{scan_id}:screenshot_done",
             f"scan:{scan_id}:terminal_marked",
         )

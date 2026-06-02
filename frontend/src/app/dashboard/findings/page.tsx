@@ -74,6 +74,25 @@ export default function FindingsPage() {
     refetchInterval: 30_000,
   });
 
+  const exportFindings = async () => {
+    const params = new URLSearchParams();
+    params.set("format", "csv");
+    if (activeOrg?.id) params.set("org_id", activeOrg.id);
+    if (severityFilter.length) params.set("severity", severityFilter.join(","));
+    if (statusFilter) params.set("status", statusFilter);
+    if (categoryFilter) params.set("category", categoryFilter);
+
+    const response = await apiClient.get(`/findings/export?${params.toString()}`, {
+      responseType: "blob",
+    });
+    const url = URL.createObjectURL(response.data);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "findings.csv";
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
   // Mutations
   const markFalsePositive = useMutation({
     mutationFn: ({ id, reason }: { id: string; reason: string }) =>
@@ -248,7 +267,10 @@ export default function FindingsPage() {
           >
             <RefreshCw className="w-3 h-3" /> Refresh
           </button>
-          <button className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg bg-surface-700 hover:bg-surface-600 border border-surface-600 text-foreground">
+          <button
+            onClick={exportFindings}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg bg-surface-700 hover:bg-surface-600 border border-surface-600 text-foreground"
+          >
             <Download className="w-3 h-3" /> Export
           </button>
         </div>

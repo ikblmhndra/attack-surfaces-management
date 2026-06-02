@@ -19,6 +19,7 @@ from app.api.v1.dependencies.auth import (
 )
 from app.db.models.models import Asset, Finding, Organization, RiskScore, Scan, ScanTemplate, User
 from app.services.audit_service import audit_log
+from app.services.scan_progress import merge_runtime_phase_status
 from app.services.scan_profiles import normalize_scan_profile
 from app.services.scan_service import ScanService
 
@@ -511,7 +512,7 @@ async def list_org_scans(
     scans = (await db.execute(query.offset((page - 1) * page_size).limit(page_size))).scalars().all()
 
     return {
-        "items": [_scan_to_dict(s) for s in scans],
+        "items": [await _scan_to_dict(s) for s in scans],
         "total": total,
         "page": page,
         "page_size": page_size,
@@ -624,14 +625,20 @@ async def _get_org_or_404(db: AsyncSession, org_id: UUID, workspace_id: UUID) ->
     return org
 
 
-def _scan_to_dict(scan: Scan) -> dict:
+async def _scan_to_dict(scan: Scan) -> dict:
+    phase_status = await merge_runtime_phase_status(str(scan.id), scan.phase_status or {})
+    config = scan.config or {}
     return {
         "id": str(scan.id),
         "scan_type": scan.scan_type,
         "status": scan.status,
         "modules": scan.modules or [],
-        "phase_status": scan.phase_status or {},
+        "scan_profile": config.get("scan_profile"),
+        "phase_status": phase_status,
         "progress_pct": scan.progress_pct,
+        "total_tasks": scan.total_tasks,
+        "completed_tasks": scan.completed_tasks,
+        "failed_tasks": scan.failed_tasks,
         "assets_found": scan.assets_found,
         "findings_found": scan.findings_found,
         "new_assets": scan.new_assets,

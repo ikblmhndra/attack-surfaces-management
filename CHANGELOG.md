@@ -4,6 +4,29 @@ All notable changes to this project are documented below, sorted newest-first.
 
 ---
 
+## 2026-06-03 — Scan Pipeline Progress and Result UI
+
+### Fixed: Accurate nuclei and crawl task accounting
+- **Files**: `workers/task_coordinator.py`, `workers/crawler/web_crawl_worker.py`, `workers/scanner/nuclei_worker.py`
+- Crawl-fed endpoint nuclei batches now increment scan `total_tasks`, preventing progress from jumping too far ahead during deep scans.
+- Nuclei phase status now tracks aggregate expected/completed/remaining batches, targets scanned, and findings instead of treating each batch as the whole phase.
+
+### Changed: Scan progress and result visibility
+- **Files**: `backend/app/services/scan_progress.py`, `backend/app/api/v1/endpoints/scans.py`, `backend/app/api/v1/endpoints/organizations.py`, `frontend/src/app/dashboard/scans/page.tsx`, `frontend/src/app/dashboard/page.tsx`, `frontend/src/app/dashboard/organizations/[id]/page.tsx`
+- Scan APIs now merge Redis runtime counters into `phase_status` and include task counts, scan profile, failures, new asset/finding counts, and duration fields.
+- Dashboard scan rows now show concrete batch/task progress such as `nuclei 0/16 batches` instead of only a coarse percentage label.
+
+### Changed: Richer asset result presentation
+- **Files**: `backend/app/api/v1/endpoints/assets.py`, `frontend/src/app/dashboard/assets/[id]/page.tsx`, `frontend/src/app/dashboard/findings/page.tsx`, `backend/app/api/v1/endpoints/findings.py`
+- Asset detail now exposes and displays richer port fingerprints, normalized technologies, and endpoint crawl score reasons.
+- Findings CSV export is now wired in the frontend and supports comma-separated severity filters.
+
+### Fixed: Pipeline observability coverage
+- **Files**: `docker-compose.yml`, `.env.example`, `infrastructure/prometheus/prometheus.yml`
+- API metrics are enabled by default through Compose, and Prometheus now scrapes port, crawl, and enrichment workers.
+
+---
+
 ## 2026-06-02 — Scanner Tool Command Hardening
 
 ### Fixed: Discovery and crawl command correctness

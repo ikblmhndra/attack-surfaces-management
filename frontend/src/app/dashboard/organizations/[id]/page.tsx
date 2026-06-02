@@ -24,6 +24,17 @@ import {
 import { cn, formatNumber } from "@/lib/utils";
 import { ScanModal } from "@/components/modals/ScanModal";
 
+function getScanProgressLabel(scan: any): string {
+  const nuclei = scan.phase_status?.nuclei;
+  if (scan.status === "running" && nuclei?.expected_batches) {
+    return `nuclei ${nuclei.completed_batches ?? 0}/${nuclei.expected_batches} batches`;
+  }
+  if (scan.total_tasks) {
+    return `${scan.completed_tasks ?? 0}/${scan.total_tasks} tasks`;
+  }
+  return `${Math.round(scan.progress_pct ?? 0)}%`;
+}
+
 export default function OrganizationDetailPage() {
   const params = useParams();
   const router = useRouter();
@@ -352,8 +363,11 @@ export default function OrganizationDetailPage() {
                       <span className="text-xs text-muted-foreground capitalize">{scan.status}</span>
                     </div>
                     {scan.status === "running" && (
-                      <div className="mt-1 h-1 bg-surface-700 rounded-full overflow-hidden">
-                        <div className="h-full bg-brand-400 rounded-full transition-all" style={{ width: `${scan.progress_pct}%` }} />
+                      <div className="mt-1 space-y-0.5">
+                        <div className="h-1 bg-surface-700 rounded-full overflow-hidden">
+                          <div className="h-full bg-brand-400 rounded-full transition-all" style={{ width: `${scan.progress_pct}%` }} />
+                        </div>
+                        <p className="text-[10px] text-muted-foreground/70">{getScanProgressLabel(scan)}</p>
                       </div>
                     )}
                   </div>

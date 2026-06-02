@@ -65,6 +65,7 @@ export default function AssetDetailPage() {
   const sub = asset?.subdomain;
   const ip = asset?.ip;
   const ports = asset?.ports || [];
+  const technologies = asset?.technologies || [];
   const openFindingsCount = Array.isArray(asset?.open_findings)
     ? asset.open_findings.length
     : Number(asset?.open_findings || 0);
@@ -300,7 +301,14 @@ export default function AssetDetailPage() {
                               <span className="text-sm font-mono font-semibold text-foreground">{port.port}</span>
                               <span className="text-[10px] uppercase text-emerald-400">{port.state}</span>
                             </div>
-                            <p className="text-xs text-muted-foreground truncate">{port.service || port.protocol}</p>
+                            <p className="text-xs text-muted-foreground truncate">
+                              {[port.service || port.protocol, port.product, port.version].filter(Boolean).join(" ")}
+                            </p>
+                            {port.banner && (
+                              <p className="mt-1 text-[10px] font-mono text-muted-foreground/80 truncate" title={port.banner}>
+                                {port.banner}
+                              </p>
+                            )}
                           </div>
                         ))}
                       </div>
@@ -312,7 +320,15 @@ export default function AssetDetailPage() {
               {/* Technologies */}
               <div className="glass-card p-5">
                 <h2 className="text-sm font-semibold text-foreground mb-3">Technologies</h2>
-                {sub?.technologies?.length > 0 ? (
+                {technologies.length > 0 ? (
+                  <div className="flex flex-wrap gap-2">
+                    {technologies.map((t: any) => (
+                      <span key={`${t.name}-${t.version || "unknown"}`} className="text-xs bg-surface-700 text-muted-foreground px-2.5 py-1 rounded-lg border border-surface-600">
+                        {t.name}{t.version ? ` ${t.version}` : ""}{t.confidence ? ` · ${Math.round(t.confidence * 100)}%` : ""}
+                      </span>
+                    ))}
+                  </div>
+                ) : sub?.technologies?.length > 0 ? (
                   <div className="flex flex-wrap gap-2">
                     {sub.technologies.map((t: string) => (
                       <span key={t} className="text-xs bg-surface-700 text-muted-foreground px-2.5 py-1 rounded-lg border border-surface-600">{t}</span>
@@ -359,6 +375,20 @@ export default function AssetDetailPage() {
                       <p className="text-xs text-muted-foreground truncate">
                         {[endpoint.title, endpoint.content_type].filter(Boolean).join(" · ")}
                       </p>
+                    )}
+                    {(endpoint.metadata?.score || endpoint.metadata?.score_reasons?.length > 0) && (
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        {endpoint.metadata?.score != null && (
+                          <span className="text-xs bg-surface-700 text-muted-foreground border border-surface-600 px-1.5 py-0.5 rounded">
+                            score {endpoint.metadata.score}
+                          </span>
+                        )}
+                        {endpoint.metadata?.score_reasons?.slice(0, 4).map((reason: string) => (
+                          <span key={reason} className="text-xs bg-surface-700 text-muted-foreground border border-surface-600 px-1.5 py-0.5 rounded">
+                            {reason}
+                          </span>
+                        ))}
+                      </div>
                     )}
                   </div>
                 ))

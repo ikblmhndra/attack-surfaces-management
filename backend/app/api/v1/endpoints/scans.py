@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field, field_validator
 from app.api.v1.dependencies.auth import get_current_user, get_workspace_id, get_db, RequireRole
 from app.db.models.models import User, Scan, Organization
 from app.services.scan_profiles import apply_scan_profile, normalize_scan_profile
+from app.services.scan_progress import merge_runtime_phase_status
 from app.services.outbox_service import create_queue_event, dispatch_pending_outbox_once
 from sqlalchemy import select, update, func, or_, cast, String
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -62,14 +63,7 @@ async def list_scans(org_id: Optional[UUID] = Query(None), status: Optional[str]
         ))
     total = (await db.execute(select(func.count()).select_from(query.subquery()))).scalar_one()
     scans = (await db.execute(query.order_by(Scan.created_at.desc()).offset((page-1)*page_size).limit(page_size))).scalars().all()
-    return {"items": [{"id": str(s.id), "org_id": str(s.org_id), "scan_type": s.scan_type,
-                       "status": s.status, "progress_pct": s.progress_pct,
-                       "assets_found": s.assets_found, "findings_found": s.findings_found,
-                       "phase_status": s.phase_status or {},
-                       "error_message": s.error_message,
-                       "started_at": s.started_at.isoformat() if s.started_at else None,
-                       "completed_at": s.completed_at.isoformat() if s.completed_at else None,
-                       "created_at": s.created_at.isoformat()} for s in scans], "total": total}
+    return {"items": [await _scan_to_dict(s) for s in scans], "total": total}
 
 @router.get("/{scan_id}")
 async def get_scan(scan_id: UUID, workspace_id: UUID = Depends(get_workspace_id),
@@ -77,15 +71,38 @@ async def get_scan(scan_id: UUID, workspace_id: UUID = Depends(get_workspace_id)
     result = await db.execute(select(Scan).where(Scan.id == scan_id, Scan.workspace_id == workspace_id))
     scan = result.scalar_one_or_none()
     if not scan: raise HTTPException(404, "Scan not found")
-    return {"id": str(scan.id), "org_id": str(scan.org_id), "scan_type": scan.scan_type,
-            "status": scan.status, "modules": scan.modules, "progress_pct": scan.progress_pct,
-            "phase_status": scan.phase_status or {},
-            "total_tasks": scan.total_tasks, "completed_tasks": scan.completed_tasks,
-            "assets_found": scan.assets_found, "findings_found": scan.findings_found,
-            "error_message": scan.error_message,
-            "started_at": scan.started_at.isoformat() if scan.started_at else None,
-            "completed_at": scan.completed_at.isoformat() if scan.completed_at else None,
-            "created_at": scan.created_at.isoformat()}
+    return await _scan_to_dict(scan, detailed=True)
+
+
+async def _scan_to_dict(scan: Scan, detailed: bool = False) -> dict:
+    phase_status = await merge_runtime_phase_status(str(scan.id), scan.phase_status or {})
+    config = scan.config or {}
+    data = {
+        "id": str(scan.id),
+        "org_id": str(scan.org_id),
+        "scan_type": scan.scan_type,
+        "status": scan.status,
+        "modules": scan.modules or [],
+        "scan_profile": config.get("scan_profile"),
+        "progress_pct": scan.progress_pct,
+        "phase_status": phase_status,
+        "total_tasks": scan.total_tasks,
+        "completed_tasks": scan.completed_tasks,
+        "failed_tasks": scan.failed_tasks,
+        "error_count": scan.error_count,
+        "assets_found": scan.assets_found,
+        "findings_found": scan.findings_found,
+        "new_assets": scan.new_assets,
+        "new_findings": scan.new_findings,
+        "error_message": scan.error_message,
+        "duration_seconds": scan.duration_seconds,
+        "started_at": scan.started_at.isoformat() if scan.started_at else None,
+        "completed_at": scan.completed_at.isoformat() if scan.completed_at else None,
+        "created_at": scan.created_at.isoformat(),
+    }
+    if detailed:
+        data["config"] = config
+    return data
 
 @router.post("/manual", status_code=201)
 async def manual_scan(

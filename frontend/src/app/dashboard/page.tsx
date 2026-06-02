@@ -724,6 +724,17 @@ function getPhaseLabel(progress: number, status: string): string {
   return "Finalizing";
 }
 
+function getScanProgressLabel(scan: any): string {
+  const nuclei = scan.phase_status?.nuclei;
+  if (scan.status === "running" && nuclei?.expected_batches) {
+    return `nuclei ${nuclei.completed_batches ?? 0}/${nuclei.expected_batches} batches`;
+  }
+  if (scan.total_tasks) {
+    return `${scan.completed_tasks ?? 0}/${scan.total_tasks} tasks`;
+  }
+  return getPhaseLabel(scan.progress_pct, scan.status);
+}
+
 function ScanActivityRow({ scan }: { scan: any }) {
   const statusColors: Record<string, string> = {
     completed: "text-emerald-400",
@@ -762,7 +773,7 @@ function ScanActivityRow({ scan }: { scan: any }) {
               />
             </div>
             <span className="text-[10px] text-muted-foreground/70">
-              {getPhaseLabel(scan.progress_pct, scan.status)}
+              {getScanProgressLabel(scan)}
             </span>
           </div>
         )}

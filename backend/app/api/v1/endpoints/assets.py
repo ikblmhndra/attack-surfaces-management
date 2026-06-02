@@ -592,7 +592,10 @@ def _port_to_dict(port) -> dict:
         "state": port.state,
         "service": port.service_name,
         "version": port.service_version,
+        "product": port.product,
+        "extrainfo": port.extrainfo,
         "banner": port.banner[:200] if port.banner else None,
+        "tls_info": port.tls_info,
         "first_seen": port.first_seen.isoformat(),
         "last_seen": port.last_seen.isoformat(),
     }
@@ -617,6 +620,7 @@ def _endpoint_to_dict(endpoint) -> dict:
         "is_api": endpoint.is_api,
         "is_auth": endpoint.is_auth,
         "is_interesting": endpoint.is_interesting,
+        "metadata": endpoint.metadata_ or {},
         "last_seen": endpoint.last_seen.isoformat() if endpoint.last_seen else None,
     }
 
@@ -628,6 +632,8 @@ def _tech_to_dict(tech) -> dict:
         "version": tech.version,
         "category": tech.category,
         "confidence": tech.confidence,
+        "detection_method": tech.detection_method,
+        "metadata": tech.metadata_ or {},
         "first_detected": tech.first_detected.isoformat(),
     }
 

@@ -182,11 +182,16 @@ class NucleiWorker(BaseWorker):
 
             async with get_session() as db:
                 await self._mark_nuclei_task_complete(db, scan_id)
-                await update_scan_phase(db, scan_id, "nuclei", "completed", targets_total=len(targets), findings=len(findings))
 
             # Queue correlation — ALWAYS called, even with zero findings.
             # This increments nuclei_done and checks for terminal condition.
-            await self._queue_correlation(scan_id, org_id, workspace_id)
+            await self._queue_correlation(
+                scan_id,
+                org_id,
+                workspace_id,
+                targets_scanned=len(targets),
+                findings_found=len(findings),
+            )
 
         log.info("nuclei_scan_completed", scan_id=scan_id, findings=len(findings))
 
@@ -631,13 +636,37 @@ class NucleiWorker(BaseWorker):
         )
         await db.commit()
 
-    async def _queue_correlation(self, scan_id: str, org_id: str, workspace_id: str) -> None:
+    async def _queue_correlation(
+        self,
+        scan_id: str,
+        org_id: str,
+        workspace_id: str,
+        targets_scanned: int = 0,
+        findings_found: int = 0,
+    ) -> None:
         from workers.task_coordinator import TaskCoordinator
         queue = QueueClient()
         await queue.connect()
 
         coord = TaskCoordinator()
-        await coord.incr_nuclei_done(scan_id)
+        await coord.incr_nuclei_done(scan_id, targets_scanned=targets_scanned, findings_found=findings_found)
+        counts = await coord.get_counts(scan_id)
+        expected = max(counts.get("nuclei_expected", 0), 0)
+        done = max(counts.get("nuclei_done", 0), 0)
+        status = "completed" if expected and done >= expected else "running"
+
+        async with get_session() as db:
+            await update_scan_phase(
+                db,
+                scan_id,
+                "nuclei",
+                status,
+                expected_batches=expected,
+                completed_batches=done,
+                remaining_batches=max(expected - done, 0),
+                targets_scanned=counts.get("nuclei_targets_scanned", 0),
+                findings=counts.get("nuclei_findings_found", 0),
+            )
 
         # Update progress proportionally so the bar keeps moving
         # even after screenshot set it to 90%.

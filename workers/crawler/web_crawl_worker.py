@@ -579,8 +579,32 @@ class WebCrawlWorker(BaseWorker):
                     "config": nuclei_config,
                 },
             )
+        batches = (len(targets) + batch_size - 1) // batch_size
+        async with get_session() as db:
+            await self._add_scan_tasks(db, scan_id, batches)
+            await update_scan_phase(
+                db,
+                scan_id,
+                "nuclei",
+                "running",
+                source="crawl",
+                endpoint_batches_queued=batches,
+                endpoint_targets_queued=len(targets),
+            )
         await coord.close()
         await queue.close()
+
+    async def _add_scan_tasks(self, db, scan_id: str, count: int) -> None:
+        if count <= 0:
+            return
+        from workers.db_models import Scan
+
+        await db.execute(
+            update(Scan)
+            .where(Scan.id == scan_id)
+            .values(total_tasks=Scan.total_tasks + count)
+        )
+        await db.commit()
 
     async def _mark_crawl_done(self, scan_id: str, org_id: str, workspace_id: str) -> None:
         coord = TaskCoordinator()

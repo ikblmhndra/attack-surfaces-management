@@ -46,14 +46,37 @@ function getPhaseLabel(progress: number, status: string): string {
   return "Finalizing";
 }
 
-function getPhaseStatusLabel(scan: any): string {
+const PHASE_ORDER = ["discovery", "targeting", "port", "crawl", "enrich", "nuclei", "screenshot", "correlation"];
+
+function getActivePhaseKey(scan: any): string | null {
   const phases = scan.phase_status || {};
-  const order = ["discovery", "port", "crawl", "nuclei", "enrich", "screenshot", "correlation"];
-  const running = order.find((phase) => phases[phase]?.status === "running");
-  if (running) return running.replace("_", " ");
-  const queued = order.find((phase) => phases[phase]?.status === "queued");
-  if (queued && scan.status === "queued") return queued.replace("_", " ");
+  const running = PHASE_ORDER.find((phase) => phases[phase]?.status === "running");
+  if (running) return running;
+  const queued = PHASE_ORDER.find((phase) => phases[phase]?.status === "queued");
+  if (queued && scan.status === "queued") return queued;
+  return null;
+}
+
+function getPhaseStatusLabel(scan: any): string {
+  const active = getActivePhaseKey(scan);
+  if (active) return active.replace("_", " ");
   return getPhaseLabel(scan.progress_pct ?? 0, scan.status);
+}
+
+function getPhaseDetail(scan: any): string {
+  const phases = scan.phase_status || {};
+  const phaseKey = getActivePhaseKey(scan);
+  const phase = phaseKey ? phases[phaseKey] : null;
+  if (phaseKey === "nuclei" && phase?.expected_batches) {
+    return `nuclei ${phase.completed_batches ?? 0}/${phase.expected_batches} batches`;
+  }
+  if (phase?.expected_batches) {
+    return `${phaseKey?.replace("_", " ")} ${phase.completed_batches ?? 0}/${phase.expected_batches} batches`;
+  }
+  if (scan.total_tasks) {
+    return `${scan.completed_tasks ?? 0}/${scan.total_tasks} tasks`;
+  }
+  return getPhaseStatusLabel(scan);
 }
 
 export default function ScansPage() {
@@ -187,7 +210,7 @@ export default function ScansPage() {
                         </div>
                         {scan.status === "running" && (
                           <span className="text-[10px] text-muted-foreground/70 mt-0.5 block">
-                            {getPhaseStatusLabel(scan)}
+                            {getPhaseDetail(scan)}
                           </span>
                         )}
                         {scan.status === "failed" && scan.error_message && (

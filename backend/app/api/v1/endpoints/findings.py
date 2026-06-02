@@ -552,7 +552,7 @@ async def export_findings(
 
     query = select(Finding).where(Finding.workspace_id == workspace_id, Finding.deleted_at.is_(None))
     if org_id: query = query.where(Finding.org_id == org_id)
-    if severity: query = query.where(Finding.severity == severity)
+    if severity: query = query.where(Finding.severity.in_([s.strip() for s in severity.split(",")]))
     if status: query = query.where(Finding.status == status)
     if category: query = query.where(Finding.category == category)
     findings = (await db.execute(query.order_by(Finding.last_seen.desc()).limit(10000))).scalars().all()
