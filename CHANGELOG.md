@@ -12,9 +12,10 @@ All notable changes to this project are documented below, sorted newest-first.
 - **Impact**: Assets with open finding objects in the detail response no longer trigger a React client-side exception.
 
 ### Fixed: Crawl endpoint persistence on oversized archive URLs
-- **File**: `workers/crawler/web_crawl_worker.py`
+- **Files**: `workers/crawler/web_crawl_worker.py`, `workers/Dockerfile`
 - Crawl persistence now skips URLs and hosts that exceed database column limits and clamps bounded display fields before upsert.
 - GAU passive URL collection now runs with bounded per-host concurrency instead of sequentially processing every host.
+- Optional FFUF fuzzing now runs inside the crawl phase after live web discovery, so fuzzed paths are validated, persisted as `web_endpoints`, and can feed endpoint-level nuclei scans.
 - Crawl progress updates are now monotonic, so late crawl completion cannot move a scan backward from a higher progress percentage.
 - Nuclei batches generated from crawled endpoints now use a dedicated HTTP-only endpoint template profile with a bounded endpoint scan timeout.
 - **Impact**: Passive GAU/Katana results with extremely long historical URLs no longer fail the entire crawl task or leave scans stuck near completion.

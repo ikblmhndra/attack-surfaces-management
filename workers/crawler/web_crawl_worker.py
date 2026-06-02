@@ -142,8 +142,9 @@ class WebCrawlWorker(BaseWorker):
             tmpdir = Path(tmp)
             katana_urls = await self._run_katana(targets, tmpdir, config)
             gau_urls = await self._run_gau(targets, tmpdir, config)
+            ffuf_urls = await self._run_ffuf(targets, tmpdir, config)
 
-            source_by_url = self._build_source_map(katana_urls, gau_urls)
+            source_by_url = self._build_source_map(katana_urls, gau_urls, ffuf_urls)
             normalized = list(source_by_url.keys())
             max_total = int(config.get("crawl_max_total_urls", 2000))
             normalized = normalized[:max_total]
@@ -232,6 +233,84 @@ class WebCrawlWorker(BaseWorker):
             urls.extend(batch)
         return urls
 
+    async def _run_ffuf(self, targets: List[Dict[str, Any]], tmpdir: Path, config: Dict[str, Any]) -> List[str]:
+        ffuf_path = _tool_path("ffuf")
+        if not config.get("fuzz", False) or not ffuf_path:
+            log.info("ffuf_unavailable_or_disabled")
+            return []
+
+        urls = [t["url"].rstrip("/") for t in targets if t.get("url")]
+        urls = urls[: int(config.get("fuzz_max_targets", 25))]
+        if not urls:
+            return []
+
+        wordlist = self._resolve_fuzz_wordlist(tmpdir, config)
+        rate = int(config.get("fuzz_rate", 50))
+        timeout = int(config.get("fuzz_timeout", 10))
+        max_time = int(config.get("fuzz_max_time", 120))
+        threads = int(config.get("fuzz_threads", 20))
+        semaphore = asyncio.Semaphore(max(1, min(int(config.get("fuzz_concurrency", 3)), 10)))
+
+        async def run_target(url: str) -> List[str]:
+            output_file = tmpdir / f"ffuf_{abs(hash(url))}.json"
+            cmd = [
+                ffuf_path,
+                "-u", f"{url}/FUZZ",
+                "-w", wordlist,
+                "-o", str(output_file),
+                "-of", "json",
+                "-fc", str(config.get("fuzz_filter_codes", "404,301,302,307")),
+                "-fs", "0",
+                "-t", str(threads),
+                "-rate", str(rate),
+                "-timeout", str(timeout),
+                "-max-time", str(max_time),
+                "-noninteractive",
+                "-ac",
+            ]
+            async with semaphore:
+                await self._run_command(cmd, timeout=max_time + 60, label="ffuf")
+
+            discovered: List[str] = []
+            if not output_file.exists():
+                return discovered
+            try:
+                data = json.loads(output_file.read_text())
+            except json.JSONDecodeError:
+                return discovered
+            for result in data.get("results", []):
+                discovered_url = result.get("url", "")
+                if discovered_url.startswith("http"):
+                    discovered.append(discovered_url)
+            return discovered
+
+        batches = await asyncio.gather(*(run_target(url) for url in urls))
+        discovered: List[str] = []
+        for batch in batches:
+            discovered.extend(batch)
+        log.info("ffuf_fuzz_completed", targets=len(urls), discovered=len(discovered))
+        return discovered
+
+    def _resolve_fuzz_wordlist(self, tmpdir: Path, config: Dict[str, Any]) -> str:
+        candidates = [
+            config.get("fuzz_wordlist", ""),
+            "/usr/share/wordlists/dirb/common.txt",
+            "/usr/share/seclists/Discovery/Web-Content/common.txt",
+        ]
+        for candidate in candidates:
+            if candidate and Path(candidate).exists():
+                return str(candidate)
+
+        fallback = tmpdir / "fuzz_words.txt"
+        fallback.write_text("\n".join([
+            "admin", "login", "dashboard", "api", "v1", "v2", "graphql",
+            "backup", ".git", ".env", "config", "wp-admin", "wp-content",
+            "uploads", "files", "assets", "static", "status", "health",
+            ".well-known", "sitemap.xml", "robots.txt", "swagger",
+            "api-docs", "openapi.json", "jenkins", ".aws", ".azure",
+        ]))
+        return str(fallback)
+
     async def _validate_urls(self, urls: List[str], tmpdir: Path, config: Dict[str, Any]) -> List[Dict[str, Any]]:
         if not urls:
             return []
@@ -306,7 +385,7 @@ class WebCrawlWorker(BaseWorker):
             result.append(normalized)
         return result
 
-    def _build_source_map(self, katana_urls: List[str], gau_urls: List[str]) -> Dict[str, str]:
+    def _build_source_map(self, katana_urls: List[str], gau_urls: List[str], ffuf_urls: List[str]) -> Dict[str, str]:
         sources: Dict[str, str] = {}
         for raw in katana_urls:
             normalized = _normalize_url(raw)
@@ -320,6 +399,12 @@ class WebCrawlWorker(BaseWorker):
                 sources[normalized] = "katana+gau"
             else:
                 sources.setdefault(normalized, "gau")
+        for raw in ffuf_urls:
+            normalized = _normalize_url(raw)
+            if not normalized:
+                continue
+            existing = sources.get(normalized)
+            sources[normalized] = f"{existing}+ffuf" if existing else "ffuf"
         return sources
 
     async def _persist_endpoints(self, db, org_id: str, workspace_id: str, endpoints: List[Dict[str, Any]]) -> tuple[int, List[str]]:

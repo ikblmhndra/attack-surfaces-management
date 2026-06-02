@@ -56,6 +56,7 @@ RUN go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest 
     && go install -v github.com/projectdiscovery/katana/cmd/katana@latest \
     && go install -v github.com/projectdiscovery/chaos-client/cmd/chaos@latest \
     && go install -v github.com/lc/gau/v2/cmd/gau@latest \
+    && go install -v github.com/ffuf/ffuf/v2@latest \
     && go install -v github.com/tomnomnom/assetfinder@latest \
     && go install -v github.com/owasp-amass/amass/v4/...@master
 
@@ -76,6 +77,7 @@ RUN pip install --no-cache-dir --upgrade pip \
     && ln -sf /go/bin/httpx /usr/local/bin/httpx \
     && ln -sf /go/bin/katana /usr/local/bin/katana \
     && ln -sf /go/bin/gau /usr/local/bin/gau \
+    && ln -sf /go/bin/ffuf /usr/local/bin/ffuf \
     && ln -sf /go/bin/nuclei /usr/local/bin/nuclei
 
 # ── tldextract data ────────────────────────────────────────────
