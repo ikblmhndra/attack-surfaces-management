@@ -262,6 +262,13 @@ class NucleiWorker(BaseWorker):
                 "http/exposed-panels",
                 "network/exposures",
             ],
+            "endpoint": [
+                "http/exposures",
+                "http/misconfiguration",
+                "http/default-logins",
+                "http/takeovers",
+                "http/exposed-panels",
+            ],
             "full": [
                 "http/cves",
                 "http/vulnerabilities",

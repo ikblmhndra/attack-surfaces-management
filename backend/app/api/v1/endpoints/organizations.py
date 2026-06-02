@@ -78,7 +78,7 @@ class ScanRequest(BaseModel):
     @field_validator("modules")
     @classmethod
     def validate_modules(cls, value: List[str]) -> List[str]:
-        allowed = {"discovery", "port", "nuclei", "screenshot"}
+        allowed = {"discovery", "port", "crawl", "nuclei", "screenshot"}
         invalid = sorted(set(value) - allowed)
         if invalid:
             raise ValueError(f"unsupported scan module(s): {', '.join(invalid)}")

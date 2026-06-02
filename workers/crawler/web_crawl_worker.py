@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 import structlog
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from workers.base_worker import BaseWorker
@@ -32,6 +32,12 @@ INTERESTING_PATH_RE = re.compile(
     r"(admin|login|signin|api|graphql|swagger|openapi|upload|backup|config|debug|status|health|\.env|\.git|wp-admin|jenkins)",
     re.I,
 )
+MAX_ENDPOINT_URL_LENGTH = 2000
+MAX_ENDPOINT_HOST_LENGTH = 500
+MAX_ENDPOINT_PATH_LENGTH = 1500
+MAX_ENDPOINT_SOURCE_LENGTH = 50
+MAX_ENDPOINT_CONTENT_TYPE_LENGTH = 255
+MAX_ENDPOINT_TITLE_LENGTH = 500
 
 
 def _tool_path(name: str) -> Optional[str]:
@@ -196,26 +202,34 @@ class WebCrawlWorker(BaseWorker):
             return []
         hosts = sorted({t["host"] for t in targets if t.get("host")})
         max_hosts = int(config.get("gau_max_hosts", 50))
-        urls: List[str] = []
-        for host in hosts[:max_hosts]:
+        gau_config = config.get("gau_config_path") or os.getenv("GAU_CONFIG_PATH", "/app/workers/config/gau.toml")
+        timeout = int(config.get("gau_timeout", 60))
+        semaphore = asyncio.Semaphore(max(1, min(int(config.get("gau_concurrency", 5)), 10)))
+
+        async def run_host(host: str) -> List[str]:
             output_file = tmpdir / f"gau_{abs(hash(host))}.txt"
-            gau_config = config.get("gau_config_path") or os.getenv("GAU_CONFIG_PATH", "/app/workers/config/gau.toml")
             cmd = [gau_path, "--config", gau_config, "--subs", "--threads", "5", host]
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=int(config.get("gau_timeout", 60)))
-                output_file.write_bytes(stdout)
-            except asyncio.TimeoutError:
-                log.warning("gau_timeout", host=host)
-                continue
-            except Exception as exc:
-                log.warning("gau_error", host=host, error=str(exc))
-                continue
-            urls.extend([line.strip() for line in output_file.read_text().splitlines() if line.strip().startswith("http")])
+            async with semaphore:
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        *cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+                    output_file.write_bytes(stdout)
+                except asyncio.TimeoutError:
+                    log.warning("gau_timeout", host=host)
+                    return []
+                except Exception as exc:
+                    log.warning("gau_error", host=host, error=str(exc))
+                    return []
+            return [line.strip() for line in output_file.read_text().splitlines() if line.strip().startswith("http")]
+
+        batches = await asyncio.gather(*(run_host(host) for host in hosts[:max_hosts]))
+        urls: List[str] = []
+        for batch in batches:
+            urls.extend(batch)
         return urls
 
     async def _validate_urls(self, urls: List[str], tmpdir: Path, config: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -326,11 +340,15 @@ class WebCrawlWorker(BaseWorker):
         now = datetime.now(timezone.utc)
         selected = []
         persisted = 0
+        skipped_oversized = 0
 
         for endpoint in endpoints:
             url = endpoint["url"]
             parsed = urlsplit(url)
             host = parsed.hostname or ""
+            if len(url) > MAX_ENDPOINT_URL_LENGTH or len(host) > MAX_ENDPOINT_HOST_LENGTH:
+                skipped_oversized += 1
+                continue
             asset_id = asset_by_host.get(host)
             if not asset_id:
                 continue
@@ -341,13 +359,13 @@ class WebCrawlWorker(BaseWorker):
                 "workspace_id": workspace_id,
                 "url": url,
                 "host": host,
-                "path": parsed.path or "/",
-                "source": endpoint.get("source", "crawl")[:50],
+                "path": (parsed.path or "/")[:MAX_ENDPOINT_PATH_LENGTH],
+                "source": endpoint.get("source", "crawl")[:MAX_ENDPOINT_SOURCE_LENGTH],
                 "http_status": endpoint.get("http_status"),
                 "status_class": endpoint.get("status_class") or _status_class(endpoint.get("http_status")),
-                "content_type": (endpoint.get("content_type") or "")[:255] or None,
+                "content_type": (endpoint.get("content_type") or "")[:MAX_ENDPOINT_CONTENT_TYPE_LENGTH] or None,
                 "content_length": endpoint.get("content_length"),
-                "title": (endpoint.get("title") or "")[:500] or None,
+                "title": (endpoint.get("title") or "")[:MAX_ENDPOINT_TITLE_LENGTH] or None,
                 **flags,
                 "metadata": {"query": parsed.query},
                 "last_seen": now,
@@ -362,6 +380,14 @@ class WebCrawlWorker(BaseWorker):
             if flags["is_interesting"] and values["status_class"] in {"ok", "redirect", "auth_required", "server_error"}:
                 selected.append(url)
         await db.commit()
+        if skipped_oversized:
+            log.info(
+                "crawl_endpoint_skipped_oversized",
+                org_id=org_id,
+                workspace_id=workspace_id,
+                skipped=skipped_oversized,
+                max_url_length=MAX_ENDPOINT_URL_LENGTH,
+            )
         return persisted, selected
 
     async def _update_progress(self, db, scan_id: str, endpoints_found: int) -> None:
@@ -369,7 +395,7 @@ class WebCrawlWorker(BaseWorker):
         await db.execute(
             update(Scan)
             .where(Scan.id == scan_id)
-            .values(progress_pct=45)
+            .values(progress_pct=func.greatest(Scan.progress_pct, 45))
         )
         await db.commit()
 
@@ -383,9 +409,9 @@ class WebCrawlWorker(BaseWorker):
         nuclei_config = {
             **config,
             "automatic_scan": False,
-            "vuln_depth": "default",
+            "vuln_depth": "endpoint",
             "severities": ["critical", "high", "medium"],
-            "scan_timeout": int(config.get("scan_timeout", 900)),
+            "scan_timeout": int(config.get("crawl_nuclei_scan_timeout", min(int(config.get("scan_timeout", 900)), 600))),
         }
         for i in range(0, len(targets), batch_size):
             await coord.add_nuclei_expected(scan_id)

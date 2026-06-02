@@ -6,6 +6,19 @@ All notable changes to this project are documented below, sorted newest-first.
 
 ## 2026-06-02 — API Timeline Query & Queue Runtime Fixes
 
+### Fixed: Asset detail client-side crash
+- **File**: `frontend/src/app/dashboard/assets/[id]/page.tsx`
+- Asset detail now normalizes `open_findings` from either a count or API summary array before rendering badges and sidebar metrics.
+- **Impact**: Assets with open finding objects in the detail response no longer trigger a React client-side exception.
+
+### Fixed: Crawl endpoint persistence on oversized archive URLs
+- **File**: `workers/crawler/web_crawl_worker.py`
+- Crawl persistence now skips URLs and hosts that exceed database column limits and clamps bounded display fields before upsert.
+- GAU passive URL collection now runs with bounded per-host concurrency instead of sequentially processing every host.
+- Crawl progress updates are now monotonic, so late crawl completion cannot move a scan backward from a higher progress percentage.
+- Nuclei batches generated from crawled endpoints now use a dedicated HTTP-only endpoint template profile with a bounded endpoint scan timeout.
+- **Impact**: Passive GAU/Katana results with extremely long historical URLs no longer fail the entire crawl task or leave scans stuck near completion.
+
 ### Fixed: Nuclei timeout reported as zero findings
 - **Files**: `workers/scanner/nuclei_worker.py`, `workers/scanner/discovery_worker.py`, `workers/crawler/web_crawl_worker.py`, `backend/app/services/scan_service.py`, `frontend/src/components/modals/ScanModal.tsx`
 - Nuclei worker now parses partial result files after timeout and treats empty timed-out batches as worker errors instead of silently completing with zero findings.

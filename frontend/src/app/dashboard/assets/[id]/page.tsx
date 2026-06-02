@@ -65,11 +65,14 @@ export default function AssetDetailPage() {
   const sub = asset?.subdomain;
   const ip = asset?.ip;
   const ports = asset?.ports || [];
+  const openFindingsCount = Array.isArray(asset?.open_findings)
+    ? asset.open_findings.length
+    : Number(asset?.open_findings || 0);
 
   const TABS: { id: "overview" | "endpoints" | "findings" | "screenshots" | "intel"; label: string; count?: number }[] = [
     { id: "overview", label: "Overview" },
     { id: "endpoints", label: "Endpoints" },
-    { id: "findings", label: "Findings", count: asset?.open_findings },
+    { id: "findings", label: "Findings", count: openFindingsCount },
     { id: "screenshots", label: "Screenshots" },
     { id: "intel", label: "Threat Intel" },
   ];
@@ -475,8 +478,8 @@ export default function AssetDetailPage() {
               </div>
               <div className="flex items-center justify-between">
                 <span className="text-xs text-muted-foreground">Open Findings</span>
-                <span className={cn("text-xs font-bold", asset.open_findings > 0 ? "text-red-400" : "text-emerald-400")}>
-                  {asset.open_findings || 0}
+                <span className={cn("text-xs font-bold", openFindingsCount > 0 ? "text-red-400" : "text-emerald-400")}>
+                  {openFindingsCount}
                 </span>
               </div>
               <div className="flex items-center justify-between">
