@@ -67,6 +67,8 @@ export interface Organization {
   total_assets:        number;
   total_findings:      number;
   is_monitoring_active: boolean;
+  auto_scan_enabled:   boolean;
+  scan_policy?:        Record<string, any>;
   last_scan_at?:       string;
   current_score?:      OrgScoreSummary;
   risk_score?:         OrgRiskScore;
@@ -279,6 +281,22 @@ export interface ScanHistory {
 // ── Scan ───────────────────────────────────────────────────────
 export type ScanType   = "full" | "quick" | "discovery" | "vuln";
 export type ScanStatus = "pending" | "queued" | "running" | "completed" | "failed" | "cancelled";
+export type ScanProfile = "safe" | "default" | "deep_authorized" | "endpoint" | "limited";
+
+export interface ScanPhaseStatus {
+  status?: string;
+  completed?: number;
+  expected?: number;
+  error?: string;
+  profile?: ScanProfile;
+  web_standard?: number;
+  web_limited?: number;
+  crawl?: number;
+  network?: number;
+  screenshot?: number;
+  direct?: number;
+  skipped_by_status?: Record<string, number>;
+}
 
 export interface Scan {
   id:              string;
@@ -287,6 +305,7 @@ export interface Scan {
   status:          ScanStatus;
   modules:         string[];
   progress_pct:    number;
+  phase_status?:   Record<string, ScanPhaseStatus>;
   total_tasks:     number;
   completed_tasks: number;
   assets_found:    number;

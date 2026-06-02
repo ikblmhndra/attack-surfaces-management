@@ -207,7 +207,7 @@ async def list_assets(
     }
 
 
-@router.get("/{asset_id}")
+@router.get("/{asset_id:uuid}")
 async def get_asset(
     asset_id: UUID,
     workspace_id: UUID = Depends(get_workspace_id),
@@ -272,7 +272,7 @@ async def get_asset(
     return result
 
 
-@router.get("/{asset_id}/endpoints")
+@router.get("/{asset_id:uuid}/endpoints")
 async def get_asset_endpoints(
     asset_id: UUID,
     interesting: Optional[bool] = Query(None),
@@ -298,7 +298,7 @@ async def get_asset_endpoints(
     return {"items": [_endpoint_to_dict(row) for row in rows], "total": len(rows)}
 
 
-@router.get("/{asset_id}/findings")
+@router.get("/{asset_id:uuid}/findings")
 async def get_asset_findings(
     asset_id: UUID,
     status: Optional[str] = Query(None),
@@ -325,7 +325,7 @@ async def get_asset_findings(
     return {"items": [_finding_summary(f) for f in findings], "total": len(findings)}
 
 
-@router.get("/{asset_id}/screenshots")
+@router.get("/{asset_id:uuid}/screenshots")
 async def get_asset_screenshots(
     asset_id: UUID,
     limit: int = Query(10, ge=1, le=50),
@@ -359,7 +359,7 @@ async def get_asset_screenshots(
     }
 
 
-@router.get("/{asset_id}/technologies")
+@router.get("/{asset_id:uuid}/technologies")
 async def get_asset_technologies(
     asset_id: UUID,
     workspace_id: UUID = Depends(get_workspace_id),
@@ -378,7 +378,7 @@ async def get_asset_technologies(
     return {"items": [_tech_to_dict(t) for t in techs]}
 
 
-@router.get("/{asset_id}/intel")
+@router.get("/{asset_id:uuid}/intel")
 async def get_asset_intel(
     asset_id: UUID,
     workspace_id: UUID = Depends(get_workspace_id),
@@ -397,7 +397,7 @@ async def get_asset_intel(
     return {"items": [_intel_to_dict(ti) for ti in intel]}
 
 
-@router.get("/{asset_id}/relationships")
+@router.get("/{asset_id:uuid}/relationships")
 async def get_asset_relationships(
     asset_id: UUID,
     depth: int = Query(2, ge=1, le=3),

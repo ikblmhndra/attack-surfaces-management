@@ -2,7 +2,6 @@
 const nextConfig = {
   output: "standalone",
   reactStrictMode: true,
-  serverExternalPackages: ["@tanstack/react-table"],
   poweredByHeader: false,
 
   images: {
@@ -20,6 +19,7 @@ const nextConfig = {
   },
 
   experimental: {
+    serverComponentsExternalPackages: ["@tanstack/react-table"],
     optimizePackageImports: [
       "lucide-react",
       "recharts",

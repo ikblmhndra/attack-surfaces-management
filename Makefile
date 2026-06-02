@@ -89,8 +89,9 @@ restart-api: ## Restart API service only
 	@$(COMPOSE) restart api
 
 restart-workers: ## Restart all worker services
-	@$(COMPOSE) restart worker-discovery worker-probe worker-nuclei \
-		worker-screenshot worker-correlation worker-risk worker-notification scheduler
+	@$(COMPOSE) restart worker-discovery worker-port worker-crawl worker-nuclei \
+		worker-screenshot worker-enrichment worker-correlation worker-risk \
+		worker-notification scheduler
 
 # ── Build ─────────────────────────────────────────────────────
 build: ## Build all Docker images
@@ -104,7 +105,8 @@ build-frontend: ## Build frontend image only
 	@$(COMPOSE) build frontend
 
 build-workers: ## Build workers image only
-	@$(COMPOSE) build worker-discovery
+	@$(COMPOSE) build worker-discovery worker-port worker-crawl worker-nuclei \
+		worker-screenshot worker-enrichment
 
 rebuild: ## Force rebuild all images (no cache)
 	@$(COMPOSE) build --no-cache --parallel
@@ -162,7 +164,7 @@ logs-api: ## Follow API logs
 	@$(COMPOSE) logs -f api --tail=100
 
 logs-workers: ## Follow all worker logs
-	@$(COMPOSE) logs -f worker-discovery worker-nuclei worker-correlation worker-risk --tail=50
+	@$(COMPOSE) logs -f worker-discovery worker-port worker-crawl worker-nuclei worker-screenshot worker-correlation worker-risk worker-enrichment worker-notification worker-scheduler --tail=50
 
 logs-nginx: ## Follow NGINX logs
 	@$(COMPOSE) logs -f nginx --tail=100
@@ -248,10 +250,12 @@ scan-org: ## Trigger a scan for an org (usage: make scan-org ORG_ID=xxx TOKEN=yy
 
 # ── Scaling ───────────────────────────────────────────────────
 ## Scaling
-workers-scale: ## Scale workers (usage: make workers-scale NUCLEI=4 DISCOVERY=3 PROBE=5)
+workers-scale: ## Scale workers (usage: make workers-scale NUCLEI=4 DISCOVERY=3 PORT=3 CRAWL=2 ENRICHMENT=2)
 	@$(COMPOSE) up -d --scale worker-nuclei=$(or $(NUCLEI),2) \
 		--scale worker-discovery=$(or $(DISCOVERY),2) \
-		--scale worker-probe=$(or $(PROBE),3) \
+		--scale worker-port=$(or $(PORT),3) \
+		--scale worker-crawl=$(or $(CRAWL),2) \
+		--scale worker-enrichment=$(or $(ENRICHMENT),2) \
 		--no-recreate
 
 # ── Production ────────────────────────────────────────────────

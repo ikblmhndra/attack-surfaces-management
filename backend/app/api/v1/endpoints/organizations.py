@@ -2,7 +2,7 @@
 ASM Platform — Organizations API Endpoints
 Full CRUD for organization management and scan orchestration.
 """
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from uuid import UUID
 
 import structlog
@@ -19,6 +19,7 @@ from app.api.v1.dependencies.auth import (
 )
 from app.db.models.models import Asset, Finding, Organization, RiskScore, Scan, ScanTemplate, User
 from app.services.audit_service import audit_log
+from app.services.scan_profiles import normalize_scan_profile
 from app.services.scan_service import ScanService
 
 log = structlog.get_logger()
@@ -43,6 +44,7 @@ class OrgCreateRequest(BaseModel):
     criticality: int = Field(default=3, ge=1, le=5)
     environment: str = Field(default="production")
     auto_scan_enabled: bool = True
+    scan_policy: Dict[str, Any] = Field(default_factory=dict)
 
 
 class OrgUpdateRequest(BaseModel):
@@ -59,12 +61,14 @@ class OrgUpdateRequest(BaseModel):
     environment: Optional[str] = None
     is_monitoring_active: Optional[bool] = None
     auto_scan_enabled: Optional[bool] = None
+    scan_policy: Optional[Dict[str, Any]] = None
 
 
 class ScanRequest(BaseModel):
     scan_type: str = Field(default="full")  # full, discovery, vuln, quick
     modules: List[str] = Field(default_factory=list)
     config: dict = Field(default_factory=dict)
+    scan_profile: Optional[str] = None
     template_id: Optional[str] = None  # Optional scan template reference
 
     @field_validator("scan_type")
@@ -78,11 +82,21 @@ class ScanRequest(BaseModel):
     @field_validator("modules")
     @classmethod
     def validate_modules(cls, value: List[str]) -> List[str]:
-        allowed = {"discovery", "port", "crawl", "nuclei", "screenshot"}
+        allowed = {"discovery", "port", "crawl", "nuclei", "screenshot", "enrich"}
         invalid = sorted(set(value) - allowed)
         if invalid:
             raise ValueError(f"unsupported scan module(s): {', '.join(invalid)}")
         return value
+
+    @field_validator("scan_profile")
+    @classmethod
+    def validate_scan_profile(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        normalized = normalize_scan_profile(value)
+        if not normalized:
+            raise ValueError("scan_profile must be one of: safe, default, deep_authorized")
+        return normalized
 
 
 class OrgResponse(BaseModel):
@@ -103,6 +117,7 @@ class OrgResponse(BaseModel):
     total_findings: int
     is_monitoring_active: bool
     auto_scan_enabled: bool
+    scan_policy: Dict[str, Any]
     last_scan_at: Optional[str]
     current_score: Optional[dict]
     created_at: str
@@ -195,6 +210,7 @@ async def list_organizations(
             "total_findings": org.total_findings,
             "is_monitoring_active": org.is_monitoring_active,
             "auto_scan_enabled": org.auto_scan_enabled,
+            "scan_policy": org.scan_policy or {},
             "last_scan_at": org.last_scan_at.isoformat() if org.last_scan_at else None,
             "current_score": {
                 "overall": latest_score.overall_score,
@@ -260,6 +276,7 @@ async def create_organization(
         criticality=request.criticality,
         environment=request.environment,
         auto_scan_enabled=request.auto_scan_enabled,
+        scan_policy=request.scan_policy,
     )
     db.add(org)
     await db.commit()
@@ -331,6 +348,7 @@ async def get_organization(
         "total_findings": finding_count,
         "is_monitoring_active": org.is_monitoring_active,
         "auto_scan_enabled": org.auto_scan_enabled,
+        "scan_policy": org.scan_policy or {},
         "last_scan_at": org.last_scan_at.isoformat() if org.last_scan_at else None,
         "risk_score": {
             "overall": latest_score.overall_score,
@@ -434,7 +452,9 @@ async def trigger_scan(
 
     # Resolve template if provided
     modules = request.modules
-    config = request.config
+    config = dict(request.config)
+    if request.scan_profile:
+        config["scan_profile"] = request.scan_profile
     scan_type = request.scan_type
     if request.template_id:
         result = await db.execute(
@@ -610,6 +630,7 @@ def _scan_to_dict(scan: Scan) -> dict:
         "scan_type": scan.scan_type,
         "status": scan.status,
         "modules": scan.modules or [],
+        "phase_status": scan.phase_status or {},
         "progress_pct": scan.progress_pct,
         "assets_found": scan.assets_found,
         "findings_found": scan.findings_found,

@@ -18,9 +18,11 @@ import structlog
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from app.services.scan_profiles import child_profile_config
 from workers.base_worker import BaseWorker
 from workers.db import get_session
 from workers.queue_client import QueueClient
+from workers.scan_phase import update_scan_phase
 from workers.scan_state import mark_scan_running, should_process_scan
 from workers.task_coordinator import TaskCoordinator
 
@@ -113,6 +115,42 @@ def _endpoint_flags(url: str) -> Dict[str, bool]:
     }
 
 
+def _endpoint_score(endpoint: Dict[str, Any], flags: Dict[str, bool]) -> tuple[int, List[str]]:
+    score = 0
+    reasons: List[str] = []
+    source = endpoint.get("source", "")
+    status_class = endpoint.get("status_class") or _status_class(endpoint.get("http_status"))
+    content_type = (endpoint.get("content_type") or "").lower()
+
+    for key, weight, reason in (
+        ("has_params", 25, "query_params"),
+        ("is_api", 25, "api_path"),
+        ("is_auth", 20, "auth_path"),
+        ("is_interesting", 10, "interesting_path"),
+    ):
+        if flags.get(key):
+            score += weight
+            reasons.append(reason)
+
+    if "ffuf" in source:
+        score += 20
+        reasons.append("fuzz_discovered")
+    if "gau" in source:
+        score += 10
+        reasons.append("passive_history")
+    if status_class in {"ok", "redirect"}:
+        score += 10
+        reasons.append(status_class)
+    elif status_class in {"auth_required", "server_error", "rate_limited"}:
+        score += 15
+        reasons.append(status_class)
+    if "json" in content_type:
+        score += 10
+        reasons.append("json")
+
+    return score, reasons
+
+
 class WebCrawlWorker(BaseWorker):
     QUEUE = "scan.crawl"
     CONCURRENCY = int(os.getenv("CRAWL_CONCURRENCY", "2"))
@@ -130,11 +168,14 @@ class WebCrawlWorker(BaseWorker):
                 log.info("crawl_skipped_inactive_scan", scan_id=scan_id)
                 await self._mark_crawl_done(scan_id, org_id, workspace_id)
                 return
+            await update_scan_phase(db, scan_id, "crawl", "running", targets_total=len(targets))
 
         max_targets = int(config.get("crawl_max_targets", 100))
         targets = targets[:max_targets]
         if not targets:
             log.info("crawl_no_targets", scan_id=scan_id)
+            async with get_session() as db:
+                await update_scan_phase(db, scan_id, "crawl", "skipped", targets_total=0)
             await self._mark_crawl_done(scan_id, org_id, workspace_id)
             return
 
@@ -161,6 +202,15 @@ class WebCrawlWorker(BaseWorker):
                 db, org_id, workspace_id, validated
             )
             await self._update_progress(db, scan_id, persisted)
+            await update_scan_phase(
+                db,
+                scan_id,
+                "crawl",
+                "completed",
+                targets_total=len(targets),
+                endpoints=persisted,
+                selected_for_nuclei=len(selected),
+            )
 
         selected = selected[: int(config.get("crawl_nuclei_max_targets", 200))]
         await self._publish_selected_nuclei(scan_id, org_id, workspace_id, selected, config)
@@ -185,12 +235,18 @@ class WebCrawlWorker(BaseWorker):
             "-silent",
             "-depth", str(int(config.get("crawl_depth", 1))),
             "-rate-limit", str(int(config.get("crawl_rate", 50))),
+            "-host-rate-limit", str(int(config.get("crawl_host_rate_limit", 20))),
             "-timeout", str(int(config.get("crawl_timeout", 10))),
             "-retries", "1",
             "-concurrency", str(int(config.get("crawl_concurrency", 10))),
+            "-parallelism", str(int(config.get("crawl_parallelism", 5))),
+            "-fs", str(config.get("katana_field_scope", "fqdn")),
+            "-mdp", str(int(config.get("katana_max_domain_pages", 200))),
             "-disable-update-check",
             "-jc",
         ]
+        if config.get("katana_known_files", True) and int(config.get("crawl_depth", 1)) >= 3:
+            cmd.extend(["-kf", "all"])
         await self._run_command(cmd, timeout=int(config.get("katana_timeout", 180)), label="katana")
         if not output_file.exists():
             return []
@@ -259,14 +315,16 @@ class WebCrawlWorker(BaseWorker):
                 "-w", wordlist,
                 "-o", str(output_file),
                 "-of", "json",
-                "-fc", str(config.get("fuzz_filter_codes", "404,301,302,307")),
+                "-mc", str(config.get("fuzz_match_codes", "200-299,301,302,307,308,401,403,405,500")),
+                "-fc", str(config.get("fuzz_filter_codes", "404")),
                 "-fs", "0",
                 "-t", str(threads),
                 "-rate", str(rate),
                 "-timeout", str(timeout),
-                "-max-time", str(max_time),
+                "-maxtime", str(max_time),
                 "-noninteractive",
                 "-ac",
+                "-ach",
             ]
             async with semaphore:
                 await self._run_command(cmd, timeout=max_time + 60, label="ffuf")
@@ -332,8 +390,13 @@ class WebCrawlWorker(BaseWorker):
             "-title",
             "-content-type",
             "-content-length",
+            "-location",
+            "-method",
+            "-web-server",
+            "-response-time",
             "-timeout", str(int(config.get("crawl_httpx_timeout", 10))),
             "-t", str(int(config.get("crawl_httpx_threads", 50))),
+            "-rl", str(int(config.get("crawl_httpx_rate_limit", 150))),
             "-no-color",
         ]
         await self._run_command(cmd, timeout=int(config.get("crawl_validate_timeout", 240)), label="httpx_crawl")
@@ -343,6 +406,8 @@ class WebCrawlWorker(BaseWorker):
                 try:
                     row = json.loads(line)
                 except json.JSONDecodeError:
+                    continue
+                if row.get("failed"):
                     continue
                 url = _normalize_url(row.get("url", ""))
                 if not url:
@@ -355,6 +420,10 @@ class WebCrawlWorker(BaseWorker):
                     "content_type": row.get("content_type", ""),
                     "content_length": row.get("content_length"),
                     "title": row.get("title", ""),
+                    "location": row.get("location", ""),
+                    "method": row.get("method", ""),
+                    "webserver": row.get("webserver", ""),
+                    "response_time": row.get("response_time", ""),
                     "source": "validated",
                 })
         return results
@@ -423,7 +492,7 @@ class WebCrawlWorker(BaseWorker):
         )).all()
         asset_by_host = {value: asset_id for asset_id, value in asset_rows}
         now = datetime.now(timezone.utc)
-        selected = []
+        selected: List[tuple[int, str]] = []
         persisted = 0
         skipped_oversized = 0
 
@@ -438,6 +507,7 @@ class WebCrawlWorker(BaseWorker):
             if not asset_id:
                 continue
             flags = _endpoint_flags(url)
+            score, score_reasons = _endpoint_score(endpoint, flags)
             values = {
                 "asset_id": asset_id,
                 "org_id": org_id,
@@ -452,7 +522,7 @@ class WebCrawlWorker(BaseWorker):
                 "content_length": endpoint.get("content_length"),
                 "title": (endpoint.get("title") or "")[:MAX_ENDPOINT_TITLE_LENGTH] or None,
                 **flags,
-                "metadata": {"query": parsed.query},
+                "metadata": {"query": parsed.query, "score": score, "score_reasons": score_reasons},
                 "last_seen": now,
             }
             stmt = pg_insert(WebEndpoint.__table__).values(**values, first_seen=now)
@@ -462,8 +532,8 @@ class WebCrawlWorker(BaseWorker):
             )
             await db.execute(stmt)
             persisted += 1
-            if flags["is_interesting"] and values["status_class"] in {"ok", "redirect", "auth_required", "server_error"}:
-                selected.append(url)
+            if score >= 25 and values["status_class"] in {"ok", "redirect", "auth_required", "server_error", "rate_limited"}:
+                selected.append((score, url))
         await db.commit()
         if skipped_oversized:
             log.info(
@@ -473,7 +543,8 @@ class WebCrawlWorker(BaseWorker):
                 skipped=skipped_oversized,
                 max_url_length=MAX_ENDPOINT_URL_LENGTH,
             )
-        return persisted, selected
+        selected.sort(key=lambda item: item[0], reverse=True)
+        return persisted, [url for _, url in selected]
 
     async def _update_progress(self, db, scan_id: str, endpoints_found: int) -> None:
         from workers.db_models import Scan
@@ -491,13 +562,11 @@ class WebCrawlWorker(BaseWorker):
         queue = QueueClient()
         await queue.connect()
         batch_size = max(1, min(int(config.get("crawl_nuclei_batch_size", 25)), 50))
-        nuclei_config = {
-            **config,
-            "automatic_scan": False,
-            "vuln_depth": "endpoint",
-            "severities": ["critical", "high", "medium"],
-            "scan_timeout": int(config.get("crawl_nuclei_scan_timeout", min(int(config.get("scan_timeout", 900)), 600))),
-        }
+        nuclei_config = child_profile_config(
+            "endpoint",
+            config,
+            {"scan_timeout": int(config.get("crawl_nuclei_scan_timeout", min(int(config.get("scan_timeout", 900)), 600)))},
+        )
         for i in range(0, len(targets), batch_size):
             await coord.add_nuclei_expected(scan_id)
             await queue.publish(

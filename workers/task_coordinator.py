@@ -26,12 +26,14 @@ local port_done = redis.call('GET', KEYS[4]) or 0
 local crawl_expected = redis.call('GET', KEYS[5]) or 0
 local crawl_done = redis.call('GET', KEYS[6]) or 0
 local screenshot_done = redis.call('GET', KEYS[7]) or 0
-local terminal_marked = redis.call('GET', KEYS[8])
+local enrich_expected = redis.call('GET', KEYS[8]) or 0
+local enrich_done = redis.call('GET', KEYS[9]) or 0
+local terminal_marked = redis.call('GET', KEYS[10])
 if terminal_marked == '1' then
     return 0
 end
-if tonumber(nuclei_done) >= tonumber(nuclei_expected) and tonumber(port_done) >= tonumber(port_expected) and tonumber(crawl_done) >= tonumber(crawl_expected) and tonumber(screenshot_done) == 1 then
-    redis.call('SETEX', KEYS[8], 300, '1')
+if tonumber(nuclei_done) >= tonumber(nuclei_expected) and tonumber(port_done) >= tonumber(port_expected) and tonumber(crawl_done) >= tonumber(crawl_expected) and tonumber(enrich_done) >= tonumber(enrich_expected) and tonumber(screenshot_done) == 1 then
+    redis.call('SETEX', KEYS[10], 300, '1')
     return 1
 end
 return 0
@@ -49,6 +51,8 @@ class TaskCoordinator:
       scan:{scan_id}:port_done         — port batches completed
       scan:{scan_id}:crawl_expected    — total crawl batches published
       scan:{scan_id}:crawl_done        — crawl batches completed
+      scan:{scan_id}:enrich_expected   — total enrichment batches published
+      scan:{scan_id}:enrich_done       — enrichment batches completed
       scan:{scan_id}:screenshot_done   — 0/1 flag
       scan:{scan_id}:terminal_marked   — 0/1 flag (atomic guard)
     """
@@ -125,6 +129,20 @@ class TaskCoordinator:
         key = f"scan:{scan_id}:screenshot_done"
         await r.setex(key, REDIS_KEY_TTL, 1)
 
+    async def add_enrich_expected(self, scan_id: str, count: int = 1) -> int:
+        r = await self._get_redis()
+        key = f"scan:{scan_id}:enrich_expected"
+        val = await r.incrby(key, count)
+        await r.expire(key, REDIS_KEY_TTL)
+        return val
+
+    async def incr_enrich_done(self, scan_id: str) -> int:
+        r = await self._get_redis()
+        key = f"scan:{scan_id}:enrich_done"
+        val = await r.incr(key)
+        await r.expire(key, REDIS_KEY_TTL)
+        return val
+
     async def mark_terminal_if_all_done(self, scan_id: str) -> bool:
         """Atomically check AND claim the terminal slot. Returns True if caller should send terminal correlation."""
         script = await self._load_script()
@@ -138,6 +156,8 @@ class TaskCoordinator:
                 f"scan:{scan_id}:crawl_expected",
                 f"scan:{scan_id}:crawl_done",
                 f"scan:{scan_id}:screenshot_done",
+                f"scan:{scan_id}:enrich_expected",
+                f"scan:{scan_id}:enrich_done",
                 f"scan:{scan_id}:terminal_marked",
             ],
         )
@@ -152,8 +172,16 @@ class TaskCoordinator:
         port_done = int(await r.get(f"scan:{scan_id}:port_done") or 0)
         crawl_expected = int(await r.get(f"scan:{scan_id}:crawl_expected") or 0)
         crawl_done = int(await r.get(f"scan:{scan_id}:crawl_done") or 0)
+        enrich_expected = int(await r.get(f"scan:{scan_id}:enrich_expected") or 0)
+        enrich_done = int(await r.get(f"scan:{scan_id}:enrich_done") or 0)
         screenshot = int(await r.get(f"scan:{scan_id}:screenshot_done") or 0)
-        return done >= expected and port_done >= port_expected and crawl_done >= crawl_expected and screenshot == 1
+        return (
+            done >= expected
+            and port_done >= port_expected
+            and crawl_done >= crawl_expected
+            and enrich_done >= enrich_expected
+            and screenshot == 1
+        )
 
     async def cleanup(self, scan_id: str) -> None:
         r = await self._get_redis()
@@ -164,6 +192,8 @@ class TaskCoordinator:
             f"scan:{scan_id}:port_done",
             f"scan:{scan_id}:crawl_expected",
             f"scan:{scan_id}:crawl_done",
+            f"scan:{scan_id}:enrich_expected",
+            f"scan:{scan_id}:enrich_done",
             f"scan:{scan_id}:screenshot_done",
             f"scan:{scan_id}:terminal_marked",
         )

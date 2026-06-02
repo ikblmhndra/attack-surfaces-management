@@ -4,7 +4,90 @@ All notable changes to this project are documented below, sorted newest-first.
 
 ---
 
+## 2026-06-02 — Scanner Tool Command Hardening
+
+### Fixed: Discovery and crawl command correctness
+- **Files**: `workers/scanner/discovery_worker.py`, `workers/crawler/web_crawl_worker.py`
+- Discovery tools now resolve binaries from either `PATH` or `/go/bin`, preventing false `tool_not_available` states when runtime PATH differs.
+- Subfinder now applies provider config via `-pc` when configured or mounted, and supports bounded all-source mode through scan config.
+- HTTP probing now captures richer ASM context from httpx, including IP, CNAME, ASN, CDN/WAF, favicon, JARM, method, redirect location, websocket, pipeline, HTTP/2, CPE, content type, and redirect chain.
+- Katana now enforces scoped crawling with `-fs fqdn` by default, host rate limits, parallelism limits, and per-domain page caps.
+- FFUF now uses the correct v2 `-maxtime` flag, keeps redirect/auth/server-error discoveries instead of filtering redirects, and enables per-host auto-calibration.
+
+### Fixed: Port and nuclei command hardening
+- **Files**: `workers/scanner/port_worker.py`, `workers/scanner/nuclei_worker.py`, `workers/Dockerfile`
+- Naabu now uses explicit duration timeouts, verifies discovered ports, displays CDN/WAF data, and safely falls back when unsupported `top-*` values are supplied.
+- Open web ports from Naabu are now fingerprinted with httpx to populate service name, web server/product, title/banner, TLS info, and technology-derived version context.
+- Nuclei now follows same-host redirects by default, caps response read/save sizes, redacts secret-like fields from evidence, disables stdin, and can store response artifacts when explicitly enabled.
+- Worker images now symlink all installed scanner binaries into `/usr/local/bin`, not only a subset.
+
+---
+
+## 2026-06-02 — Core Scan Profile & Target Candidate Engine
+
+### Added: Central scan profiles for vulnerability scanning
+- **Files**: `backend/app/services/scan_profiles.py`, `backend/app/services/scan_service.py`, `backend/app/api/v1/endpoints/organizations.py`, `backend/app/api/v1/endpoints/scans.py`, `workers/scanner/nuclei_worker.py`
+- Added shared scan profiles: `safe`, `default`, `deep_authorized`, `endpoint`, and `limited`.
+- Full, vuln-only, and manual nuclei scans now default to `deep_authorized`, while still excluding destructive/intrusive tags such as `dos`, `bruteforce`, `intrusive`, `destructive`, and `unsafe`.
+- Nuclei command generation now consumes profile-provided template directories before falling back to legacy `vuln_depth` mapping.
+- Automated organization scans and manual nuclei scans now accept `scan_profile`.
+
+### Added: Target candidate builder for downstream scanner selection
+- **Files**: `backend/app/services/scan_profiles.py`, `workers/scanner/discovery_worker.py`, `workers/crawler/web_crawl_worker.py`
+- Discovery now builds grouped scanner candidates for standard web targets, limited web targets, crawl targets, network targets, screenshots, and technology maps.
+- Targeting summaries are written to `phase_status["targeting"]`, including candidate counts and HTTP status skip reasons.
+- Crawl-fed endpoint nuclei batches now use the `endpoint` profile, and auth/error/rate-limited web batches use the `limited` profile.
+
+### Changed: Scan profile controls in frontend
+- **Files**: `frontend/src/components/modals/ScanModal.tsx`, `frontend/src/app/dashboard/page.tsx`, `frontend/src/app/dashboard/organizations/[id]/page.tsx`, `frontend/src/types/index.ts`
+- Scan modals now expose Safe, Default, and Deep Authorized profile choices.
+- Organization settings now include a default scan profile selector that writes to `scan_policy.scan_profile`.
+- Frontend scan phase types now include targeting summary fields.
+
+---
+
+## 2026-06-02 — Repository Audit & Runtime Hardening
+
+### Added: Audit report and Docker build hygiene
+- **Files**: `AUDIT.md`, `backend/.dockerignore`, `frontend/.dockerignore`, `workers/.dockerignore`
+- Added a repository audit report covering backend tests, frontend build, dependency vulnerabilities, Docker/Compose checks, RabbitMQ queues, and remaining pipeline risks.
+- Added service-level `.dockerignore` files so Docker builds exclude local env files, caches, test output, and generated build artifacts.
+
+### Fixed: Operational targets and API route matching
+- **Files**: `Makefile`, `.env.example`, `frontend/next.config.js`, `backend/app/api/v1/endpoints/assets.py`, `backend/app/api/v1/endpoints/findings.py`
+- `make logs-workers` and `make workers-scale` now reference the current worker services, including port, crawl, enrichment, screenshot, notification, and scheduler workers.
+- `.env.example` now matches the Compose frontend default API base path: `/api/v1`.
+- Moved the Next.js external package setting under the supported experimental key for Next 14, removing the production build warning.
+- Asset and finding detail routes now require UUID path conversion, preventing static endpoints such as `/assets/export` and `/findings/export` from being intercepted by dynamic `{id}` routes.
+
+---
+
 ## 2026-06-02 — API Timeline Query & Queue Runtime Fixes
+
+### Added: Production scan policy, phase status, and enrichment worker
+- **Files**: `backend/app/services/scan_service.py`, `backend/app/db/migrations/versions/007_scan_policy_phase_status.py`, `workers/enrichment/enrichment_worker.py`, `workers/task_coordinator.py`, `workers/scanner/port_worker.py`, `docker-compose.yml`, `Makefile`, `frontend/src/app/dashboard/scans/page.tsx`, `frontend/src/app/dashboard/organizations/[id]/page.tsx`
+- Organizations now support a JSON `scan_policy` that is merged into scan config with bounded safety limits for nuclei, crawl, fuzz, and enrichment settings.
+- Scans now persist per-phase `phase_status` so UI and API consumers can see concrete pipeline phase state instead of relying only on coarse progress percentages.
+- Added a dedicated `worker-enrichment` service that enriches IP assets with no-key ASN/RDAP baseline data and optional Shodan/VirusTotal/AbuseIPDB/OTX plugin results when API keys are configured.
+- `.env.example` now documents enrichment provider keys and `ENRICHMENT_CONCURRENCY` for first-time setup.
+- Task coordination now waits for enrichment batches before terminal correlation, preventing scans from completing before IP intelligence is persisted.
+- Endpoint crawl selection now scores high-signal URLs from Katana, GAU, and FFUF before feeding bounded endpoint targets into nuclei.
+- **Impact**: Full scans now preserve IP/ASN/org/country enrichment data, expose clearer phase progress, and send better-targeted endpoint nuclei batches.
+
+### Fixed: Nginx stale upstream DNS after service rebuilds
+- **File**: `infrastructure/nginx/nginx.conf`
+- Nginx now uses Docker DNS (`127.0.0.11`) with a short TTL and dynamic `proxy_pass` targets for API and frontend services.
+- **Impact**: Recreating or rebuilding `api`/`frontend` no longer leaves Nginx proxying to an old container IP and returning `502 Bad Gateway`.
+
+### Fixed: Enrichment worker provider plugin imports
+- **File**: `workers/requirements-workers.txt`
+- Worker images now include `pydantic` and `pydantic-settings`, matching backend configuration dependencies used by the optional enrichment provider engine.
+- **Impact**: `worker-enrichment` can load Shodan, VirusTotal, AbuseIPDB, and OTX plugins instead of logging `No module named 'pydantic'`.
+
+### Fixed: AbuseIPDB enrichment request parameters
+- **File**: `backend/app/integrations/enrichment/engine.py`
+- AbuseIPDB now sends the `verbose` request parameter as a string accepted by aiohttp/yarl.
+- **Impact**: AbuseIPDB enrichment no longer fails before the HTTP request with `Invalid variable type`.
 
 ### Fixed: Asset detail client-side crash
 - **File**: `frontend/src/app/dashboard/assets/[id]/page.tsx`

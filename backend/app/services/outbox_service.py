@@ -143,6 +143,14 @@ async def _prepare_event(event: OutboxEvent) -> None:
             key = f"scan:{scan_id}:port_expected"
             await redis.incrby(key, int(coordinator["port_expected"]))
             await redis.expire(key, ttl)
+        if coordinator.get("crawl_expected"):
+            key = f"scan:{scan_id}:crawl_expected"
+            await redis.incrby(key, int(coordinator["crawl_expected"]))
+            await redis.expire(key, ttl)
+        if coordinator.get("enrich_expected"):
+            key = f"scan:{scan_id}:enrich_expected"
+            await redis.incrby(key, int(coordinator["enrich_expected"]))
+            await redis.expire(key, ttl)
         if coordinator.get("screenshot_done"):
             await redis.setex(f"scan:{scan_id}:screenshot_done", ttl, 1)
     finally:

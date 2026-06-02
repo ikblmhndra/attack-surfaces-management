@@ -158,6 +158,20 @@ services:
     cap_add:
       - NET_RAW
 
+  worker-enrichment:
+    <<: *worker-base
+    command: python -m workers.enrichment.enrichment_worker
+    environment:
+      <<: *common-env
+      WORKER_TYPE: enrichment
+      ENRICHMENT_CONCURRENCY: ${ENRICHMENT_CONCURRENCY:-2}
+      SHODAN_API_KEY: ${SHODAN_API_KEY:-}
+      CENSYS_API_ID: ${CENSYS_API_ID:-}
+      CENSYS_API_SECRET: ${CENSYS_API_SECRET:-}
+      VIRUSTOTAL_API_KEY: ${VIRUSTOTAL_API_KEY:-}
+      ABUSEIPDB_API_KEY: ${ABUSEIPDB_API_KEY:-}
+      OTX_API_KEY: ${OTX_API_KEY:-}
+
   worker-crawl:
     <<: *worker-base
     command: python -m workers.crawler.web_crawl_worker

@@ -27,6 +27,8 @@ playwright==1.44.0
 Pillow==10.3.0
 
 # Enrichment
+pydantic==2.7.1
+pydantic-settings==2.2.1
 tenacity==8.3.0
 
 # Metrics

@@ -46,6 +46,16 @@ function getPhaseLabel(progress: number, status: string): string {
   return "Finalizing";
 }
 
+function getPhaseStatusLabel(scan: any): string {
+  const phases = scan.phase_status || {};
+  const order = ["discovery", "port", "crawl", "nuclei", "enrich", "screenshot", "correlation"];
+  const running = order.find((phase) => phases[phase]?.status === "running");
+  if (running) return running.replace("_", " ");
+  const queued = order.find((phase) => phases[phase]?.status === "queued");
+  if (queued && scan.status === "queued") return queued.replace("_", " ");
+  return getPhaseLabel(scan.progress_pct ?? 0, scan.status);
+}
+
 export default function ScansPage() {
   const { activeOrg } = useWorkspaceStore();
   const queryClient = useQueryClient();
@@ -177,7 +187,7 @@ export default function ScansPage() {
                         </div>
                         {scan.status === "running" && (
                           <span className="text-[10px] text-muted-foreground/70 mt-0.5 block">
-                            {getPhaseLabel(progress, scan.status)}
+                            {getPhaseStatusLabel(scan)}
                           </span>
                         )}
                         {scan.status === "failed" && scan.error_message && (

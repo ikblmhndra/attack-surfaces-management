@@ -74,6 +74,12 @@ COPY requirements-workers.txt .
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements-workers.txt \
     && rm -f /usr/local/bin/httpx \
+    && ln -sf /go/bin/subfinder /usr/local/bin/subfinder \
+    && ln -sf /go/bin/assetfinder /usr/local/bin/assetfinder \
+    && ln -sf /go/bin/amass /usr/local/bin/amass \
+    && ln -sf /go/bin/dnsx /usr/local/bin/dnsx \
+    && ln -sf /go/bin/naabu /usr/local/bin/naabu \
+    && ln -sf /go/bin/chaos /usr/local/bin/chaos \
     && ln -sf /go/bin/httpx /usr/local/bin/httpx \
     && ln -sf /go/bin/katana /usr/local/bin/katana \
     && ln -sf /go/bin/gau /usr/local/bin/gau \

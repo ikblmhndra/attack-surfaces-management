@@ -174,6 +174,7 @@ class Organization(TimestampMixin, SoftDeleteMixin, Base):
     last_scan_at = Column(DateTime(timezone=True), nullable=True)
     is_monitoring_active = Column(Boolean, nullable=False, default=True)
     auto_scan_enabled = Column(Boolean, nullable=False, default=True)
+    scan_policy = Column(JSONB, nullable=False, default=dict)
 
     __table_args__ = (
         UniqueConstraint("workspace_id", "slug", name="uq_org_workspace_slug"),
@@ -564,6 +565,7 @@ class Scan(TimestampMixin, Base):
     status = Column(String(50), nullable=False, default="pending", index=True)  # pending, queued, running, completed, failed, cancelled
     modules = Column(ARRAY(String), nullable=False, default=list)
     config = Column(JSONB, nullable=False, default=dict)
+    phase_status = Column(JSONB, nullable=False, default=dict)
 
     # Progress
     total_tasks = Column(Integer, nullable=False, default=0)

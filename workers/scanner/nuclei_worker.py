@@ -14,9 +14,11 @@ from typing import Any, Dict, List, Optional
 
 import structlog
 
+from app.services.scan_profiles import SAFE_EXCLUDED_TAGS
 from workers.base_worker import BaseWorker
 from workers.db import get_session
 from workers.queue_client import QueueClient
+from workers.scan_phase import update_scan_phase
 from workers.scan_state import mark_scan_running
 
 log = structlog.get_logger()
@@ -121,9 +123,12 @@ class NucleiWorker(BaseWorker):
             if not await mark_scan_running(db, scan_id, progress_floor=10):
                 log.info("nuclei_skipped_inactive_scan", scan_id=scan_id)
                 return
+            await update_scan_phase(db, scan_id, "nuclei", "running", targets_total=len(targets))
 
         if not targets:
             log.warning("nuclei_no_targets", scan_id=scan_id)
+            async with get_session() as db:
+                await update_scan_phase(db, scan_id, "nuclei", "skipped", targets_total=0)
             await self._queue_correlation(scan_id, org_id, workspace_id)
             return
 
@@ -177,6 +182,7 @@ class NucleiWorker(BaseWorker):
 
             async with get_session() as db:
                 await self._mark_nuclei_task_complete(db, scan_id)
+                await update_scan_phase(db, scan_id, "nuclei", "completed", targets_total=len(targets), findings=len(findings))
 
             # Queue correlation — ALWAYS called, even with zero findings.
             # This increments nuclei_done and checks for terminal condition.
@@ -209,13 +215,15 @@ class NucleiWorker(BaseWorker):
         severities = config.get("severities", DEFAULT_SEVERITIES)
         tags = config.get("tags", [])
         templates = config.get("templates", [])
-        exclude_tags = config.get("exclude_tags", ["dos", "fuzz", "intrusive"])
+        exclude_tags = config.get("exclude_tags", SAFE_EXCLUDED_TAGS)
         rate_limit = config.get("rate_limit", self.RATE_LIMIT)
         bulk_size = config.get("bulk_size", 10)
         concurrency = config.get("concurrency", 10)
         template_timeout = int(config.get("template_timeout", 8))
         retries = int(config.get("retries", 0))
         scan_timeout = int(config.get("scan_timeout", 900))
+        response_size_read = int(config.get("nuclei_response_size_read", 1048576))
+        response_size_save = int(config.get("nuclei_response_size_save", 262144))
         nuclei_path = shutil.which("nuclei") or "/go/bin/nuclei"
 
         cmd = [
@@ -229,10 +237,20 @@ class NucleiWorker(BaseWorker):
             "-c", str(concurrency),
             "-timeout", str(template_timeout),
             "-retries", str(retries),
-            "-follow-redirects",
             "-max-redirects", "3",
+            "-rsr", str(response_size_read),
+            "-rss", str(response_size_save),
+            "-redact", "authorization,token,password,secret,api_key,apikey,access_token,refresh_token",
             "-disable-update-check",
+            "-no-stdin",
         ]
+        if config.get("allow_cross_host_redirects", False):
+            cmd.append("-follow-redirects")
+        else:
+            cmd.append("-follow-host-redirects")
+        if config.get("nuclei_store_responses", False):
+            response_dir = output_file.parent / "nuclei-responses"
+            cmd.extend(["-sresp", "-srd", str(response_dir)])
 
         # Template selection based on vuln_depth
         vuln_depth = config.get("vuln_depth", "default")
@@ -246,7 +264,8 @@ class NucleiWorker(BaseWorker):
         elif severities:
             cmd.extend(["-severity", ",".join(severities)])
 
-        # Map depth → template directories
+        # Map depth -> template directories. Central scan profiles can pass
+        # explicit template dirs; depth mapping remains for older messages.
         TEMPLATE_DIRS_BY_DEPTH = {
             "critical": [
                 "http/cves",
@@ -288,6 +307,11 @@ class NucleiWorker(BaseWorker):
         if templates:
             for tmpl in templates:
                 cmd.extend(["-t", tmpl])
+        elif config.get("template_dirs"):
+            for tmpl_dir in config.get("template_dirs", []):
+                tmpl_path = Path(self.TEMPLATES_PATH) / str(tmpl_dir)
+                if tmpl_path.exists():
+                    cmd.extend(["-t", str(tmpl_path)])
         else:
             dirs = TEMPLATE_DIRS_BY_DEPTH.get(vuln_depth, TEMPLATE_DIRS_BY_DEPTH["default"])
             for tmpl_dir in dirs:

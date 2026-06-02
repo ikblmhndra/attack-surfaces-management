@@ -81,6 +81,7 @@ class BaseWorker(ABC):
         "correlation.process": ("asm.correlation", aio_pika.ExchangeType.FANOUT),
         "risk.compute":        ("asm.risk", aio_pika.ExchangeType.DIRECT),
         "notify.send":         ("asm.notify", aio_pika.ExchangeType.TOPIC),
+        "enrich.assets":       ("asm.enrich", aio_pika.ExchangeType.DIRECT),
     }
 
     def __init__(self):

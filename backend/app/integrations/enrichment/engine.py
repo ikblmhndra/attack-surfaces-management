@@ -328,7 +328,7 @@ class AbuseIPDBPlugin(BaseEnrichmentPlugin):
             return EnrichmentResult(source=self.name, indicator_type="ip", data={}, error="No API key")
 
         headers = {"Key": self.api_key, "Accept": "application/json"}
-        params = {"ipAddress": ip, "maxAgeInDays": 90, "verbose": True}
+        params = {"ipAddress": ip, "maxAgeInDays": 90, "verbose": "true"}
 
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
             async with session.get(f"{self.base_url}/check", headers=headers, params=params) as resp:

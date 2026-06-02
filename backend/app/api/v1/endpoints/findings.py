@@ -179,7 +179,7 @@ async def list_findings(
     }
 
 
-@router.get("/{finding_id}")
+@router.get("/{finding_id:uuid}")
 async def get_finding(
     finding_id: UUID,
     workspace_id: UUID = Depends(get_workspace_id),
@@ -223,7 +223,7 @@ async def get_finding(
     return result
 
 
-@router.put("/{finding_id}")
+@router.put("/{finding_id:uuid}")
 async def update_finding(
     finding_id: UUID,
     request: FindingUpdateRequest,
@@ -258,7 +258,7 @@ async def update_finding(
     return {"id": str(finding_id), "message": "Finding updated"}
 
 
-@router.post("/{finding_id}/false-positive")
+@router.post("/{finding_id:uuid}/false-positive")
 async def mark_false_positive(
     finding_id: UUID,
     request: FalsePositiveRequest,
@@ -294,7 +294,7 @@ async def mark_false_positive(
     return {"id": str(finding_id), "status": "false_positive", "message": "Finding marked as false positive"}
 
 
-@router.post("/{finding_id}/accept-risk")
+@router.post("/{finding_id:uuid}/accept-risk")
 async def accept_risk(
     finding_id: UUID,
     request: RiskAcceptRequest,
@@ -331,7 +331,7 @@ async def accept_risk(
     }
 
 
-@router.post("/{finding_id}/reopen")
+@router.post("/{finding_id:uuid}/reopen")
 async def reopen_finding(
     finding_id: UUID,
     bg: BackgroundTasks,

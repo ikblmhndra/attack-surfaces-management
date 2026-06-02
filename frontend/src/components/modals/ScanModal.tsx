@@ -19,18 +19,26 @@ interface ScanModalProps {
 
 type ScanType = "full" | "quick" | "discovery" | "vuln";
 type Tab = "automated" | "manual";
+type ScanProfile = "safe" | "default" | "deep_authorized";
 
 const SCAN_TYPES: { value: ScanType; label: string; desc: string }[] = [
-  { value: "full", label: "Full Scan", desc: "Discovery + port scan + vuln scan + screenshot" },
+  { value: "full", label: "Full Scan", desc: "Discovery + port + crawl + vuln + enrich" },
   { value: "quick", label: "Quick Scan", desc: "Discovery + vuln scan (critical/high only)" },
   { value: "discovery", label: "Discovery Only", desc: "Subdomains + DNS + HTTP probe only" },
   { value: "vuln", label: "Vulnerability Only", desc: "Skip discovery, scan existing assets" },
+];
+
+const SCAN_PROFILES: { value: ScanProfile; label: string; desc: string }[] = [
+  { value: "deep_authorized", label: "Deep Authorized", desc: "Broad safe coverage" },
+  { value: "default", label: "Default", desc: "Balanced coverage" },
+  { value: "safe", label: "Safe", desc: "Critical/high only" },
 ];
 
 export function ScanModal({ orgId, onClose }: ScanModalProps) {
   const qc = useQueryClient();
   const [activeTab, setActiveTab] = useState<Tab>("automated");
   const [scanType, setScanType] = useState<ScanType>("full");
+  const [scanProfile, setScanProfile] = useState<ScanProfile>("deep_authorized");
   const [crawl, setCrawl] = useState(true);
   const [fuzz, setFuzz] = useState(false);
   const [manualTargets, setManualTargets] = useState("");
@@ -39,6 +47,7 @@ export function ScanModal({ orgId, onClose }: ScanModalProps) {
   const triggerScan = useMutation({
     mutationFn: () => apiClient.post(`/organizations/${orgId}/scans`, {
       scan_type: scanType,
+      scan_profile: scanType === "quick" ? "safe" : scanProfile,
       config: {
         crawl,
         fuzz,
@@ -51,7 +60,6 @@ export function ScanModal({ orgId, onClose }: ScanModalProps) {
         bulk_size: scanType === "full" ? 6 : 15,
         automatic_scan: scanType !== "quick",
         use_tech_tags: scanType !== "quick",
-        ...(scanType === "quick" ? { vuln_depth: "critical" } : {}),
       },
     }),
     onSuccess: () => {
@@ -68,6 +76,7 @@ export function ScanModal({ orgId, onClose }: ScanModalProps) {
     mutationFn: () => apiClient.post(`/scans/manual`, {
       org_id: orgId,
       targets: manualTargets.split("\n").map(t => t.trim()).filter(Boolean),
+      scan_profile: scanProfile,
     }),
     onSuccess: (res: any) => {
       toast.success(`Nuclei scan queued against ${res.data?.message || "targets"}`);
@@ -171,6 +180,29 @@ export function ScanModal({ orgId, onClose }: ScanModalProps) {
                     </div>
                   </div>
                 </div>
+
+                <div>
+                  <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2.5 block">
+                    Scan Profile
+                  </label>
+                  <div className="grid grid-cols-3 gap-2">
+                    {SCAN_PROFILES.map((profile) => (
+                      <button
+                        key={profile.value}
+                        onClick={() => setScanProfile(profile.value)}
+                        className={cn(
+                          "p-2.5 rounded-xl border text-left transition-all",
+                          scanProfile === profile.value
+                            ? "bg-red-500/10 border-red-500/30 text-red-300"
+                            : "bg-surface-800 border-surface-700 text-muted-foreground hover:border-surface-600"
+                        )}
+                      >
+                        <p className="text-xs font-medium">{profile.label}</p>
+                        <p className="text-[10px] mt-0.5 opacity-70">{profile.desc}</p>
+                      </button>
+                    ))}
+                  </div>
+                </div>
               </>
             ) : (
               <>
@@ -198,6 +230,31 @@ export function ScanModal({ orgId, onClose }: ScanModalProps) {
                   </div>
                 </div>
 
+                {(scanType === "full" || scanType === "vuln") && (
+                  <div>
+                    <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2.5 block">
+                      Scan Profile
+                    </label>
+                    <div className="grid grid-cols-3 gap-2">
+                      {SCAN_PROFILES.map((profile) => (
+                        <button
+                          key={profile.value}
+                          onClick={() => setScanProfile(profile.value)}
+                          className={cn(
+                            "p-2.5 rounded-xl border text-left transition-all",
+                            scanProfile === profile.value
+                              ? "bg-red-500/10 border-red-500/30 text-red-300"
+                              : "bg-surface-800 border-surface-700 text-muted-foreground hover:border-surface-600"
+                          )}
+                        >
+                          <p className="text-xs font-medium">{profile.label}</p>
+                          <p className="text-[10px] mt-0.5 opacity-70">{profile.desc}</p>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
                 {/* Pipeline stages preview */}
                 <div className="bg-surface-800 rounded-xl p-3.5">
                   <div className="flex items-center justify-between mb-2">
@@ -205,7 +262,7 @@ export function ScanModal({ orgId, onClose }: ScanModalProps) {
                       Pipeline
                     </span>
                     <span className="text-[11px] text-muted-foreground">
-                      {scanType === "full" ? "4 stages" :
+                      {scanType === "full" ? "6 stages" :
                        scanType === "quick" ? "2 stages" :
                        scanType === "discovery" ? "1 stage" : "1 stage"}
                     </span>
@@ -222,6 +279,9 @@ export function ScanModal({ orgId, onClose }: ScanModalProps) {
                     )}
                     {scanType === "full" && (
                       <span className="text-[11px] px-2 py-1 rounded-md bg-emerald-500/10 text-emerald-400">Screenshot</span>
+                    )}
+                    {scanType === "full" && (
+                      <span className="text-[11px] px-2 py-1 rounded-md bg-yellow-500/10 text-yellow-400">Enrich</span>
                     )}
                     {crawl && scanType !== "vuln" && (
                       <span className="text-[11px] px-2 py-1 rounded-md bg-cyan-500/10 text-cyan-400">Crawl</span>

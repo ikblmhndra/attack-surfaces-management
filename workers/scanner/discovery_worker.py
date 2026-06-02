@@ -22,7 +22,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from workers.base_worker import BaseWorker
 from workers.db import get_session
 from workers.queue_client import QueueClient
+from workers.scan_phase import update_scan_phase
 from workers.scan_state import mark_scan_running
+from app.services.scan_profiles import build_target_candidates, child_profile_config
 
 log = structlog.get_logger()
 
@@ -37,8 +39,16 @@ NUCLEI_LIMITED_STATUS_CLASSES = {"auth_required", "server_error", "rate_limited"
 
 def tool_available(name: str) -> bool:
     if name not in _TOOL_CACHE:
-        _TOOL_CACHE[name] = shutil.which(name) is not None
+        _TOOL_CACHE[name] = tool_path(name) is not None
     return _TOOL_CACHE[name]
+
+
+def tool_path(name: str) -> Optional[str]:
+    path = shutil.which(name)
+    if path:
+        return path
+    go_path = Path(f"/go/bin/{name}")
+    return str(go_path) if go_path.exists() else None
 
 
 def normalize_technology(raw: Any) -> Optional[Dict[str, Optional[str]]]:
@@ -116,6 +126,7 @@ class DiscoveryWorker(BaseWorker):
         targets = message["targets"]  # domains, IPs, CIDRs
         config = message.get("config", {})
         modules = config.get("modules", [])
+        config.setdefault("scan_type", message.get("scan_type", config.get("scan_type", "full")))
 
         log.info("discovery_started", scan_id=scan_id, org_id=org_id, targets=targets)
 
@@ -123,6 +134,7 @@ class DiscoveryWorker(BaseWorker):
             if not await mark_scan_running(db, scan_id, progress_floor=10):
                 log.info("discovery_skipped_inactive_scan", scan_id=scan_id)
                 return
+            await update_scan_phase(db, scan_id, "discovery", "running")
 
         # For targeted scans (e.g. vuln-only), skip discovery phase and
         # queue downstream tasks directly with the input targets.
@@ -167,6 +179,16 @@ class DiscoveryWorker(BaseWorker):
                     alive_hosts, resolved
                 )
                 await self._update_scan_progress(db, scan_id, assets_found=len(alive_hosts))
+                await update_scan_phase(
+                    db,
+                    scan_id,
+                    "discovery",
+                    "completed",
+                    subdomains=len(all_subdomains),
+                    resolved_hosts=len(resolved),
+                    alive_hosts=len(alive_hosts),
+                    new_assets=new_count,
+                )
 
             # ── Phase 5: Queue downstream tasks ───────────────
             all_ips = set()
@@ -201,7 +223,7 @@ class DiscoveryWorker(BaseWorker):
 
         # Run all discovery methods in parallel
         tasks = [
-            self._run_subfinder(domain, tmpdir),
+            self._run_subfinder(domain, tmpdir, config),
             self._run_assetfinder(domain, tmpdir),
             self._run_crtsh(domain),
             self._run_chaos(domain, tmpdir, config),
@@ -228,24 +250,30 @@ class DiscoveryWorker(BaseWorker):
 
         return clean
 
-    async def _run_subfinder(self, domain: str, tmpdir: Path) -> Set[str]:
-        if not tool_available("subfinder"):
+    async def _run_subfinder(self, domain: str, tmpdir: Path, config: Dict) -> Set[str]:
+        subfinder_path = tool_path("subfinder")
+        if not subfinder_path:
             log.warning("subfinder_not_available")
             return set()
 
         outfile = tmpdir / f"subfinder_{domain}.txt"
         cmd = [
-            "subfinder", "-d", domain,
+            subfinder_path, "-d", domain,
             "-o", str(outfile),
             "-silent",
-            "-t", "50",
-            "-timeout", "30",
+            "-t", str(int(config.get("subfinder_threads", 50))),
+            "-timeout", str(int(config.get("subfinder_timeout", 30))),
+            "-max-time", str(int(config.get("subfinder_max_time", 10))),
+            "-duc",
         ]
 
-        # Add API keys from environment
-        api_keys = []
-        if os.getenv("SHODAN_API_KEY"):
-            api_keys.extend(["-provider-config", "/etc/subfinder/provider-config.yaml"])
+        provider_config = config.get("subfinder_provider_config") or os.getenv("SUBFINDER_PROVIDER_CONFIG")
+        if not provider_config:
+            provider_config = "/etc/subfinder/provider-config.yaml"
+        if provider_config and Path(provider_config).exists():
+            cmd.extend(["-pc", provider_config])
+        if config.get("subfinder_all_sources", False):
+            cmd.append("-all")
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -270,12 +298,13 @@ class DiscoveryWorker(BaseWorker):
         return set()
 
     async def _run_assetfinder(self, domain: str, tmpdir: Path) -> Set[str]:
-        if not tool_available("assetfinder"):
+        assetfinder_path = tool_path("assetfinder")
+        if not assetfinder_path:
             return set()
 
         try:
             proc = await asyncio.create_subprocess_exec(
-                "assetfinder", "--subs-only", domain,
+                assetfinder_path, "--subs-only", domain,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -335,13 +364,14 @@ class DiscoveryWorker(BaseWorker):
     async def _run_chaos(self, domain: str, tmpdir: Path, config: Dict) -> Set[str]:
         """Query ProjectDiscovery Chaos dataset."""
         chaos_key = os.getenv("CHAOS_API_KEY", "")
-        if not chaos_key or not tool_available("chaos"):
+        chaos_path = tool_path("chaos")
+        if not chaos_key or not chaos_path:
             return set()
 
         outfile = tmpdir / f"chaos_{domain}.txt"
         try:
             proc = await asyncio.create_subprocess_exec(
-                "chaos", "-d", domain, "-o", str(outfile), "-silent",
+                chaos_path, "-d", domain, "-o", str(outfile), "-silent",
                 env={**os.environ, "CHAOS_KEY": chaos_key},
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -355,12 +385,13 @@ class DiscoveryWorker(BaseWorker):
         return set()
 
     async def _run_amass(self, domain: str, tmpdir: Path) -> Set[str]:
-        if not tool_available("amass"):
+        amass_path = tool_path("amass")
+        if not amass_path:
             return set()
 
         outfile = tmpdir / f"amass_{domain}.txt"
         cmd = [
-            "amass", "enum",
+            amass_path, "enum",
             "-passive",
             "-d", domain,
             "-o", str(outfile),
@@ -391,7 +422,8 @@ class DiscoveryWorker(BaseWorker):
         if not hosts:
             return {}
 
-        if not tool_available("dnsx"):
+        dnsx_path = tool_path("dnsx")
+        if not dnsx_path:
             return {h: {} for h in hosts}
 
         input_file = tmpdir / "hosts_to_resolve.txt"
@@ -399,7 +431,7 @@ class DiscoveryWorker(BaseWorker):
         output_file = tmpdir / "dnsx_output.json"
 
         cmd = [
-            "dnsx",
+            dnsx_path,
             "-l", str(input_file),
             "-json",
             "-o", str(output_file),
@@ -452,7 +484,8 @@ class DiscoveryWorker(BaseWorker):
         config: Dict,
     ) -> Set[str]:
         """Run katana to crawl alive URLs and discover hidden endpoints, JS paths, API routes."""
-        if not urls or not tool_available("katana"):
+        katana_path = tool_path("katana")
+        if not urls or not katana_path:
             return set()
 
         input_file = tmpdir / "katana_targets.txt"
@@ -463,15 +496,18 @@ class DiscoveryWorker(BaseWorker):
         rate_limit = config.get("crawl_rate", 50)
 
         cmd = [
-            "katana",
+            katana_path,
             "-list", str(input_file),
             "-o", str(output_file),
             "-silent",
             "-depth", str(depth),
             "-rate-limit", str(rate_limit),
+            "-host-rate-limit", str(int(config.get("crawl_host_rate_limit", 20))),
             "-timeout", "10",
             "-retries", "1",
             "-concurrency", "10",
+            "-fs", str(config.get("katana_field_scope", "fqdn")),
+            "-mdp", str(int(config.get("katana_max_domain_pages", 200))),
             "-disable-update-check",
             "-jc",  # Extract JS endpoints
         ]
@@ -510,7 +546,8 @@ class DiscoveryWorker(BaseWorker):
         config: Dict,
     ) -> Set[str]:
         """Fuzz discovered URLs with ffuf to find hidden endpoints, backups, admin panels."""
-        if not urls or not tool_available("ffuf"):
+        ffuf_path = tool_path("ffuf")
+        if not urls or not ffuf_path:
             return set()
 
         discovered = set()
@@ -542,19 +579,21 @@ class DiscoveryWorker(BaseWorker):
             out = tmpdir / f"ffuf_{hash(parsed)}.json"
 
             cmd = [
-                "ffuf",
+                ffuf_path,
                 "-u", f"{parsed}/FUZZ",
                 "-w", wordlist,
                 "-o", str(out),
                 "-of", "json",
-                "-fc", "404,301,302,307",  # Filter out common non-interesting
+                "-mc", str(config.get("fuzz_match_codes", "200-299,301,302,307,308,401,403,405,500")),
+                "-fc", str(config.get("fuzz_filter_codes", "404")),
                 "-fs", "0",                 # Filter out zero-length
                 "-t", "20",
                 "-rate", str(rate),
                 "-timeout", str(timeout),
-                "-max-time", "120",
+                "-maxtime", "120",
                 "-noninteractive",
                 "-ac",  # Auto-calibrate filtering
+                "-ach",
             ]
 
             log.info("ffuf_fuzz_started", url=parsed)
@@ -594,7 +633,8 @@ class DiscoveryWorker(BaseWorker):
         config: Dict,
     ) -> Dict[str, Dict[str, Any]]:
         """Run httpx to probe alive HTTP/HTTPS services."""
-        if not hosts or not tool_available("httpx"):
+        httpx_path = tool_path("httpx")
+        if not hosts or not httpx_path:
             return {}
 
         input_file = tmpdir / "probe_targets.txt"
@@ -607,7 +647,7 @@ class DiscoveryWorker(BaseWorker):
         output_file = tmpdir / "httpx_output.json"
 
         cmd = [
-            "httpx",
+            httpx_path,
             "-l", str(input_file),
             "-json",
             "-o", str(output_file),
@@ -618,13 +658,31 @@ class DiscoveryWorker(BaseWorker):
             "-web-server",
             "-status-code",
             "-tech-detect",
+            "-cpe",
             "-tls-grab",
+            "-ip",
+            "-cname",
+            "-asn",
+            "-cdn",
+            "-favicon",
+            "-jarm",
+            "-method",
+            "-location",
+            "-websocket",
+            "-pipeline",
+            "-http2",
+            "-probe",
+            "-include-chain",
             "-content-length",
+            "-content-type",
             "-response-time",
             "-hash", "sha256",
-            "-t", "50",
-            "-timeout", "15",
+            "-t", str(int(config.get("httpx_threads", config.get("crawl_httpx_threads", 50)))),
+            "-rl", str(int(config.get("httpx_rate_limit", 150))),
+            "-timeout", str(int(config.get("httpx_timeout", 15))),
+            "-max-host-error", str(int(config.get("httpx_max_host_error", 20))),
             "-no-color",
+            "-duc",
         ]
 
         try:
@@ -644,8 +702,12 @@ class DiscoveryWorker(BaseWorker):
             for line in output_file.read_text().splitlines():
                 try:
                     data = json.loads(line)
+                    if data.get("failed") and not config.get("httpx_include_failed", False):
+                        continue
                     url = data.get("url", "")
                     host = data.get("host", url.split("//")[-1].split("/")[0] if "//" in url else url)
+                    hash_data = data.get("hash") or {}
+                    body_hash = hash_data.get("body_sha256", "") if isinstance(hash_data, dict) else str(hash_data)
 
                     alive[host] = {
                         "url": url,
@@ -655,7 +717,18 @@ class DiscoveryWorker(BaseWorker):
                         "webserver": data.get("webserver", ""),
                         "content_length": data.get("content_length"),
                         "response_time": data.get("response_time", ""),
-                        "hash": data.get("hash", {}).get("body_sha256", ""),
+                        "hash": body_hash,
+                        "favicon": data.get("favicon", ""),
+                        "jarm": data.get("jarm", ""),
+                        "ip": data.get("ip", ""),
+                        "cname": data.get("cname", []),
+                        "asn": data.get("asn", {}),
+                        "method": data.get("method", ""),
+                        "location": data.get("location", ""),
+                        "websocket": data.get("websocket", False),
+                        "pipeline": data.get("pipeline", False),
+                        "http2": data.get("http2", False),
+                        "cpe": data.get("cpe", []),
                         "technologies": data.get("tech", []),
                         "tls": data.get("tls", {}),
                         "cdn": data.get("cdn", False),
@@ -837,12 +910,23 @@ class DiscoveryWorker(BaseWorker):
         nuclei_batches_queued = 0
         crawl_batches_queued = 0
         screenshot_queued = False
+        candidates = build_target_candidates(
+            subdomains=subdomains,
+            ips=ips,
+            direct_targets=direct_targets,
+            alive_hosts=alive_hosts,
+            config=config,
+        )
+
+        async with get_session() as db:
+            await update_scan_phase(db, scan_id, "targeting", "completed", **candidates["summary"])
 
         # Port scan task per IP batch (100 IPs per task)
         if "port" in modules:
             batch_size = 100
-            for i in range(0, len(ips), batch_size):
-                ip_batch = ips[i:i + batch_size]
+            network_targets = candidates["network_targets"]
+            for i in range(0, len(network_targets), batch_size):
+                ip_batch = network_targets[i:i + batch_size]
                 await coord.add_port_expected(scan_id)
                 port_batches_queued += 1
                 await queue.publish(
@@ -857,20 +941,8 @@ class DiscoveryWorker(BaseWorker):
                 )
 
         crawl_targets = []
-        if "crawl" in modules and alive_hosts and config.get("crawl", True):
-            for host in subdomains:
-                info = alive_hosts.get(host)
-                if not info or not info.get("url"):
-                    continue
-                if info.get("status_class") not in CRAWL_STATUS_CLASSES:
-                    continue
-                crawl_targets.append({
-                    "host": host,
-                    "url": info["url"],
-                    "status_code": info.get("status_code"),
-                    "status_class": info.get("status_class"),
-                    "technologies": info.get("technologies", []),
-                })
+        if "crawl" in modules and config.get("crawl", True):
+            crawl_targets = candidates["crawl_targets"]
             if crawl_targets:
                 await coord.add_crawl_expected(scan_id)
                 crawl_batches_queued += 1
@@ -889,35 +961,16 @@ class DiscoveryWorker(BaseWorker):
 
         # Nuclei scan per subdomain batch (50 per task)
         if "nuclei" in modules:
-            if direct_targets:
-                standard_targets = list(direct_targets)
-                limited_targets = []
-                tech_map = {}
-            else:
-                standard_targets = []
-                limited_targets = []
-                tech_map = {}
-                if alive_hosts:
-                    for host in list(subdomains):
-                        info = alive_hosts.get(host)
-                        if not info:
-                            continue
-                        status_class = info.get("status_class") or classify_http_status(info.get("status_code"))
-                        if status_class in NUCLEI_STANDARD_STATUS_CLASSES:
-                            standard_targets.append(host)
-                        elif status_class in NUCLEI_LIMITED_STATUS_CLASSES:
-                            limited_targets.append(host)
-                        if info.get("url"):
-                            tech_map[info["url"]] = info.get("technologies", [])
+            standard_targets = candidates["web_standard_targets"]
+            limited_targets = candidates["web_limited_targets"]
+            tech_map = candidates["tech_map"]
 
             batch_size = max(1, min(int(config.get("nuclei_batch_size", 25)), 50))
-            limited_config = {
-                **config,
-                "automatic_scan": False,
-                "vuln_depth": "default",
-                "severities": ["critical", "high", "medium"],
-                "scan_timeout": int(config.get("scan_timeout", 900)),
-            }
+            limited_config = child_profile_config(
+                "limited",
+                config,
+                {"scan_timeout": int(config.get("scan_timeout", 900))},
+            )
             for target_group, group_config, profile in (
                 (standard_targets, config, "standard"),
                 (limited_targets, limited_config, "limited"),
@@ -950,14 +1003,7 @@ class DiscoveryWorker(BaseWorker):
                     )
                     nuclei_queued = True
 
-        screenshot_targets = subdomains
-        if alive_hosts:
-            screenshot_targets = [
-                host for host in subdomains
-                if alive_hosts.get(host, {}).get("status_class") in (
-                    CRAWL_STATUS_CLASSES | NUCLEI_LIMITED_STATUS_CLASSES
-                )
-            ]
+        screenshot_targets = candidates["screenshot_targets"] or subdomains
 
         # Screenshot task
         if "screenshot" in modules and screenshot_targets:
@@ -986,7 +1032,7 @@ class DiscoveryWorker(BaseWorker):
         await queue.close()
         await coord.close()
 
-        return nuclei_queued
+        return bool(port_batches_queued or crawl_batches_queued or nuclei_batches_queued or screenshot_queued)
 
     # ── Utilities ─────────────────────────────────────────────
 

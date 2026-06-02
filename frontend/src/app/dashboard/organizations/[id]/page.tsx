@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, type FormEvent } from "react";
 import { useParams, useRouter } from "next/navigation";
 import {
   Building2, ArrowLeft, RefreshCw, Scan, Edit, AlertTriangle,
@@ -36,7 +36,7 @@ export default function OrganizationDetailPage() {
   const [editForm, setEditForm] = useState({
     name: "", description: "", domains: "", ip_ranges: "", asns: "",
     company_name: "", industry: "", criticality: 3, environment: "production",
-    auto_scan_enabled: true,
+    auto_scan_enabled: true, scan_profile: "deep_authorized", scan_policy: "{}",
   });
 
   const updateOrg = useMutation({
@@ -61,8 +61,35 @@ export default function OrganizationDetailPage() {
       criticality: org?.criticality || 3,
       environment: org?.environment || "production",
       auto_scan_enabled: org?.auto_scan_enabled ?? true,
+      scan_profile: org?.scan_policy?.scan_profile || "deep_authorized",
+      scan_policy: JSON.stringify(org?.scan_policy || {}, null, 2),
     });
     setEditing(true);
+  };
+
+  const saveOrganization = (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    let scanPolicy = {};
+    try {
+      scanPolicy = editForm.scan_policy.trim() ? JSON.parse(editForm.scan_policy) : {};
+    } catch {
+      toast.error("Scan policy must be valid JSON");
+      return;
+    }
+    scanPolicy = { ...scanPolicy, scan_profile: editForm.scan_profile };
+    updateOrg.mutate({
+      name: editForm.name,
+      description: editForm.description || null,
+      domains: editForm.domains.split("\n").map(s => s.trim()).filter(Boolean),
+      ip_ranges: editForm.ip_ranges.split("\n").map(s => s.trim()).filter(Boolean),
+      asns: editForm.asns.split("\n").map(s => s.trim()).filter(Boolean),
+      company_name: editForm.company_name || null,
+      industry: editForm.industry || null,
+      criticality: editForm.criticality,
+      environment: editForm.environment,
+      auto_scan_enabled: editForm.auto_scan_enabled,
+      scan_policy: scanPolicy,
+    });
   };
 
   const { data: org, isLoading } = useQuery({
@@ -363,7 +390,7 @@ export default function OrganizationDetailPage() {
             exit={{ opacity: 0, scale: 0.96, y: 8 }}
             className="fixed inset-0 z-50 flex items-center justify-center p-4"
           >
-            <div className="w-full max-w-lg bg-surface-900 border border-border rounded-2xl shadow-2xl overflow-hidden">
+            <div className="w-full max-w-xl bg-surface-900 border border-border rounded-2xl shadow-2xl overflow-hidden">
               <div className="flex items-center justify-between p-5 border-b border-border">
                 <div className="flex items-center gap-3">
                   <div className="w-9 h-9 rounded-xl bg-brand-500/10 flex items-center justify-center">
@@ -377,18 +404,7 @@ export default function OrganizationDetailPage() {
               </div>
 
               <form
-                onSubmit={(e) => { e.preventDefault(); updateOrg.mutate({
-                  name: editForm.name,
-                  description: editForm.description || null,
-                  domains: editForm.domains.split("\n").map(s => s.trim()).filter(Boolean),
-                  ip_ranges: editForm.ip_ranges.split("\n").map(s => s.trim()).filter(Boolean),
-                  asns: editForm.asns.split("\n").map(s => s.trim()).filter(Boolean),
-                  company_name: editForm.company_name || null,
-                  industry: editForm.industry || null,
-                  criticality: editForm.criticality,
-                  environment: editForm.environment,
-                  auto_scan_enabled: editForm.auto_scan_enabled,
-                })}}
+                onSubmit={saveOrganization}
                 className="p-5 space-y-4 max-h-[60vh] overflow-y-auto"
               >
                 <div>
@@ -485,6 +501,28 @@ export default function OrganizationDetailPage() {
                     className="h-4 w-4 rounded border-border bg-surface-900 text-brand-500 focus:ring-brand-500"
                   />
                 </label>
+                <div>
+                  <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1.5 block">Default Scan Profile</label>
+                  <select
+                    value={editForm.scan_profile}
+                    onChange={(e) => setEditForm(f => ({...f, scan_profile: e.target.value}))}
+                    className="w-full bg-surface-800 border border-surface-700 rounded-lg px-3 py-2 text-sm text-foreground focus:outline-none focus:border-brand-500/50"
+                  >
+                    <option value="deep_authorized">Deep Authorized - broad safe coverage</option>
+                    <option value="default">Default - balanced coverage</option>
+                    <option value="safe">Safe - critical/high only</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1.5 block">Scan Policy JSON</label>
+                  <textarea
+                    value={editForm.scan_policy}
+                    onChange={(e) => setEditForm(f => ({...f, scan_policy: e.target.value}))}
+                    rows={8}
+                    spellCheck={false}
+                    className="w-full bg-surface-800 border border-surface-700 rounded-lg px-3 py-2 text-xs text-foreground font-mono focus:outline-none focus:border-brand-500/50 resize-y"
+                  />
+                </div>
 
                 <div className="flex items-center gap-3 pt-2">
                   <button type="button" onClick={() => setEditing(false)}

@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from app.api.v1.dependencies.auth import get_current_user, get_workspace_id, get_db, RequireRole
 from app.db.models.models import User, Scan, Organization
+from app.services.scan_profiles import apply_scan_profile, normalize_scan_profile
 from app.services.outbox_service import create_queue_event, dispatch_pending_outbox_once
 from sqlalchemy import select, update, func, or_, cast, String
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,14 +23,25 @@ class ManualScanRequest(BaseModel):
     targets: List[str]
     config: dict = Field(default_factory=dict)
     vuln_depth: str = "default"
+    scan_profile: Optional[str] = None
 
     @field_validator("vuln_depth")
     @classmethod
     def validate_vuln_depth(cls, value: str) -> str:
-        allowed = {"critical", "default", "full"}
+        allowed = {"critical", "default", "full", "endpoint"}
         if value not in allowed:
             raise ValueError(f"vuln_depth must be one of: {', '.join(sorted(allowed))}")
         return value
+
+    @field_validator("scan_profile")
+    @classmethod
+    def validate_scan_profile(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        normalized = normalize_scan_profile(value)
+        if not normalized:
+            raise ValueError("scan_profile must be one of: safe, default, deep_authorized")
+        return normalized
 
 @router.get("")
 async def list_scans(org_id: Optional[UUID] = Query(None), status: Optional[str] = Query(None),
@@ -53,6 +65,7 @@ async def list_scans(org_id: Optional[UUID] = Query(None), status: Optional[str]
     return {"items": [{"id": str(s.id), "org_id": str(s.org_id), "scan_type": s.scan_type,
                        "status": s.status, "progress_pct": s.progress_pct,
                        "assets_found": s.assets_found, "findings_found": s.findings_found,
+                       "phase_status": s.phase_status or {},
                        "error_message": s.error_message,
                        "started_at": s.started_at.isoformat() if s.started_at else None,
                        "completed_at": s.completed_at.isoformat() if s.completed_at else None,
@@ -66,6 +79,7 @@ async def get_scan(scan_id: UUID, workspace_id: UUID = Depends(get_workspace_id)
     if not scan: raise HTTPException(404, "Scan not found")
     return {"id": str(scan.id), "org_id": str(scan.org_id), "scan_type": scan.scan_type,
             "status": scan.status, "modules": scan.modules, "progress_pct": scan.progress_pct,
+            "phase_status": scan.phase_status or {},
             "total_tasks": scan.total_tasks, "completed_tasks": scan.completed_tasks,
             "assets_found": scan.assets_found, "findings_found": scan.findings_found,
             "error_message": scan.error_message,
@@ -95,6 +109,15 @@ async def manual_scan(
         raise HTTPException(404, "Organization not found")
 
     scan_id = str(uuid.uuid4())
+    scan_config = apply_scan_profile(
+        {
+            "targets": request.targets,
+            "vuln_depth": request.vuln_depth,
+            **request.config,
+            **({"scan_profile": request.scan_profile} if request.scan_profile else {}),
+        },
+        "manual_nuclei",
+    )
 
     db.add(
         Scan(
@@ -105,7 +128,8 @@ async def manual_scan(
             scan_type="manual_nuclei",
             status="queued",
             modules=["nuclei"],
-            config={"targets": request.targets, "vuln_depth": request.vuln_depth, **request.config},
+            config=scan_config,
+            phase_status={"nuclei": {"status": "queued"}},
             total_tasks=1,
         )
     )
@@ -117,11 +141,7 @@ async def manual_scan(
                 "org_id": str(request.org_id),
                 "workspace_id": str(workspace_id),
                 "targets": request.targets,
-                "config": {
-                    "vuln_depth": request.vuln_depth,
-                    "severities": ["critical", "high", "medium", "low"],
-                    **request.config,
-                },
+                "config": scan_config,
             },
             headers={
                 "coordinator": {
