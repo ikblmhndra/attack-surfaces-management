@@ -24,6 +24,7 @@ RUN_FULL_SCAN_ON_START = os.getenv("RUN_FULL_SCAN_ON_START", "false").lower() in
 TLS_CHECK_INTERVAL_HOURS = 12
 CLEANUP_INTERVAL_HOURS = 6
 ENRICHMENT_REFRESH_HOURS = 48
+VALIDATION_REFRESH_HOURS = int(os.getenv("VALIDATION_REFRESH_HOURS", "24"))
 QUICK_SCAN_INTERVAL_HOURS = 6
 ACTIVE_SCAN_STATUSES = ("queued", "pending", "running")
 
@@ -136,6 +137,14 @@ class ScanScheduler:
             trigger=IntervalTrigger(hours=ENRICHMENT_REFRESH_HOURS),
             id="enrichment_refresh",
             name="Refresh threat intelligence enrichment",
+        )
+
+        # ── Asset ownership/scope validation refresh ──────────
+        self.scheduler.add_job(
+            self._schedule_asset_validation,
+            trigger=IntervalTrigger(hours=VALIDATION_REFRESH_HOURS),
+            id="asset_validation_refresh",
+            name="Refresh asset ownership and scope validation",
         )
 
         # ── Daily report generation ───────────────────────────
@@ -394,6 +403,28 @@ class ScanScheduler:
                 message={"assets": batch},
                 priority=1,
             )
+
+    async def _schedule_asset_validation(self) -> None:
+        """Queue periodic validation for active organizations."""
+        log.info("scheduling_asset_validation_refresh")
+        async with get_session() as db:
+            orgs = await self._get_active_organizations(db)
+
+        queued = 0
+        for org in orgs:
+            await self.queue.publish(
+                routing_key="asset.validate",
+                message={
+                    "org_id": org["id"],
+                    "workspace_id": org["workspace_id"],
+                    "limit": int(os.getenv("VALIDATION_REFRESH_LIMIT", "250")),
+                    "stale_hours": VALIDATION_REFRESH_HOURS,
+                },
+                priority=1,
+            )
+            queued += 1
+
+        log.info("asset_validation_refresh_queued", count=queued)
 
     async def _generate_daily_summaries(self) -> None:
         """Queue daily summary report generation for all workspaces."""

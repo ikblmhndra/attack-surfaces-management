@@ -587,11 +587,21 @@ class WebCrawlWorker(BaseWorker):
         coord = TaskCoordinator()
         queue = QueueClient()
         await queue.connect()
-        batch_size = max(1, min(int(config.get("crawl_nuclei_batch_size", 25)), 50))
+        batch_size = max(1, min(int(config.get("crawl_nuclei_batch_size", 25)), 3))
         nuclei_config = child_profile_config(
             "endpoint",
             config,
-            {"scan_timeout": int(config.get("crawl_nuclei_scan_timeout", min(int(config.get("scan_timeout", 900)), 600)))},
+            {
+                "scan_timeout": min(
+                    int(config.get("crawl_nuclei_scan_timeout", min(int(config.get("scan_timeout", 900)), 600))),
+                    300,
+                ),
+                "template_timeout": min(int(config.get("template_timeout", 6)), 6),
+                "concurrency": min(int(config.get("concurrency", 4)), 4),
+                "bulk_size": min(int(config.get("bulk_size", 4)), 4),
+                "nuclei_batch_size": 3,
+                "severities": ["critical", "high", "medium"],
+            },
         )
         for i in range(0, len(targets), batch_size):
             await coord.add_nuclei_expected(scan_id)

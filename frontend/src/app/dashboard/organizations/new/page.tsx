@@ -24,6 +24,8 @@ export default function NewOrganizationPage() {
   const [industry, setIndustry] = useState("");
   const [criticality, setCriticality] = useState(3);
   const [autoScanEnabled, setAutoScanEnabled] = useState(true);
+  const [scopeAllowPatterns, setScopeAllowPatterns] = useState("");
+  const [scopeDenyPatterns, setScopeDenyPatterns] = useState("");
 
   const qc = useQueryClient();
 
@@ -37,6 +39,8 @@ export default function NewOrganizationPage() {
         industry: industry || undefined,
         criticality,
         auto_scan_enabled: autoScanEnabled,
+        scope_allow_patterns: scopeAllowPatterns.split("\n").map(s => s.trim()).filter(Boolean),
+        scope_deny_patterns: scopeDenyPatterns.split("\n").map(s => s.trim()).filter(Boolean),
       }),
     onSuccess: (res) => {
       toast.success("Organization created");
@@ -208,6 +212,36 @@ export default function NewOrganizationPage() {
             <button onClick={addRootDomain} className="flex items-center gap-1.5 text-xs text-brand-400 hover:text-brand-300">
               <Plus className="w-3.5 h-3.5" /> Add root domain
             </button>
+          </div>
+
+          {/* Scope controls */}
+          <div className="glass-card p-5 space-y-3">
+            <h2 className="text-sm font-semibold text-foreground">Scope Controls</h2>
+            <p className="text-xs text-muted-foreground">
+              Optional explicit allow/deny patterns for validation and scan targeting.
+            </p>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div>
+                <label className="block text-sm text-muted-foreground mb-1">Allow patterns</label>
+                <textarea
+                  value={scopeAllowPatterns}
+                  onChange={e => setScopeAllowPatterns(e.target.value)}
+                  placeholder={"*.example.com\n203.0.113.0/24"}
+                  rows={4}
+                  className="w-full px-3 py-2 bg-surface-800 border border-border rounded-lg text-sm text-foreground font-mono focus:outline-none focus:ring-2 focus:ring-brand-500 resize-none"
+                />
+              </div>
+              <div>
+                <label className="block text-sm text-muted-foreground mb-1">Deny patterns</label>
+                <textarea
+                  value={scopeDenyPatterns}
+                  onChange={e => setScopeDenyPatterns(e.target.value)}
+                  placeholder={"*.vendor.example.com\n198.51.100.0/24"}
+                  rows={4}
+                  className="w-full px-3 py-2 bg-surface-800 border border-border rounded-lg text-sm text-foreground font-mono focus:outline-none focus:ring-2 focus:ring-brand-500 resize-none"
+                />
+              </div>
+            </div>
           </div>
 
           {/* Automation */}

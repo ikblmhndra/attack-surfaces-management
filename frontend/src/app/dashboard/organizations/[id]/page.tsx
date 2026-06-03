@@ -5,7 +5,7 @@ import { useParams, useRouter } from "next/navigation";
 import {
   Building2, ArrowLeft, RefreshCw, Scan, Edit, AlertTriangle,
   Layers, Globe, Clock, Activity, TrendingUp, TrendingDown,
-  ChevronRight, X, Save, Loader2, Timer
+  ChevronRight, X, Save, Loader2, Timer, Shield
 } from "lucide-react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { formatDistanceToNow } from "date-fns";
@@ -48,6 +48,7 @@ export default function OrganizationDetailPage() {
     name: "", description: "", domains: "", ip_ranges: "", asns: "",
     company_name: "", industry: "", criticality: 3, environment: "production",
     auto_scan_enabled: true, scan_profile: "deep_authorized", scan_policy: "{}",
+    scope_allow_patterns: "", scope_deny_patterns: "",
   });
 
   const updateOrg = useMutation({
@@ -58,6 +59,15 @@ export default function OrganizationDetailPage() {
       setEditing(false);
     },
     onError: (err: any) => toast.error(err?.response?.data?.detail || "Failed to update"),
+  });
+
+  const validateAssets = useMutation({
+    mutationFn: () => apiClient.post(`/organizations/${orgId}/assets/validate`, { limit: 500 }),
+    onSuccess: () => {
+      toast.success("Asset validation queued");
+      qc.invalidateQueries({ queryKey: ["organization", orgId] });
+    },
+    onError: (err: any) => toast.error(err?.response?.data?.detail || "Failed to queue validation"),
   });
 
   const openEditor = () => {
@@ -74,6 +84,8 @@ export default function OrganizationDetailPage() {
       auto_scan_enabled: org?.auto_scan_enabled ?? true,
       scan_profile: org?.scan_policy?.scan_profile || "deep_authorized",
       scan_policy: JSON.stringify(org?.scan_policy || {}, null, 2),
+      scope_allow_patterns: (org?.scope_allow_patterns || []).join("\n"),
+      scope_deny_patterns: (org?.scope_deny_patterns || []).join("\n"),
     });
     setEditing(true);
   };
@@ -100,6 +112,8 @@ export default function OrganizationDetailPage() {
       environment: editForm.environment,
       auto_scan_enabled: editForm.auto_scan_enabled,
       scan_policy: scanPolicy,
+      scope_allow_patterns: editForm.scope_allow_patterns.split("\n").map(s => s.trim()).filter(Boolean),
+      scope_deny_patterns: editForm.scope_deny_patterns.split("\n").map(s => s.trim()).filter(Boolean),
     });
   };
 
@@ -190,6 +204,14 @@ export default function OrganizationDetailPage() {
               >
                 <Scan className="w-3.5 h-3.5" />
                 Run Scan
+              </button>
+              <button
+                onClick={() => validateAssets.mutate()}
+                disabled={validateAssets.isPending}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg bg-surface-700 hover:bg-surface-600 border border-surface-600 text-foreground disabled:opacity-50"
+              >
+                {validateAssets.isPending ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Shield className="w-3.5 h-3.5" />}
+                Validate Assets
               </button>
               <button
                 onClick={openEditor}
@@ -474,6 +496,28 @@ export default function OrganizationDetailPage() {
                     <textarea
                       value={editForm.asns} onChange={(e) => setEditForm(f => ({...f, asns: e.target.value}))}
                       rows={2}
+                      className="w-full bg-surface-800 border border-surface-700 rounded-lg px-3 py-2 text-sm text-foreground font-mono focus:outline-none focus:border-brand-500/50 resize-none"
+                    />
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1.5 block">Allow Patterns</label>
+                    <textarea
+                      value={editForm.scope_allow_patterns}
+                      onChange={(e) => setEditForm(f => ({...f, scope_allow_patterns: e.target.value}))}
+                      rows={3}
+                      placeholder={"*.example.com\n203.0.113.0/24"}
+                      className="w-full bg-surface-800 border border-surface-700 rounded-lg px-3 py-2 text-sm text-foreground font-mono focus:outline-none focus:border-brand-500/50 resize-none"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1.5 block">Deny Patterns</label>
+                    <textarea
+                      value={editForm.scope_deny_patterns}
+                      onChange={(e) => setEditForm(f => ({...f, scope_deny_patterns: e.target.value}))}
+                      rows={3}
+                      placeholder={"*.vendor.example.com\n198.51.100.0/24"}
                       className="w-full bg-surface-800 border border-surface-700 rounded-lg px-3 py-2 text-sm text-foreground font-mono focus:outline-none focus:border-brand-500/50 resize-none"
                     />
                   </div>

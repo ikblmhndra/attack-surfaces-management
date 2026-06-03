@@ -17,7 +17,7 @@ interface ScanModalProps {
   onClose: () => void;
 }
 
-type ScanType = "full" | "quick" | "discovery" | "vuln";
+type ScanType = "full" | "quick" | "discovery" | "vuln" | "nuclei_assets";
 type Tab = "automated" | "manual";
 type ScanProfile = "safe" | "default" | "deep_authorized";
 
@@ -26,6 +26,7 @@ const SCAN_TYPES: { value: ScanType; label: string; desc: string }[] = [
   { value: "quick", label: "Quick Scan", desc: "Discovery + vuln scan (critical/high only)" },
   { value: "discovery", label: "Discovery Only", desc: "Subdomains + DNS + HTTP probe only" },
   { value: "vuln", label: "Vulnerability Only", desc: "Skip discovery, scan existing assets" },
+  { value: "nuclei_assets", label: "Nuclei Assets", desc: "Scan discovered assets only" },
 ];
 
 const SCAN_PROFILES: { value: ScanProfile; label: string; desc: string }[] = [
@@ -45,23 +46,49 @@ export function ScanModal({ orgId, onClose }: ScanModalProps) {
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   const triggerScan = useMutation({
-    mutationFn: () => apiClient.post(`/organizations/${orgId}/scans`, {
-      scan_type: scanType,
-      scan_profile: scanType === "quick" ? "safe" : scanProfile,
-      config: {
-        crawl,
-        fuzz,
-        nuclei_batch_size: scanType === "full" ? 15 : 50,
-        crawl_nuclei_batch_size: scanType === "full" ? 15 : 25,
-        scan_timeout: scanType === "full" ? 1800 : 300,
-        template_timeout: 8,
-        retries: 0,
-        concurrency: scanType === "full" ? 6 : 15,
-        bulk_size: scanType === "full" ? 6 : 15,
-        automatic_scan: scanType !== "quick",
-        use_tech_tags: scanType !== "quick",
-      },
-    }),
+    mutationFn: () => {
+      if (scanType === "nuclei_assets") {
+        return apiClient.post(`/organizations/${orgId}/scans/nuclei-assets`, {
+          scan_profile: scanProfile,
+          include_hosts: true,
+          include_endpoints: true,
+          include_limited: true,
+          max_hosts: 200,
+          max_endpoints: 50,
+          config: {
+            nuclei_batch_size: 4,
+            crawl_nuclei_batch_size: 3,
+            crawl_nuclei_scan_timeout: 300,
+            scan_timeout: 900,
+            template_timeout: 8,
+            retries: 0,
+            concurrency: 6,
+            bulk_size: 6,
+            automatic_scan: true,
+            use_tech_tags: true,
+          },
+        });
+      }
+
+      return apiClient.post(`/organizations/${orgId}/scans`, {
+        scan_type: scanType,
+        scan_profile: scanType === "quick" ? "safe" : scanProfile,
+        config: {
+          crawl,
+          fuzz,
+          nuclei_batch_size: scanType === "full" ? 4 : 8,
+          crawl_nuclei_batch_size: scanType === "full" ? 3 : 5,
+          crawl_nuclei_scan_timeout: 300,
+          scan_timeout: scanType === "full" ? 900 : 300,
+          template_timeout: 8,
+          retries: 0,
+          concurrency: scanType === "full" ? 6 : 8,
+          bulk_size: scanType === "full" ? 6 : 8,
+          automatic_scan: scanType !== "quick",
+          use_tech_tags: scanType !== "quick",
+        },
+      });
+    },
     onSuccess: () => {
       toast.success("Scan queued successfully");
       qc.invalidateQueries({ queryKey: ["org-scans"] });
@@ -230,7 +257,7 @@ export function ScanModal({ orgId, onClose }: ScanModalProps) {
                   </div>
                 </div>
 
-                {(scanType === "full" || scanType === "vuln") && (
+                {(scanType === "full" || scanType === "vuln" || scanType === "nuclei_assets") && (
                   <div>
                     <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2.5 block">
                       Scan Profile
@@ -264,17 +291,21 @@ export function ScanModal({ orgId, onClose }: ScanModalProps) {
                     <span className="text-[11px] text-muted-foreground">
                       {scanType === "full" ? "6 stages" :
                        scanType === "quick" ? "2 stages" :
-                       scanType === "discovery" ? "1 stage" : "1 stage"}
+                       scanType === "discovery" ? "1 stage" :
+                       scanType === "nuclei_assets" ? "1 stage" : "1 stage"}
                     </span>
                   </div>
                   <div className="flex items-center gap-1.5 flex-wrap">
                     {(scanType === "full" || scanType === "quick" || scanType === "discovery") && (
                       <span className="text-[11px] px-2 py-1 rounded-md bg-brand-500/10 text-brand-400">Discovery</span>
                     )}
+                    {scanType === "nuclei_assets" && (
+                      <span className="text-[11px] px-2 py-1 rounded-md bg-brand-500/10 text-brand-400">Existing Assets</span>
+                    )}
                     {scanType === "full" && (
                       <span className="text-[11px] px-2 py-1 rounded-md bg-purple-500/10 text-purple-400">Port Scan</span>
                     )}
-                    {(scanType === "full" || scanType === "quick" || scanType === "vuln") && (
+                    {(scanType === "full" || scanType === "quick" || scanType === "vuln" || scanType === "nuclei_assets") && (
                       <span className="text-[11px] px-2 py-1 rounded-md bg-red-500/10 text-red-400">Vuln Scan</span>
                     )}
                     {scanType === "full" && (
@@ -283,16 +314,17 @@ export function ScanModal({ orgId, onClose }: ScanModalProps) {
                     {scanType === "full" && (
                       <span className="text-[11px] px-2 py-1 rounded-md bg-yellow-500/10 text-yellow-400">Enrich</span>
                     )}
-                    {crawl && scanType !== "vuln" && (
+                    {crawl && scanType !== "vuln" && scanType !== "nuclei_assets" && (
                       <span className="text-[11px] px-2 py-1 rounded-md bg-cyan-500/10 text-cyan-400">Crawl</span>
                     )}
-                    {fuzz && scanType !== "vuln" && (
+                    {fuzz && scanType !== "vuln" && scanType !== "nuclei_assets" && (
                       <span className="text-[11px] px-2 py-1 rounded-md bg-orange-500/10 text-orange-400">Fuzz</span>
                     )}
                   </div>
                 </div>
 
                 {/* Toggles */}
+                {scanType !== "nuclei_assets" && (
                 <div className="space-y-3">
                   <div className="flex items-center justify-between p-3 rounded-xl bg-surface-800">
                     <div className="flex items-center gap-3">
@@ -342,6 +374,7 @@ export function ScanModal({ orgId, onClose }: ScanModalProps) {
                     </button>
                   </div>
                 </div>
+                )}
 
                 {/* Advanced */}
                 <div>

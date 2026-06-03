@@ -19,6 +19,7 @@ from app.api.v1.dependencies.auth import (
 )
 from app.db.models.models import Asset, Finding, Organization, RiskScore, Scan, ScanTemplate, User
 from app.services.audit_service import audit_log
+from app.services.outbox_service import create_queue_event, dispatch_pending_outbox_once
 from app.services.scan_progress import merge_runtime_phase_status
 from app.services.scan_profiles import normalize_scan_profile
 from app.services.scan_service import ScanService
@@ -46,6 +47,8 @@ class OrgCreateRequest(BaseModel):
     environment: str = Field(default="production")
     auto_scan_enabled: bool = True
     scan_policy: Dict[str, Any] = Field(default_factory=dict)
+    scope_allow_patterns: List[str] = Field(default_factory=list)
+    scope_deny_patterns: List[str] = Field(default_factory=list)
 
 
 class OrgUpdateRequest(BaseModel):
@@ -63,6 +66,8 @@ class OrgUpdateRequest(BaseModel):
     is_monitoring_active: Optional[bool] = None
     auto_scan_enabled: Optional[bool] = None
     scan_policy: Optional[Dict[str, Any]] = None
+    scope_allow_patterns: Optional[List[str]] = None
+    scope_deny_patterns: Optional[List[str]] = None
 
 
 class ScanRequest(BaseModel):
@@ -100,6 +105,30 @@ class ScanRequest(BaseModel):
         return normalized
 
 
+class NucleiAssetScanRequest(BaseModel):
+    scan_profile: str = Field(default="deep_authorized")
+    include_hosts: bool = True
+    include_endpoints: bool = True
+    include_limited: bool = True
+    max_hosts: int = Field(default=200, ge=1, le=500)
+    max_endpoints: int = Field(default=50, ge=0, le=500)
+    config: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("scan_profile")
+    @classmethod
+    def validate_scan_profile(cls, value: str) -> str:
+        normalized = normalize_scan_profile(value)
+        if not normalized:
+            raise ValueError("scan_profile must be one of: safe, default, deep_authorized")
+        return normalized
+
+
+class AssetValidationRequest(BaseModel):
+    asset_ids: List[str] = Field(default_factory=list)
+    limit: int = Field(default=200, ge=1, le=1000)
+    stale_hours: Optional[int] = Field(default=None, ge=1, le=720)
+
+
 class OrgResponse(BaseModel):
     id: str
     name: str
@@ -119,6 +148,8 @@ class OrgResponse(BaseModel):
     is_monitoring_active: bool
     auto_scan_enabled: bool
     scan_policy: Dict[str, Any]
+    scope_allow_patterns: List[str]
+    scope_deny_patterns: List[str]
     last_scan_at: Optional[str]
     current_score: Optional[dict]
     created_at: str
@@ -212,6 +243,8 @@ async def list_organizations(
             "is_monitoring_active": org.is_monitoring_active,
             "auto_scan_enabled": org.auto_scan_enabled,
             "scan_policy": org.scan_policy or {},
+            "scope_allow_patterns": org.scope_allow_patterns or [],
+            "scope_deny_patterns": org.scope_deny_patterns or [],
             "last_scan_at": org.last_scan_at.isoformat() if org.last_scan_at else None,
             "current_score": {
                 "overall": latest_score.overall_score,
@@ -278,6 +311,8 @@ async def create_organization(
         environment=request.environment,
         auto_scan_enabled=request.auto_scan_enabled,
         scan_policy=request.scan_policy,
+        scope_allow_patterns=request.scope_allow_patterns,
+        scope_deny_patterns=request.scope_deny_patterns,
     )
     db.add(org)
     await db.commit()
@@ -350,6 +385,8 @@ async def get_organization(
         "is_monitoring_active": org.is_monitoring_active,
         "auto_scan_enabled": org.auto_scan_enabled,
         "scan_policy": org.scan_policy or {},
+        "scope_allow_patterns": org.scope_allow_patterns or [],
+        "scope_deny_patterns": org.scope_deny_patterns or [],
         "last_scan_at": org.last_scan_at.isoformat() if org.last_scan_at else None,
         "risk_score": {
             "overall": latest_score.overall_score,
@@ -492,6 +529,101 @@ async def trigger_scan(
         "status": "queued",
         "scan_type": scan.scan_type,
         "message": "Scan queued successfully. Check /api/v1/scans/{scan_id} for status.",
+    }
+
+
+@router.post("/{org_id}/scans/nuclei-assets", status_code=status.HTTP_201_CREATED)
+async def trigger_nuclei_asset_scan(
+    org_id: UUID,
+    request: NucleiAssetScanRequest,
+    workspace_id: UUID = Depends(get_workspace_id),
+    current_user: User = Depends(require_analyst),
+    db: AsyncSession = Depends(get_db),
+):
+    """Run nuclei directly against existing discovered assets and crawled endpoints."""
+    await _get_org_or_404(db, org_id, workspace_id)
+
+    active_scans = (await db.execute(
+        select(func.count(Scan.id)).where(
+            Scan.org_id == org_id,
+            Scan.status.in_(["queued", "pending", "running"]),
+        )
+    )).scalar_one()
+    if active_scans >= 3:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Maximum concurrent scans (3) reached. Please wait for active scans to complete.",
+        )
+
+    scan_service = ScanService(db)
+    try:
+        scan = await scan_service.create_nuclei_asset_scan(
+            org_id=org_id,
+            workspace_id=workspace_id,
+            created_by=current_user.id,
+            config=request.config,
+            scan_profile=request.scan_profile,
+            include_hosts=request.include_hosts,
+            include_endpoints=request.include_endpoints,
+            include_limited=request.include_limited,
+            max_hosts=request.max_hosts,
+            max_endpoints=request.max_endpoints,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    target_counts = (scan.config or {}).get("target_counts") or {}
+    return {
+        "scan_id": str(scan.id),
+        "status": "queued",
+        "scan_type": scan.scan_type,
+        "target_counts": target_counts,
+        "message": (
+            f"Nuclei asset scan queued against {target_counts.get('hosts', 0)} host target(s) "
+            f"and {target_counts.get('endpoints', 0)} endpoint target(s)."
+        ),
+    }
+
+
+@router.post("/{org_id}/assets/validate", status_code=status.HTTP_202_ACCEPTED)
+async def queue_asset_validation(
+    org_id: UUID,
+    request: AssetValidationRequest,
+    workspace_id: UUID = Depends(get_workspace_id),
+    current_user: User = Depends(require_analyst),
+    db: AsyncSession = Depends(get_db),
+):
+    """Queue ownership/scope revalidation for existing assets."""
+    await _get_org_or_404(db, org_id, workspace_id)
+    payload = {
+        "org_id": str(org_id),
+        "workspace_id": str(workspace_id),
+        "asset_ids": request.asset_ids,
+        "limit": request.limit,
+    }
+    if request.stale_hours:
+        payload["stale_hours"] = request.stale_hours
+
+    event = create_queue_event(
+        routing_key="asset.validate",
+        payload=payload,
+        priority=4,
+        aggregate_type="organization",
+        aggregate_id=str(org_id),
+    )
+    db.add(event)
+    await db.commit()
+
+    try:
+        await dispatch_pending_outbox_once(limit=5)
+    except Exception as exc:
+        log.warning("asset_validation_outbox_dispatch_deferred", org_id=str(org_id), error=str(exc))
+
+    return {
+        "status": "queued",
+        "routing_key": "asset.validate",
+        "asset_count": len(request.asset_ids),
+        "limit": request.limit,
     }
 
 

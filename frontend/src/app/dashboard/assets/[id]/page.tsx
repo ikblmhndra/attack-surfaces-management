@@ -7,7 +7,7 @@ import {
   Layers, Lock, Network, Activity, Eye, ExternalLink,
   MapPin, Clock, Cpu, ChevronRight, ChevronDown
 } from "lucide-react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { formatDistanceToNow, format } from "date-fns";
 import { motion } from "framer-motion";
 import { assetsAPI } from "@/lib/api";
@@ -28,6 +28,7 @@ const HTTP_STATUS_CONFIG: Record<string, { label: string; className: string }> =
 export default function AssetDetailPage() {
   const params = useParams();
   const router = useRouter();
+  const queryClient = useQueryClient();
   const assetId = params.id as string;
 
   const [activeTab, setActiveTab] = useState<"overview" | "endpoints" | "findings" | "screenshots" | "intel">("overview");
@@ -36,6 +37,15 @@ export default function AssetDetailPage() {
     queryKey: ["asset", assetId],
     queryFn: () => assetsAPI.get(assetId).then(r => r.data),
     enabled: !!assetId,
+  });
+
+  const reviewMutation = useMutation({
+    mutationFn: (decision: "approve" | "reject" | "needs_review") =>
+      assetsAPI.review(assetId, { decision }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["asset", assetId] });
+      queryClient.invalidateQueries({ queryKey: ["assets"] });
+    },
   });
 
   const { data: findings } = useQuery({
@@ -159,6 +169,9 @@ export default function AssetDetailPage() {
                   <ValidationMetric label="Scope" value={asset.scope_status || "unknown"} />
                   <ValidationMetric label="Liveness" value={asset.liveness_status || "unknown"} />
                   <ValidationMetric label="Exposure" value={asset.exposure_status || "unknown"} />
+                  <ValidationMetric label="Review" value={asset.review_status || "none"} />
+                </div>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                   <div>
                     <p className="text-xs text-muted-foreground">Ownership</p>
                     <p className="text-sm font-mono text-foreground">
@@ -175,6 +188,29 @@ export default function AssetDetailPage() {
                     <p className="text-xs text-muted-foreground">Last Verified</p>
                     <p className="text-sm text-foreground">{asset.last_verified_at ? formatRelative(asset.last_verified_at) : "—"}</p>
                   </div>
+                </div>
+                <div className="flex flex-wrap gap-2 pt-1">
+                  <button
+                    onClick={() => reviewMutation.mutate("approve")}
+                    disabled={reviewMutation.isPending}
+                    className="px-3 py-1.5 text-xs rounded-lg bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 hover:bg-emerald-500/20 disabled:opacity-50"
+                  >
+                    Approve
+                  </button>
+                  <button
+                    onClick={() => reviewMutation.mutate("needs_review")}
+                    disabled={reviewMutation.isPending}
+                    className="px-3 py-1.5 text-xs rounded-lg bg-amber-500/10 text-amber-400 border border-amber-500/20 hover:bg-amber-500/20 disabled:opacity-50"
+                  >
+                    Needs Review
+                  </button>
+                  <button
+                    onClick={() => reviewMutation.mutate("reject")}
+                    disabled={reviewMutation.isPending}
+                    className="px-3 py-1.5 text-xs rounded-lg bg-red-500/10 text-red-400 border border-red-500/20 hover:bg-red-500/20 disabled:opacity-50"
+                  >
+                    Reject
+                  </button>
                 </div>
                 {(asset.validation_sources?.reasons || []).length > 0 && (
                   <div className="flex flex-wrap gap-1.5">
@@ -541,6 +577,10 @@ export default function AssetDetailPage() {
                 <StatusBadge status={asset.status} />
               </div>
               <div className="flex items-center justify-between">
+                <span className="text-xs text-muted-foreground">Review</span>
+                <span className="text-xs text-foreground capitalize">{(asset.review_status || "none").replaceAll("_", " ")}</span>
+              </div>
+              <div className="flex items-center justify-between">
                 <span className="text-xs text-muted-foreground">Open Findings</span>
                 <span className={cn("text-xs font-bold", openFindingsCount > 0 ? "text-red-400" : "text-emerald-400")}>
                   {openFindingsCount}
@@ -650,11 +690,11 @@ function HttpStatusBadge({ status, statusClass }: { status?: number; statusClass
 function ValidationMetric({ label, value }: { label: string; value: string }) {
   const normalized = value.replaceAll("_", " ");
   const className =
-    value === "in_scope" || value === "alive" || value === "exposed"
+    value === "in_scope" || value === "alive" || value === "exposed" || value === "approved"
       ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
-      : value === "probable" || value === "limited" || value === "dns_only"
+      : value === "probable" || value === "limited" || value === "dns_only" || value === "pending"
         ? "bg-amber-500/10 text-amber-400 border-amber-500/20"
-        : value === "out_of_scope" || value === "unresolved" || value === "not_exposed"
+        : value === "out_of_scope" || value === "unresolved" || value === "not_exposed" || value === "rejected"
           ? "bg-red-500/10 text-red-400 border-red-500/20"
           : "bg-surface-700 text-muted-foreground border-border";
 

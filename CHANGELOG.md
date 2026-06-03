@@ -6,6 +6,14 @@ All notable changes to this project are documented below, sorted newest-first.
 
 ## 2026-06-03 — Scan Pipeline Progress and Result UI
 
+### Added: Asset validation worker and analyst review workflow
+- **Files**: `backend/app/db/migrations/versions/010_scope_controls_asset_review.py`, `backend/app/db/models/models.py`, `backend/app/services/asset_validation.py`, `backend/app/api/v1/endpoints/assets.py`, `backend/app/api/v1/endpoints/organizations.py`, `backend/app/core/queue_client.py`, `backend/tests/unit/test_asset_validation.py`, `workers/validation/asset_validation_worker.py`, `workers/base_worker.py`, `workers/queue_client.py`, `workers/scheduler/scheduler.py`, `docker-compose.yml`, `.env.example`, `frontend/src/app/dashboard/assets/page.tsx`, `frontend/src/app/dashboard/assets/[id]/page.tsx`, `frontend/src/app/dashboard/organizations/new/page.tsx`, `frontend/src/app/dashboard/organizations/[id]/page.tsx`, `frontend/src/lib/api.ts`, `frontend/src/types/index.ts`
+- Added organization allow/deny scope patterns and asset analyst review fields with an idempotent migration.
+- Added `asset.validate` queue routing, a dedicated validation worker, Compose service, and scheduler refresh job for periodic ownership/scope revalidation.
+- Validation now merges DNS/HTTP/TLS evidence with RDAP/ASN evidence from RDAP.org and Team Cymru, while preserving analyst-approved or analyst-rejected decisions.
+- Added asset review API actions for approve, reject, and needs-review decisions, plus organization API action to queue validation against existing assets.
+- Asset inventory now supports review filtering; asset detail now shows review status and review actions; organization create/edit now exposes scope controls and manual validation queueing.
+
 ### Added: Asset validation and scope confidence milestone
 - **Files**: `backend/app/db/migrations/versions/009_asset_validation.py`, `backend/app/db/models/models.py`, `backend/app/services/asset_validation.py`, `backend/app/services/scan_profiles.py`, `workers/scanner/discovery_worker.py`, `workers/scanner/port_worker.py`, `backend/app/api/v1/endpoints/assets.py`, `backend/app/api/v1/endpoints/scans.py`, `frontend/src/app/dashboard/assets/page.tsx`, `frontend/src/app/dashboard/assets/[id]/page.tsx`
 - Added asset validation fields for `scope_status`, `ownership_confidence`, `ownership_reason`, `exposure_status`, `liveness_status`, validation evidence, and last verified timestamp.
@@ -30,6 +38,9 @@ All notable changes to this project are documented below, sorted newest-first.
 - Nuclei batches that time out with no parsed findings now record a phase warning and complete as partial coverage instead of raising worker exceptions and retrying until scan failure.
 - Suppressed low-value info-level nuclei findings such as technology, favicon, WAF, fingerprint, and WordPress plugin detection so they do not pollute vulnerability results by default.
 - Bounded nuclei runtime by lowering deep/endpoint batch sizes, capping endpoint nuclei target budgets, and enforcing worker-side maximum batch timeouts for stale scan configs.
+- Switched nuclei persistence to JSONL streaming output and reduced default full-scan nuclei batches so timed-out batches are less likely to drop findings before results are flushed.
+- Reworked deep nuclei execution to be vulnerability-first: UI defaults, backend caps, discovery batching, and crawl-fed endpoint scans now avoid large stale batches and prioritize critical/high/medium/low coverage over info inventory.
+- Added a nuclei-only scan path for already-discovered assets and high-signal crawled endpoints, exposed through the organization scan API and Scan Modal as `Nuclei Assets`.
 
 ### Fixed: Accurate nuclei and crawl task accounting
 - **Files**: `workers/task_coordinator.py`, `workers/crawler/web_crawl_worker.py`, `workers/scanner/nuclei_worker.py`

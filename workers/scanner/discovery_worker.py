@@ -26,7 +26,11 @@ from workers.scan_observability import record_target_selections
 from workers.scan_phase import update_scan_phase
 from workers.scan_state import mark_scan_running
 from app.services.scan_profiles import build_target_candidates, child_profile_config
-from app.services.asset_validation import should_scan_validated_asset, validate_discovered_host
+from app.services.asset_validation import (
+    apply_scope_controls,
+    should_scan_validated_asset,
+    validate_discovered_host,
+)
 
 log = structlog.get_logger()
 
@@ -174,11 +178,17 @@ class DiscoveryWorker(BaseWorker):
             alive_hosts = await self._probe_http(list(resolved.keys()), tmpdir, config)
             validation_by_host = {}
             for host, dns_info in resolved.items():
-                validation_by_host[host] = validate_discovered_host(
+                validation = validate_discovered_host(
                     host=host,
                     root_domains=targets.get("domains", []),
                     dns_info=dns_info,
                     http_info=alive_hosts.get(host, {}),
+                )
+                validation_by_host[host] = apply_scope_controls(
+                    validation,
+                    target=host,
+                    allow_patterns=targets.get("scope_allow_patterns", []),
+                    deny_patterns=targets.get("scope_deny_patterns", []),
                 )
             for host, http_data in alive_hosts.items():
                 http_data["validation"] = validation_by_host.get(host)
@@ -1021,14 +1031,29 @@ class DiscoveryWorker(BaseWorker):
             limited_targets = candidates["web_limited_targets"]
             tech_map = candidates["tech_map"]
 
-            batch_size = max(1, min(int(config.get("nuclei_batch_size", 25)), 50))
+            batch_size = max(1, min(int(config.get("nuclei_batch_size", 25)), 4))
+            standard_config = {
+                **config,
+                "scan_timeout": min(int(config.get("scan_timeout", 900)), 900),
+                "nuclei_batch_size": batch_size,
+                "severities": [
+                    severity
+                    for severity in (config.get("severities") or ["critical", "high", "medium", "low"])
+                    if severity != "info"
+                ],
+            }
             limited_config = child_profile_config(
                 "limited",
                 config,
-                {"scan_timeout": int(config.get("scan_timeout", 900))},
+                {
+                    "scan_timeout": min(int(config.get("scan_timeout", 900)), 600),
+                    "concurrency": min(int(config.get("concurrency", 4)), 4),
+                    "bulk_size": min(int(config.get("bulk_size", 4)), 4),
+                    "nuclei_batch_size": 4,
+                },
             )
             for target_group, group_config, profile in (
-                (standard_targets, config, "standard"),
+                (standard_targets, standard_config, "standard"),
                 (limited_targets, limited_config, "limited"),
             ):
                 target_group = dedupe_preserve_order(target_group)

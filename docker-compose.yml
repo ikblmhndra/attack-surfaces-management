@@ -173,6 +173,15 @@ services:
       ABUSEIPDB_API_KEY: ${ABUSEIPDB_API_KEY:-}
       OTX_API_KEY: ${OTX_API_KEY:-}
 
+  worker-validation:
+    <<: *worker-base
+    command: python -m workers.validation.asset_validation_worker
+    environment:
+      <<: *common-env
+      WORKER_TYPE: validation
+      VALIDATION_CONCURRENCY: ${VALIDATION_CONCURRENCY:-2}
+      VALIDATION_STALE_HOURS: ${VALIDATION_STALE_HOURS:-24}
+
   worker-crawl:
     <<: *worker-base
     command: python -m workers.crawler.web_crawl_worker
@@ -243,6 +252,8 @@ services:
       WORKER_TYPE: scheduler
       SCAN_INTERVAL_HOURS: ${SCAN_INTERVAL_HOURS:-24}
       RUN_FULL_SCAN_ON_START: ${RUN_FULL_SCAN_ON_START:-false}
+      VALIDATION_REFRESH_HOURS: ${VALIDATION_REFRESH_HOURS:-24}
+      VALIDATION_REFRESH_LIMIT: ${VALIDATION_REFRESH_LIMIT:-250}
 
   # ============================================================
   # DATABASES & STORAGE

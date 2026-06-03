@@ -215,10 +215,10 @@ class NucleiWorker(BaseWorker):
             target_file = tmpdir / "targets.txt"
             target_file.write_text("\n".join(targets))
 
-            output_file = tmpdir / "nuclei_results.json"
+            output_file = tmpdir / "nuclei_results.jsonl"
 
             # Run nuclei
-            findings_raw, timed_out = await self._run_nuclei(
+            findings_raw, timed_out, effective_scan_timeout = await self._run_nuclei(
                 target_file=target_file,
                 output_file=output_file,
                 config=config,
@@ -261,7 +261,7 @@ class NucleiWorker(BaseWorker):
                         "nuclei_timeout_no_findings",
                         scan_id=scan_id,
                         targets=len(targets),
-                        timeout=config.get("scan_timeout", 600),
+                        timeout=effective_scan_timeout,
                     )
                     async with get_session() as db:
                         await update_scan_phase(
@@ -310,7 +310,7 @@ class NucleiWorker(BaseWorker):
         output_file: Path,
         config: Dict,
         scan_id: str,
-    ) -> tuple[List[Dict], bool]:
+    ) -> tuple[List[Dict], bool, int]:
         """Execute nuclei with configured templates and return raw JSON results."""
         severities = config.get("severities", DEFAULT_SEVERITIES)
         tags = config.get("tags", [])
@@ -340,9 +340,11 @@ class NucleiWorker(BaseWorker):
         cmd = [
             nuclei_path,
             "-l", str(target_file),
-            "-json-export", str(output_file),
+            "-jsonl",
+            "-o", str(output_file),
             "-silent",
             "-no-color",
+            "-stream",
             "-rate-limit", str(rate_limit),
             "-bulk-size", str(bulk_size),
             "-c", str(concurrency),
@@ -462,15 +464,15 @@ class NucleiWorker(BaseWorker):
                 await proc.wait()
             except Exception:
                 pass
-            return self._parse_results_file(output_file), True
+            return self._parse_results_file(output_file), True, scan_timeout
         except FileNotFoundError:
             log.error("nuclei_not_found", message="nuclei binary not found in PATH")
-            return [], False
+            return [], False, scan_timeout
         except Exception as e:
             log.error("nuclei_exception", error=str(e), scan_id=scan_id)
-            return [], False
+            return [], False, scan_timeout
 
-        return self._parse_results_file(output_file), False
+        return self._parse_results_file(output_file), False, scan_timeout
 
     def _parse_results_file(self, output_file: Path) -> List[Dict]:
         """Parse nuclei JSON output, including partial files after timeout."""

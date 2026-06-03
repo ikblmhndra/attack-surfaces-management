@@ -175,6 +175,8 @@ class Organization(TimestampMixin, SoftDeleteMixin, Base):
     is_monitoring_active = Column(Boolean, nullable=False, default=True)
     auto_scan_enabled = Column(Boolean, nullable=False, default=True)
     scan_policy = Column(JSONB, nullable=False, default=dict)
+    scope_allow_patterns = Column(ARRAY(String), nullable=False, default=list)
+    scope_deny_patterns = Column(ARRAY(String), nullable=False, default=list)
 
     __table_args__ = (
         UniqueConstraint("workspace_id", "slug", name="uq_org_workspace_slug"),
@@ -225,6 +227,10 @@ class Asset(TimestampMixin, SoftDeleteMixin, Base):
     liveness_status = Column(String(50), nullable=False, default="unknown", index=True)
     validation_sources = Column(JSONB, nullable=False, default=dict)
     last_verified_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    review_status = Column(String(50), nullable=False, default="none", index=True)
+    reviewed_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    reviewed_at = Column(DateTime(timezone=True), nullable=True)
+    review_note = Column(Text, nullable=True)
 
     # Tracking
     first_seen = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

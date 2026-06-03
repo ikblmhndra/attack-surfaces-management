@@ -1,6 +1,8 @@
 """Asset validation and scan-gating helpers."""
 from __future__ import annotations
 
+import fnmatch
+import ipaddress
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable
 
@@ -113,7 +115,7 @@ def validate_discovered_host(
     else:
         liveness_status = "unresolved"
 
-    if status_class in {"ok", "redirect", "auth"}:
+    if status_class in {"ok", "redirect", "auth", "auth_required"}:
         exposure_status = "exposed"
     elif status_class in {"client_error", "server_error", "not_found"}:
         exposure_status = "limited"
@@ -140,6 +142,85 @@ def validate_discovered_host(
     }
 
 
+def apply_scope_controls(
+    validation: Dict[str, Any],
+    *,
+    target: str,
+    allow_patterns: Iterable[str] | None = None,
+    deny_patterns: Iterable[str] | None = None,
+) -> Dict[str, Any]:
+    """Apply organization explicit allow/deny patterns to validation evidence."""
+    updated = dict(validation or {})
+    sources = dict(updated.get("validation_sources") or {})
+    reasons = list(sources.get("reasons") or [])
+    target_normalized = normalize_hostname(target)
+
+    deny_match = _first_pattern_match(target_normalized, deny_patterns or [])
+    allow_match = _first_pattern_match(target_normalized, allow_patterns or [])
+    if deny_match:
+        updated["scope_status"] = "out_of_scope"
+        updated["ownership_confidence"] = min(float(updated.get("ownership_confidence") or 0), 0.2)
+        updated["ownership_reason"] = f"matched organization deny pattern: {deny_match}"
+        updated["is_in_scope"] = False
+        reasons.append("org_deny_pattern_matched")
+        sources["matched_deny_pattern"] = deny_match
+    elif allow_match and updated.get("scope_status") in {"needs_review", "out_of_scope"}:
+        updated["scope_status"] = "probable"
+        updated["ownership_confidence"] = max(float(updated.get("ownership_confidence") or 0), 0.65)
+        updated["ownership_reason"] = f"matched organization allow pattern: {allow_match}"
+        updated["is_in_scope"] = True
+        reasons.append("org_allow_pattern_matched")
+        sources["matched_allow_pattern"] = allow_match
+
+    sources["reasons"] = list(dict.fromkeys(reasons))
+    updated["validation_sources"] = sources
+    return updated
+
+
+def merge_rdap_evidence(
+    validation: Dict[str, Any],
+    *,
+    rdap: Dict[str, Any] | None,
+    org_names: Iterable[str] | None = None,
+) -> Dict[str, Any]:
+    """Merge RDAP/ASN ownership evidence into an existing validation result."""
+    if not rdap:
+        return validation
+    updated = dict(validation or {})
+    sources = dict(updated.get("validation_sources") or {})
+    reasons = list(sources.get("reasons") or [])
+    evidence = dict(sources.get("evidence") or {})
+    evidence["rdap"] = rdap
+
+    org_haystack = " ".join(
+        str(value or "").lower()
+        for value in [
+            rdap.get("asn_org"),
+            rdap.get("registry_org"),
+            rdap.get("isp"),
+            rdap.get("network_name"),
+            rdap.get("network_handle"),
+            rdap.get("country"),
+        ]
+    )
+    names = [normalize_hostname(name).replace(".", " ") for name in (org_names or []) if name]
+    matched_name = next((name for name in names if name and name in org_haystack), None)
+    if matched_name:
+        reasons.append("rdap_org_matches_scope")
+        updated["ownership_confidence"] = min(max(float(updated.get("ownership_confidence") or 0), 0.8), 1.0)
+        if updated.get("scope_status") in {"needs_review", "probable"}:
+            updated["scope_status"] = "in_scope"
+        updated["ownership_reason"] = "RDAP/ASN ownership matched organization identity"
+    elif rdap.get("asn") or rdap.get("asn_org"):
+        reasons.append("rdap_asn_observed")
+        updated["ownership_confidence"] = max(float(updated.get("ownership_confidence") or 0), 0.55)
+
+    sources["reasons"] = list(dict.fromkeys(reasons))
+    sources["evidence"] = evidence
+    updated["validation_sources"] = sources
+    return updated
+
+
 def should_scan_validated_asset(validation: Dict[str, Any] | None, *, require_validation: bool = True) -> bool:
     """Return whether active scan phases should target this asset."""
     if not validation:
@@ -158,3 +239,26 @@ def validation_skip_reason(validation: Dict[str, Any] | None) -> str:
     if validation.get("liveness_status") not in SCANNABLE_LIVENESS_STATUSES:
         return f"liveness_{validation.get('liveness_status') or 'unknown'}"
     return "eligible"
+
+
+def _first_pattern_match(target: str, patterns: Iterable[str]) -> str | None:
+    for raw_pattern in patterns:
+        pattern = normalize_hostname(raw_pattern)
+        if not pattern:
+            continue
+        if _pattern_matches(target, pattern):
+            return raw_pattern
+    return None
+
+
+def _pattern_matches(target: str, pattern: str) -> bool:
+    if pattern.startswith("*.") and (target.endswith(pattern[1:]) or target == pattern[2:]):
+        return True
+    if any(char in pattern for char in "*?[]"):
+        return fnmatch.fnmatch(target, pattern)
+    try:
+        network = ipaddress.ip_network(pattern, strict=False)
+        return ipaddress.ip_address(target) in network
+    except ValueError:
+        pass
+    return target == pattern or target.endswith(f".{pattern}")

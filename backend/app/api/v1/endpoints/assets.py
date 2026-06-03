@@ -8,7 +8,7 @@ from uuid import UUID
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,6 +21,19 @@ from app.db.models.models import (
 log = structlog.get_logger()
 router = APIRouter()
 require_analyst = RequireRole(["owner", "admin", "analyst"])
+
+
+class AssetReviewRequest(BaseModel):
+    decision: str = Field(..., description="approve,reject,needs_review")
+    note: Optional[str] = Field(default=None, max_length=2000)
+
+    @field_validator("decision")
+    @classmethod
+    def validate_decision(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"approve", "reject", "needs_review"}:
+            raise ValueError("decision must be one of: approve, reject, needs_review")
+        return normalized
 
 
 def _classify_http_status(status_code: Optional[int]) -> str:
@@ -82,6 +95,7 @@ async def list_assets(
     technology: Optional[str] = Query(None),
     http_status_class: Optional[str] = Query(None, description="ok,redirect,auth_required,not_found,rate_limited,server_error,other"),
     scope_status: Optional[str] = Query(None, description="in_scope,probable,needs_review,out_of_scope"),
+    review_status: Optional[str] = Query(None, description="none,pending,approved,rejected"),
     liveness_status: Optional[str] = Query(None, description="alive,dns_only,unresolved,unknown"),
     exposure_status: Optional[str] = Query(None, description="exposed,limited,not_exposed,unknown"),
     cdn_only: Optional[bool] = Query(None),
@@ -111,6 +125,8 @@ async def list_assets(
         query = query.where(Asset.criticality == criticality)
     if scope_status:
         query = query.where(Asset.scope_status == scope_status)
+    if review_status:
+        query = query.where(Asset.review_status == review_status)
     if liveness_status:
         query = query.where(Asset.liveness_status == liveness_status)
     if exposure_status:
@@ -158,6 +174,7 @@ async def list_assets(
         "first_seen": Asset.first_seen,
         "criticality": Asset.criticality,
         "asset_type": Asset.asset_type,
+        "review_status": Asset.review_status,
     }
     sort_col = sort_map.get(sort_by, Asset.last_seen)
     query = query.order_by(sort_col.desc() if sort_dir == "desc" else sort_col.asc())
@@ -279,6 +296,65 @@ async def get_asset(
     })
 
     return result
+
+
+@router.post("/{asset_id:uuid}/review")
+async def review_asset(
+    asset_id: UUID,
+    request: AssetReviewRequest,
+    workspace_id: UUID = Depends(get_workspace_id),
+    current_user: User = Depends(require_analyst),
+    db: AsyncSession = Depends(get_db),
+):
+    """Record analyst ownership/scope review for an asset."""
+    asset = await _get_asset_or_404(db, asset_id, workspace_id)
+    now = datetime.now(timezone.utc)
+
+    if request.decision == "approve":
+        asset.scope_status = "in_scope"
+        asset.is_in_scope = True
+        asset.review_status = "approved"
+        asset.ownership_confidence = max(float(asset.ownership_confidence or 0), 0.9)
+        asset.ownership_reason = "approved by analyst"
+    elif request.decision == "reject":
+        asset.scope_status = "out_of_scope"
+        asset.is_in_scope = False
+        asset.review_status = "rejected"
+        asset.ownership_confidence = min(float(asset.ownership_confidence or 0), 0.2)
+        asset.ownership_reason = "rejected by analyst"
+    else:
+        asset.scope_status = "needs_review"
+        asset.is_in_scope = True
+        asset.review_status = "pending"
+        asset.ownership_reason = "marked for analyst review"
+
+    asset.reviewed_by = current_user.id
+    asset.reviewed_at = now
+    asset.review_note = request.note
+    asset.last_verified_at = now
+
+    sources = dict(asset.validation_sources or {})
+    reasons = list(sources.get("reasons") or [])
+    reasons.append(f"analyst_{asset.review_status}")
+    evidence = dict(sources.get("evidence") or {})
+    evidence["analyst_review"] = {
+        "decision": request.decision,
+        "review_status": asset.review_status,
+        "reviewed_by": str(current_user.id),
+        "reviewed_at": now.isoformat(),
+        "note": request.note,
+    }
+    sources["reasons"] = list(dict.fromkeys(reasons))
+    sources["evidence"] = evidence
+    sources["validated_at"] = now.isoformat()
+    asset.validation_sources = sources
+
+    await db.commit()
+    await db.refresh(asset)
+
+    sub = (await db.execute(select(Subdomain).where(Subdomain.asset_id == asset_id))).scalar_one_or_none()
+    ip = (await db.execute(select(IPAddress).where(IPAddress.asset_id == asset_id))).scalar_one_or_none()
+    return _asset_to_dict(asset, sub, ip, detailed=True)
 
 
 @router.get("/{asset_id:uuid}/endpoints")
@@ -548,6 +624,10 @@ def _asset_to_dict(asset, sub=None, ip=None, detailed=False) -> dict:
         "liveness_status": asset.liveness_status,
         "validation_sources": asset.validation_sources or {},
         "last_verified_at": asset.last_verified_at.isoformat() if asset.last_verified_at else None,
+        "review_status": asset.review_status,
+        "reviewed_by": str(asset.reviewed_by) if asset.reviewed_by else None,
+        "reviewed_at": asset.reviewed_at.isoformat() if asset.reviewed_at else None,
+        "review_note": asset.review_note,
         "tags": asset.tags or [],
         "criticality": asset.criticality,
         "environment": asset.environment,

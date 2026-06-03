@@ -7,10 +7,11 @@ from typing import Any, Dict, List
 from uuid import UUID
 
 import structlog
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models.models import Organization, Scan
-from app.services.scan_profiles import apply_scan_profile
+from app.db.models.models import Asset, Organization, Scan, WebEndpoint
+from app.services.scan_profiles import apply_scan_profile, child_profile_config
 from app.services.outbox_service import create_queue_event, dispatch_pending_outbox_once
 
 log = structlog.get_logger()
@@ -26,10 +27,10 @@ DEFAULT_SCAN_POLICY = {
     "scan_profile": "deep_authorized",
     "modules": DEFAULT_MODULES["full"],
     "budgets": {
-        "scan_timeout": 1800,
-        "nuclei_batch_size": 15,
-        "crawl_nuclei_batch_size": 15,
-        "crawl_nuclei_scan_timeout": 600,
+        "scan_timeout": 900,
+        "nuclei_batch_size": 4,
+        "crawl_nuclei_batch_size": 3,
+        "crawl_nuclei_scan_timeout": 300,
         "max_endpoints": 2500,
         "max_hosts": 200,
     },
@@ -62,9 +63,10 @@ DEFAULT_SCAN_CONFIG = {
         "scan_profile": "deep_authorized",
         "crawl": True,
         "fuzz": False,
-        "nuclei_batch_size": 15,
-        "crawl_nuclei_batch_size": 15,
-        "scan_timeout": 1800,
+        "nuclei_batch_size": 4,
+        "crawl_nuclei_batch_size": 3,
+        "crawl_nuclei_scan_timeout": 300,
+        "scan_timeout": 900,
         "template_timeout": 8,
         "retries": 0,
         "concurrency": 6,
@@ -82,8 +84,8 @@ DEFAULT_SCAN_CONFIG = {
         "scan_profile": "safe",
         "crawl": True,
         "fuzz": False,
-        "nuclei_batch_size": 50,
-        "crawl_nuclei_batch_size": 25,
+        "nuclei_batch_size": 8,
+        "crawl_nuclei_batch_size": 5,
         "scan_timeout": 300,
         "template_timeout": 8,
         "retries": 0,
@@ -100,7 +102,7 @@ DEFAULT_SCAN_CONFIG = {
     },
     "vuln": {
         "scan_profile": "deep_authorized",
-        "nuclei_batch_size": 25,
+        "nuclei_batch_size": 4,
         "scan_timeout": 900,
         "template_timeout": 8,
         "retries": 0,
@@ -127,6 +129,27 @@ CONFIG_LIMITS = {
     "fuzz_max_targets": (1, 50),
 }
 
+PROFILE_RUNTIME_CAPS = {
+    "deep_authorized": {
+        "scan_timeout": 900,
+        "nuclei_batch_size": 4,
+        "crawl_nuclei_batch_size": 3,
+        "crawl_nuclei_scan_timeout": 300,
+    },
+    "endpoint": {
+        "scan_timeout": 300,
+        "nuclei_batch_size": 3,
+        "concurrency": 4,
+        "bulk_size": 4,
+    },
+    "limited": {
+        "scan_timeout": 600,
+        "nuclei_batch_size": 4,
+        "concurrency": 4,
+        "bulk_size": 4,
+    },
+}
+
 
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
     merged = deepcopy(base)
@@ -148,6 +171,24 @@ def _clamp_config(config: Dict[str, Any]) -> Dict[str, Any]:
         except (TypeError, ValueError):
             sanitized.pop(key, None)
     return sanitized
+
+
+def _apply_runtime_caps(config: Dict[str, Any]) -> Dict[str, Any]:
+    capped = dict(config or {})
+    profile = str(capped.get("scan_profile") or "")
+    for key, max_value in PROFILE_RUNTIME_CAPS.get(profile, {}).items():
+        if key not in capped:
+            continue
+        try:
+            capped[key] = min(int(capped[key]), max_value)
+        except (TypeError, ValueError):
+            capped[key] = max_value
+
+    if profile == "deep_authorized" and not capped.get("nuclei_include_info_templates", False):
+        severities = capped.get("severities") or []
+        capped["severities"] = [severity for severity in severities if severity != "info"]
+
+    return capped
 
 
 def _policy_to_config(policy: Dict[str, Any]) -> Dict[str, Any]:
@@ -187,6 +228,153 @@ class ScanService:
     def __init__(self, db: AsyncSession):
         self.db = db
 
+    async def create_nuclei_asset_scan(
+        self,
+        *,
+        org_id: UUID,
+        workspace_id: UUID,
+        created_by: UUID,
+        config: Dict[str, Any],
+        scan_profile: str = "deep_authorized",
+        include_hosts: bool = True,
+        include_endpoints: bool = True,
+        include_limited: bool = True,
+        max_hosts: int = 200,
+        max_endpoints: int = 50,
+    ) -> Scan:
+        """Queue nuclei directly against already-discovered assets and endpoints."""
+        host_targets: List[str] = []
+        endpoint_targets: List[str] = []
+
+        if include_hosts and max_hosts > 0:
+            host_targets = await self._discovered_nuclei_hosts(
+                org_id=org_id,
+                workspace_id=workspace_id,
+                include_limited=include_limited,
+                limit=max_hosts,
+            )
+
+        if include_endpoints and max_endpoints > 0:
+            endpoint_targets = await self._discovered_nuclei_endpoints(
+                org_id=org_id,
+                workspace_id=workspace_id,
+                limit=max_endpoints,
+            )
+
+        host_targets = _dedupe_preserve_order(host_targets)
+        endpoint_targets = _dedupe_preserve_order(endpoint_targets)
+        if not host_targets and not endpoint_targets:
+            raise ValueError("No eligible discovered assets or endpoints are available for nuclei")
+
+        base_config = _apply_runtime_caps(_clamp_config(apply_scan_profile(
+            {
+                **DEFAULT_SCAN_CONFIG["vuln"],
+                **(config or {}),
+                "scan_profile": scan_profile,
+                "scan_type": "nuclei_assets",
+                "automatic_scan": True,
+                "use_tech_tags": True,
+            },
+            "vuln",
+        )))
+        endpoint_config = child_profile_config(
+            "endpoint",
+            base_config,
+            {
+                "scan_timeout": min(int(base_config.get("crawl_nuclei_scan_timeout", 300)), 300),
+                "template_timeout": min(int(base_config.get("template_timeout", 6)), 6),
+                "concurrency": min(int(base_config.get("concurrency", 4)), 4),
+                "bulk_size": min(int(base_config.get("bulk_size", 4)), 4),
+                "nuclei_batch_size": 3,
+                "severities": ["critical", "high", "medium"],
+            },
+        )
+
+        host_batch_size = max(1, min(int(base_config.get("nuclei_batch_size", 4)), 4))
+        endpoint_batch_size = max(1, min(int(endpoint_config.get("nuclei_batch_size", 3)), 3))
+        host_batches = _chunks(host_targets, host_batch_size)
+        endpoint_batches = _chunks(endpoint_targets, endpoint_batch_size)
+        total_batches = len(host_batches) + len(endpoint_batches)
+
+        scan = Scan(
+            org_id=org_id,
+            workspace_id=workspace_id,
+            created_by=created_by,
+            scan_type="nuclei_assets",
+            status="queued",
+            modules=["nuclei"],
+            config={
+                **base_config,
+                "source": "discovered_assets",
+                "include_hosts": include_hosts,
+                "include_endpoints": include_endpoints,
+                "include_limited": include_limited,
+                "target_counts": {
+                    "hosts": len(host_targets),
+                    "endpoints": len(endpoint_targets),
+                    "batches": total_batches,
+                },
+            },
+            phase_status={
+                "nuclei": {
+                    "status": "queued",
+                    "source": "discovered_assets",
+                    "expected_batches": total_batches,
+                    "targets_total": len(host_targets) + len(endpoint_targets),
+                    "host_targets": len(host_targets),
+                    "endpoint_targets": len(endpoint_targets),
+                }
+            },
+            total_tasks=total_batches,
+        )
+        self.db.add(scan)
+        await self.db.flush()
+
+        for batch in host_batches:
+            self.db.add(create_queue_event(
+                routing_key="scan.nuclei",
+                payload={
+                    "scan_id": str(scan.id),
+                    "org_id": str(org_id),
+                    "workspace_id": str(workspace_id),
+                    "targets": batch,
+                    "config": base_config,
+                },
+                priority=7,
+                headers={"coordinator": {"scan_id": str(scan.id), "nuclei_expected": 1, "screenshot_done": True}},
+                aggregate_type="scan",
+                aggregate_id=str(scan.id),
+            ))
+
+        for batch in endpoint_batches:
+            self.db.add(create_queue_event(
+                routing_key="scan.nuclei",
+                payload={
+                    "scan_id": str(scan.id),
+                    "org_id": str(org_id),
+                    "workspace_id": str(workspace_id),
+                    "targets": batch,
+                    "config": endpoint_config,
+                },
+                priority=7,
+                headers={"coordinator": {"scan_id": str(scan.id), "nuclei_expected": 1, "screenshot_done": True}},
+                aggregate_type="scan",
+                aggregate_id=str(scan.id),
+            ))
+
+        await self.db.commit()
+        await self.db.refresh(scan)
+        await dispatch_pending_outbox_once(limit=max(5, total_batches))
+        log.info(
+            "nuclei_asset_scan_queued",
+            scan_id=str(scan.id),
+            org_id=str(org_id),
+            hosts=len(host_targets),
+            endpoints=len(endpoint_targets),
+            batches=total_batches,
+        )
+        return scan
+
     async def create_and_queue(
         self,
         org_id: UUID,
@@ -211,7 +399,7 @@ class ScanService:
             **_policy_to_config(org_policy),
             **(config or {}),
         })
-        effective_config = _clamp_config(apply_scan_profile(effective_config, scan_type))
+        effective_config = _apply_runtime_caps(_clamp_config(apply_scan_profile(effective_config, scan_type)))
         if not effective_config.get("enrichment_enabled", True):
             scan_modules = [module for module in scan_modules if module != "enrich"]
 
@@ -240,6 +428,10 @@ class ScanService:
                         "domains": (org.domains or []) + (org.root_domains or []),
                         "ip_ranges": org.ip_ranges or [],
                         "asns": org.asns or [],
+                        "scope_allow_patterns": org.scope_allow_patterns or [],
+                        "scope_deny_patterns": org.scope_deny_patterns or [],
+                        "company_name": org.company_name,
+                        "organization_name": org.name,
                     },
                     "config": {
                         **effective_config,
@@ -259,3 +451,81 @@ class ScanService:
         log.info("scan_queued", scan_id=str(scan.id), scan_type=scan_type, org_id=str(org_id))
 
         return scan
+
+    async def _discovered_nuclei_hosts(
+        self,
+        *,
+        org_id: UUID,
+        workspace_id: UUID,
+        include_limited: bool,
+        limit: int,
+    ) -> List[str]:
+        liveness = ["alive"]
+        exposure = ["exposed"]
+        if include_limited:
+            exposure.append("limited")
+
+        result = await self.db.execute(
+            select(Asset.value)
+            .where(
+                Asset.org_id == org_id,
+                Asset.workspace_id == workspace_id,
+                Asset.deleted_at.is_(None),
+                Asset.status == "active",
+                Asset.asset_type == "subdomain",
+                Asset.is_in_scope.is_(True),
+                Asset.scope_status.in_(["in_scope", "probable"]),
+                Asset.liveness_status.in_(liveness),
+                Asset.exposure_status.in_(exposure),
+            )
+            .order_by(Asset.criticality.desc(), Asset.last_seen.desc())
+            .limit(max(1, min(int(limit), 500)))
+        )
+        return [value for value in result.scalars().all() if value]
+
+    async def _discovered_nuclei_endpoints(
+        self,
+        *,
+        org_id: UUID,
+        workspace_id: UUID,
+        limit: int,
+    ) -> List[str]:
+        result = await self.db.execute(
+            select(WebEndpoint.url)
+            .where(
+                WebEndpoint.org_id == org_id,
+                WebEndpoint.workspace_id == workspace_id,
+                WebEndpoint.status_class.in_(["ok", "redirect", "auth_required", "server_error", "rate_limited"]),
+                or_(
+                    WebEndpoint.is_interesting.is_(True),
+                    WebEndpoint.has_params.is_(True),
+                    WebEndpoint.is_api.is_(True),
+                    WebEndpoint.is_auth.is_(True),
+                ),
+            )
+            .order_by(
+                WebEndpoint.is_interesting.desc(),
+                WebEndpoint.has_params.desc(),
+                WebEndpoint.is_auth.desc(),
+                WebEndpoint.is_api.desc(),
+                WebEndpoint.last_seen.desc(),
+            )
+            .limit(max(1, min(int(limit), 500)))
+        )
+        return [url for url in result.scalars().all() if url]
+
+
+def _chunks(values: List[str], size: int) -> List[List[str]]:
+    return [values[i:i + size] for i in range(0, len(values), size)]
+
+
+def _dedupe_preserve_order(values: List[str]) -> List[str]:
+    seen = set()
+    deduped = []
+    for value in values:
+        normalized = str(value or "").strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+    return deduped

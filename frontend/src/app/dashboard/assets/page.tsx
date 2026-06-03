@@ -38,6 +38,7 @@ export default function AssetsPage() {
   const [typeFilter, setTypeFilter]   = useState<string>("");
   const [statusFilter, setStatusFilter] = useState<string>("active");
   const [httpStatusFilter, setHttpStatusFilter] = useState<string>("");
+  const [reviewFilter, setReviewFilter] = useState<string>("");
   const [search, setSearch]           = useState("");
   const [page, setPage]               = useState(1);
   const [selected, setSelected]       = useState<any>(null);
@@ -49,9 +50,10 @@ export default function AssetsPage() {
     if (typeFilter)    p.set("asset_type", typeFilter);
     if (statusFilter)  p.set("status", statusFilter);
     if (httpStatusFilter) p.set("http_status_class", httpStatusFilter);
+    if (reviewFilter) p.set("review_status", reviewFilter);
     if (search)        p.set("search", search);
     return p.toString();
-  }, [page, typeFilter, statusFilter, httpStatusFilter, search, activeOrg?.id]);
+  }, [page, typeFilter, statusFilter, httpStatusFilter, reviewFilter, search, activeOrg?.id]);
 
   const { data, isLoading, refetch } = useQuery({
     queryKey: ["assets", params],
@@ -161,6 +163,14 @@ export default function AssetsPage() {
           <option value="server_error">Server Error</option>
           <option value="probe_failed">Probe Failed</option>
         </select>
+        <select value={reviewFilter} onChange={e => { setReviewFilter(e.target.value); setPage(1); }}
+          className="px-3 py-1.5 text-sm bg-surface-800 border border-border rounded-lg text-foreground focus:outline-none focus:ring-1 focus:ring-brand-500">
+          <option value="">All reviews</option>
+          <option value="pending">Pending Review</option>
+          <option value="approved">Approved</option>
+          <option value="rejected">Rejected</option>
+          <option value="none">No Review</option>
+        </select>
       </div>
 
       {/* Asset table */}
@@ -259,6 +269,9 @@ function AssetRow({ asset, onClick }: { asset: any; onClick: (a: any) => void })
           <div className="flex flex-wrap gap-1">
             <ValidationPill value={asset.scope_status || "unknown"} />
             <ValidationPill value={asset.liveness_status || "unknown"} compact />
+            {asset.review_status && asset.review_status !== "none" && (
+              <ValidationPill value={asset.review_status} compact />
+            )}
           </div>
         </div>
       </td>
@@ -344,10 +357,11 @@ function ValidationPill({ value, compact = false }: { value: string; compact?: b
   const normalized = value.replaceAll("_", " ");
   const className =
     value === "in_scope" || value === "alive" || value === "exposed"
+      || value === "approved"
       ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
-      : value === "probable" || value === "limited" || value === "dns_only"
+      : value === "probable" || value === "limited" || value === "dns_only" || value === "pending"
         ? "bg-amber-500/10 text-amber-400 border-amber-500/20"
-        : value === "out_of_scope" || value === "unresolved" || value === "not_exposed"
+        : value === "out_of_scope" || value === "unresolved" || value === "not_exposed" || value === "rejected"
           ? "bg-red-500/10 text-red-400 border-red-500/20"
           : "bg-surface-700 text-muted-foreground border-border";
 

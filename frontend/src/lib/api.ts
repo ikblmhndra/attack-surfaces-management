@@ -197,6 +197,8 @@ export const assetsAPI = {
   getTechnologies: (id: string) => api.get(`/assets/${id}/technologies`),
   getScreenshots: (id: string) => api.get(`/assets/${id}/screenshots`),
   getIntel: (id: string) => api.get(`/assets/${id}/intel`),
+  review: (id: string, data: { decision: "approve" | "reject" | "needs_review"; note?: string }) =>
+    api.post(`/assets/${id}/review`, data),
 };
 
 export const findingsAPI = {

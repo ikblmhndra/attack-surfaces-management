@@ -69,6 +69,8 @@ export interface Organization {
   is_monitoring_active: boolean;
   auto_scan_enabled:   boolean;
   scan_policy?:        Record<string, any>;
+  scope_allow_patterns?: string[];
+  scope_deny_patterns?:  string[];
   last_scan_at?:       string;
   current_score?:      OrgScoreSummary;
   risk_score?:         OrgRiskScore;
@@ -144,6 +146,10 @@ export interface Asset {
   liveness_status?: "alive" | "dns_only" | "unresolved" | "unknown";
   validation_sources?: Record<string, any>;
   last_verified_at?: string;
+  review_status?:    "none" | "pending" | "approved" | "rejected";
+  reviewed_by?:      string;
+  reviewed_at?:      string;
+  review_note?:      string;
   tags:             string[];
   criticality:      number;
   environment?:     string;
@@ -182,6 +188,7 @@ export interface IPDetail {
   version:        4 | 6;
   asn?:           string;
   asn_org?:       string;
+  asn_country?:   string;
   country_code?:  string;
   country_name?:  string;
   city?:          string;
