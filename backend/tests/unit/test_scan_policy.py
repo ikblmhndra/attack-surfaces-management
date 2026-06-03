@@ -71,7 +71,12 @@ def test_target_candidate_builder_routes_by_http_status():
     candidates = build_target_candidates(
         subdomains=["app.example.com", "login.example.com", "old.example.com", "missing.example.com"],
         ips=["192.0.2.10", "192.0.2.10", "192.0.2.11"],
-        config={"scan_type": "full", "scan_profile": "deep_authorized", "crawl": True},
+        config={
+            "scan_type": "full",
+            "scan_profile": "deep_authorized",
+            "crawl": True,
+            "enforce_scope_validation": False,
+        },
         alive_hosts={
             "app.example.com": {
                 "url": "https://app.example.com",
@@ -103,3 +108,57 @@ def test_target_candidate_builder_routes_by_http_status():
     assert candidates["crawl_targets"][0]["url"] == "https://app.example.com"
     assert candidates["tech_map"]["https://app.example.com"] == ["Next.js:14.2.3"]
     assert candidates["summary"]["skipped_by_status"] == {"not_found": 1}
+
+
+def test_target_candidate_builder_gates_failed_validation():
+    candidates = build_target_candidates(
+        subdomains=["app.example.com", "other.example.net"],
+        ips=[],
+        config={"scan_type": "full", "scan_profile": "deep_authorized", "crawl": True},
+        alive_hosts={
+            "app.example.com": {
+                "url": "https://app.example.com",
+                "status_code": 200,
+                "status_class": "ok",
+                "validation": {
+                    "scope_status": "in_scope",
+                    "liveness_status": "alive",
+                    "ownership_confidence": 0.9,
+                },
+            },
+            "other.example.net": {
+                "url": "https://other.example.net",
+                "status_code": 200,
+                "status_class": "ok",
+                "validation": {
+                    "scope_status": "out_of_scope",
+                    "liveness_status": "alive",
+                    "ownership_confidence": 0.2,
+                },
+            },
+        },
+    )
+
+    assert candidates["web_standard_targets"] == ["app.example.com"]
+    assert candidates["validation_skipped_targets"][0]["host"] == "other.example.net"
+    assert candidates["summary"]["skipped_by_validation"] == {"scope_out_of_scope": 1}
+
+
+def test_target_candidate_builder_reports_dns_only_validation():
+    candidates = build_target_candidates(
+        subdomains=["dns-only.example.com"],
+        ips=[],
+        config={"scan_type": "full", "scan_profile": "deep_authorized", "crawl": True},
+        alive_hosts={},
+        validation_by_host={
+            "dns-only.example.com": {
+                "scope_status": "in_scope",
+                "liveness_status": "dns_only",
+                "ownership_confidence": 0.7,
+            }
+        },
+    )
+
+    assert candidates["web_standard_targets"] == []
+    assert candidates["summary"]["skipped_by_validation"] == {"liveness_dns_only": 1}
+    assert candidates["validation_skipped_targets"][0]["reason"] == "liveness_dns_only"

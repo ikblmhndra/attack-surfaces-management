@@ -30,6 +30,16 @@ Last updated: 2026-06-03.
   - [x] Added initial "Why No Findings" explanations using phase state and target coverage.
   - [x] Runtime migration was applied successfully with `make migrate`.
   - [x] Docker rebuild/recreate was completed for API, frontend, discovery, crawl, and nuclei workers.
+- [x] **Milestone 2: Asset Validation and Scope Confidence - initial implementation**
+  - [x] Added asset validation fields for scope, ownership confidence, liveness, exposure, validation evidence, and last verified timestamp.
+  - [x] Added Alembic migration `009_asset_validation` with historical backfill for existing subdomain/IP assets.
+  - [x] Added deterministic `asset_validation` service for DNS, HTTP, TLS, redirect, and root-domain evidence.
+  - [x] Discovery now validates alive hosts before persistence and downstream target selection.
+  - [x] Downstream target candidate selection gates active web/crawl/screenshot scans on validation by default.
+  - [x] Port-discovered IP assets receive baseline validation state.
+  - [x] Scan target selections record validation-gated skipped targets.
+  - [x] Scan detail "Why No Findings" can explain validation-gated targets.
+  - [x] Asset API and UI now expose validation state and evidence.
 
 ### Partially Complete
 
@@ -57,11 +67,16 @@ Last updated: 2026-06-03.
   - [x] Safety-policy template exclusions.
   - [x] Endpoint budget cap reached.
   - [x] Scan errors present.
-  - [ ] Future reasons should be added after asset validation and scanner expansion, especially validation-gated targets and no eligible scanner profile.
+  - [x] Validation-gated targets.
+  - [ ] Future reasons should be added after scanner expansion, especially no eligible scanner profile.
+- [ ] Milestone 2 follow-ups that are intentionally not in the initial implementation.
+  - [ ] Add a dedicated `asset.validate` queue and worker for periodic revalidation.
+  - [ ] Add RDAP/ASN ownership evidence and confidence scoring.
+  - [ ] Add organization-level allow/deny pattern controls beyond root domains.
+  - [ ] Add explicit analyst review workflow for `needs_review` assets.
 
 ### Not Started
 
-- [ ] Milestone 2: Asset Validation and Scope Confidence.
 - [ ] Milestone 3: Discovery Engine V2.
 - [ ] Milestone 4: Endpoint Intelligence V2.
 - [ ] Milestone 5: Scanner Coverage Expansion.
@@ -742,14 +757,19 @@ Acceptance:
 ### Milestone 2: Asset Validation and Scope Confidence
 
 Scope:
-- Add asset validation worker.
-- Add ownership confidence and exposure/liveness fields.
-- Validate DNS, HTTP, TLS, RDAP/ASN, redirect ownership.
-- Block low-confidence/out-of-scope assets from active scanning by default.
+- [x] Add ownership confidence and exposure/liveness fields.
+- [x] Validate DNS, HTTP, TLS, redirect ownership, and organization root-domain evidence during discovery.
+- [x] Block low-confidence/out-of-scope assets from active scanning by default.
+- [x] Persist validation evidence and show it in asset API/UI.
+- [x] Backfill existing assets from historical subdomain/IP state.
+- [ ] Add asset validation worker for periodic revalidation.
+- [ ] Add RDAP/ASN ownership evidence.
+- [ ] Add analyst review workflow for `needs_review` assets.
 
 Acceptance:
-- Assets show in-scope/out-of-scope/needs-review.
-- Downstream scan target selection uses validation state.
+- [x] Assets show in-scope/out-of-scope/needs-review.
+- [x] Downstream scan target selection uses validation state.
+- [x] Scan detail records validation-gated skipped targets.
 
 ### Milestone 3: Discovery Engine V2
 

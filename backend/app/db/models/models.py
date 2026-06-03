@@ -217,6 +217,15 @@ class Asset(TimestampMixin, SoftDeleteMixin, Base):
     discovery_method = Column(String(100), nullable=True)
     confidence = Column(Float, nullable=False, default=1.0)
 
+    # Validation and scope confidence
+    scope_status = Column(String(50), nullable=False, default="in_scope", index=True)
+    ownership_confidence = Column(Float, nullable=False, default=1.0)
+    ownership_reason = Column(String(255), nullable=True)
+    exposure_status = Column(String(50), nullable=False, default="unknown")
+    liveness_status = Column(String(50), nullable=False, default="unknown", index=True)
+    validation_sources = Column(JSONB, nullable=False, default=dict)
+    last_verified_at = Column(DateTime(timezone=True), nullable=True, index=True)
+
     # Tracking
     first_seen = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     last_seen = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

@@ -254,7 +254,13 @@ function AssetRow({ asset, onClick }: { asset: any; onClick: (a: any) => void })
         </div>
       </td>
       <td>
-        <span className="text-xs capitalize text-muted-foreground">{asset.asset_type}</span>
+        <div className="flex flex-col gap-1">
+          <span className="text-xs capitalize text-muted-foreground">{asset.asset_type}</span>
+          <div className="flex flex-wrap gap-1">
+            <ValidationPill value={asset.scope_status || "unknown"} />
+            <ValidationPill value={asset.liveness_status || "unknown"} compact />
+          </div>
+        </div>
       </td>
       <td><StatusBadge status={asset.status} /></td>
       <td>
@@ -330,6 +336,24 @@ function HttpStatusBadge({ status, statusClass }: { status?: number; statusClass
     <span className={cn("inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-xs font-medium", cfg.className)}>
       <span className="font-mono">{status || "—"}</span>
       <span>{cfg.label}</span>
+    </span>
+  );
+}
+
+function ValidationPill({ value, compact = false }: { value: string; compact?: boolean }) {
+  const normalized = value.replaceAll("_", " ");
+  const className =
+    value === "in_scope" || value === "alive" || value === "exposed"
+      ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
+      : value === "probable" || value === "limited" || value === "dns_only"
+        ? "bg-amber-500/10 text-amber-400 border-amber-500/20"
+        : value === "out_of_scope" || value === "unresolved" || value === "not_exposed"
+          ? "bg-red-500/10 text-red-400 border-red-500/20"
+          : "bg-surface-700 text-muted-foreground border-border";
+
+  return (
+    <span className={cn("text-[10px] border rounded px-1.5 py-0.5 capitalize", className)}>
+      {compact ? normalized.replace(" ", "") : normalized}
     </span>
   );
 }

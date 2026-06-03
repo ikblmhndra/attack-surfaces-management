@@ -6,6 +6,16 @@ All notable changes to this project are documented below, sorted newest-first.
 
 ## 2026-06-03 — Scan Pipeline Progress and Result UI
 
+### Added: Asset validation and scope confidence milestone
+- **Files**: `backend/app/db/migrations/versions/009_asset_validation.py`, `backend/app/db/models/models.py`, `backend/app/services/asset_validation.py`, `backend/app/services/scan_profiles.py`, `workers/scanner/discovery_worker.py`, `workers/scanner/port_worker.py`, `backend/app/api/v1/endpoints/assets.py`, `backend/app/api/v1/endpoints/scans.py`, `frontend/src/app/dashboard/assets/page.tsx`, `frontend/src/app/dashboard/assets/[id]/page.tsx`
+- Added asset validation fields for `scope_status`, `ownership_confidence`, `ownership_reason`, `exposure_status`, `liveness_status`, validation evidence, and last verified timestamp.
+- Discovery now validates hosts with DNS, HTTP, TLS, redirect, and organization root-domain evidence before persisting assets.
+- Target selection now gates downstream nuclei/crawl/screenshot candidates on validation state by default and records skipped validation targets in scan target selections.
+- Targeting now carries DNS-only validation evidence for resolved but non-live hosts, replacing generic `missing_validation` skips with actionable liveness reasons.
+- Port-discovered IP assets now receive baseline validation state and evidence.
+- Asset list/detail APIs and UI now expose validation state, confidence, and evidence reasons.
+- Existing assets were backfilled with historical validation state from subdomain/IP data.
+
 ### Added: Durable scan observability milestone
 - **Files**: `backend/app/db/migrations/versions/008_scan_observability.py`, `backend/app/db/models/models.py`, `workers/scan_phase.py`, `workers/scan_observability.py`, `workers/scanner/discovery_worker.py`, `workers/crawler/web_crawl_worker.py`, `workers/scanner/nuclei_worker.py`, `backend/app/api/v1/endpoints/scans.py`, `frontend/src/app/dashboard/scans/[id]/page.tsx`
 - Added durable `scan_phase_runs` and `scan_target_selections` tables for phase timelines, target coverage, and selected/skipped target evidence.
@@ -16,6 +26,10 @@ All notable changes to this project are documented below, sorted newest-first.
 - Completed the remaining Milestone 1 observability gaps for current workers: port, screenshot, and enrichment now record target selections; screenshot/enrichment phase summaries include success/failed counts; correlation now writes intermediate and terminal phase summaries.
 - Expanded no-finding explanations for completed nuclei with no findings, active safety exclusions, endpoint budget caps, and recorded scan errors.
 - Fixed scan target selection upserts to merge duplicate targets within a batch before `ON CONFLICT`, preventing DiscoveryWorker cardinality violations and retry exhaustion.
+- Sanitized nuclei finding text/JSON evidence before persistence so binary responses, such as favicons containing NUL bytes, no longer break PostgreSQL inserts.
+- Nuclei batches that time out with no parsed findings now record a phase warning and complete as partial coverage instead of raising worker exceptions and retrying until scan failure.
+- Suppressed low-value info-level nuclei findings such as technology, favicon, WAF, fingerprint, and WordPress plugin detection so they do not pollute vulnerability results by default.
+- Bounded nuclei runtime by lowering deep/endpoint batch sizes, capping endpoint nuclei target budgets, and enforcing worker-side maximum batch timeouts for stale scan configs.
 
 ### Fixed: Accurate nuclei and crawl task accounting
 - **Files**: `workers/task_coordinator.py`, `workers/crawler/web_crawl_worker.py`, `workers/scanner/nuclei_worker.py`

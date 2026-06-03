@@ -81,6 +81,9 @@ async def list_assets(
     has_findings: Optional[bool] = Query(None),
     technology: Optional[str] = Query(None),
     http_status_class: Optional[str] = Query(None, description="ok,redirect,auth_required,not_found,rate_limited,server_error,other"),
+    scope_status: Optional[str] = Query(None, description="in_scope,probable,needs_review,out_of_scope"),
+    liveness_status: Optional[str] = Query(None, description="alive,dns_only,unresolved,unknown"),
+    exposure_status: Optional[str] = Query(None, description="exposed,limited,not_exposed,unknown"),
     cdn_only: Optional[bool] = Query(None),
     cloud_provider: Optional[str] = Query(None),
     criticality: Optional[int] = Query(None, ge=1, le=5),
@@ -106,6 +109,12 @@ async def list_assets(
         query = query.where(Asset.status == status)
     if criticality:
         query = query.where(Asset.criticality == criticality)
+    if scope_status:
+        query = query.where(Asset.scope_status == scope_status)
+    if liveness_status:
+        query = query.where(Asset.liveness_status == liveness_status)
+    if exposure_status:
+        query = query.where(Asset.exposure_status == exposure_status)
     if tags:
         tag_list = [t.strip() for t in tags.split(",")]
         query = query.where(Asset.tags.overlap(tag_list))
@@ -532,6 +541,13 @@ def _asset_to_dict(asset, sub=None, ip=None, detailed=False) -> dict:
         "asset_type": asset.asset_type,
         "value": asset.value,
         "status": asset.status,
+        "scope_status": asset.scope_status,
+        "ownership_confidence": asset.ownership_confidence,
+        "ownership_reason": asset.ownership_reason,
+        "exposure_status": asset.exposure_status,
+        "liveness_status": asset.liveness_status,
+        "validation_sources": asset.validation_sources or {},
+        "last_verified_at": asset.last_verified_at.isoformat() if asset.last_verified_at else None,
         "tags": asset.tags or [],
         "criticality": asset.criticality,
         "environment": asset.environment,

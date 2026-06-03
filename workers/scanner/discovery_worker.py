@@ -26,6 +26,7 @@ from workers.scan_observability import record_target_selections
 from workers.scan_phase import update_scan_phase
 from workers.scan_state import mark_scan_running
 from app.services.scan_profiles import build_target_candidates, child_profile_config
+from app.services.asset_validation import should_scan_validated_asset, validate_discovered_host
 
 log = structlog.get_logger()
 
@@ -171,6 +172,16 @@ class DiscoveryWorker(BaseWorker):
 
             # ── Phase 3: HTTP Probing ─────────────────────────
             alive_hosts = await self._probe_http(list(resolved.keys()), tmpdir, config)
+            validation_by_host = {}
+            for host, dns_info in resolved.items():
+                validation_by_host[host] = validate_discovered_host(
+                    host=host,
+                    root_domains=targets.get("domains", []),
+                    dns_info=dns_info,
+                    http_info=alive_hosts.get(host, {}),
+                )
+            for host, http_data in alive_hosts.items():
+                http_data["validation"] = validation_by_host.get(host)
             log.info("http_probed", alive=len(alive_hosts))
 
             # ── Phase 4: Persist Assets ───────────────────────
@@ -193,7 +204,16 @@ class DiscoveryWorker(BaseWorker):
 
             # ── Phase 5: Queue downstream tasks ───────────────
             all_ips = set()
-            for host, dns_data in resolved.items():
+            eligible_hosts = {
+                host
+                for host, info in alive_hosts.items()
+                if should_scan_validated_asset(
+                    info.get("validation"),
+                    require_validation=bool(config.get("enforce_scope_validation", True)),
+                )
+            }
+            for host in eligible_hosts:
+                dns_data = resolved.get(host, {})
                 all_ips.update(dns_data.get("a", []))
                 all_ips.update(dns_data.get("aaaa", []))
 
@@ -204,6 +224,7 @@ class DiscoveryWorker(BaseWorker):
                 subdomains=list(all_subdomains),
                 ips=list(all_ips),
                 alive_hosts=alive_hosts,
+                validation_by_host=validation_by_host,
                 tmpdir=tmpdir,
                 config=config,
             )
@@ -770,6 +791,7 @@ class DiscoveryWorker(BaseWorker):
         now = datetime.now(timezone.utc)
 
         for host, http_data in alive_hosts.items():
+            validation = http_data.get("validation") or {}
             # Upsert Asset
             asset_values = {
                 "org_id": org_id,
@@ -778,14 +800,39 @@ class DiscoveryWorker(BaseWorker):
                 "value": host,
                 "status": "active",
                 "discovery_method": "automated",
+                "confidence": validation.get("confidence", 1.0),
+                "is_in_scope": validation.get("is_in_scope", True),
+                "scope_status": validation.get("scope_status", "in_scope"),
+                "ownership_confidence": validation.get("ownership_confidence", 1.0),
+                "ownership_reason": validation.get("ownership_reason"),
+                "exposure_status": validation.get("exposure_status", "unknown"),
+                "liveness_status": validation.get("liveness_status", "alive"),
+                "validation_sources": validation.get("validation_sources", {}),
+                "last_verified_at": validation.get("last_verified_at", now),
                 "last_seen": now,
-                "metadata": {"source": "discovery_worker"},
+                "metadata": {
+                    "source": "discovery_worker",
+                    "validation": validation.get("validation_sources", {}),
+                },
             }
 
             stmt = pg_insert(Asset.__table__).values(**asset_values)
             stmt = stmt.on_conflict_do_update(
                 constraint="uq_asset_org_type_value",
-                set_={"last_seen": now, "status": "active"},
+                set_={
+                    "last_seen": now,
+                    "status": "active",
+                    "confidence": asset_values["confidence"],
+                    "is_in_scope": asset_values["is_in_scope"],
+                    "scope_status": asset_values["scope_status"],
+                    "ownership_confidence": asset_values["ownership_confidence"],
+                    "ownership_reason": asset_values["ownership_reason"],
+                    "exposure_status": asset_values["exposure_status"],
+                    "liveness_status": asset_values["liveness_status"],
+                    "validation_sources": asset_values["validation_sources"],
+                    "last_verified_at": asset_values["last_verified_at"],
+                    "metadata": asset_values["metadata"],
+                },
             ).returning(Asset.__table__.c.id, Asset.__table__.c.first_seen)
 
             result = await db.execute(stmt)
@@ -898,6 +945,7 @@ class DiscoveryWorker(BaseWorker):
         config: Dict,
         direct_targets: Optional[List[str]] = None,
         alive_hosts: Optional[Dict[str, Dict]] = None,
+        validation_by_host: Optional[Dict[str, Dict]] = None,
         tmpdir: Optional[Path] = None,
     ) -> None:
         """Publish port scan and nuclei tasks for discovered assets."""
@@ -916,6 +964,7 @@ class DiscoveryWorker(BaseWorker):
             ips=ips,
             direct_targets=direct_targets,
             alive_hosts=alive_hosts,
+            validation_by_host=validation_by_host,
             config=config,
         )
 
@@ -1093,6 +1142,25 @@ class DiscoveryWorker(BaseWorker):
                 "selected": True,
                 "reasons": ["screenshot_candidate"],
                 "metadata": {"downstream_phase": "screenshot"},
+            })
+        for target in candidates.get("validation_skipped_targets") or []:
+            validation = target.get("validation") or {}
+            rows.append({
+                "target": target.get("host"),
+                "target_type": "host",
+                "profile": profile,
+                "selected": False,
+                "reasons": ["validation_gate"],
+                "skip_reason": target.get("reason") or "validation_gate",
+                "metadata": {
+                    "downstream_phase": "targeting",
+                    "scope_status": validation.get("scope_status"),
+                    "liveness_status": validation.get("liveness_status"),
+                    "exposure_status": validation.get("exposure_status"),
+                    "ownership_confidence": validation.get("ownership_confidence"),
+                    "ownership_reason": validation.get("ownership_reason"),
+                    "validation_reasons": (validation.get("validation_sources") or {}).get("reasons", []),
+                },
             })
         return rows
 

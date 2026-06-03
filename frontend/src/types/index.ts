@@ -137,6 +137,13 @@ export interface Asset {
   asset_type:       AssetType;
   value:            string;
   status:           "active" | "inactive";
+  scope_status?:    "in_scope" | "probable" | "needs_review" | "out_of_scope";
+  ownership_confidence?: number;
+  ownership_reason?: string;
+  exposure_status?: "exposed" | "limited" | "not_exposed" | "unknown" | "unknown_http";
+  liveness_status?: "alive" | "dns_only" | "unresolved" | "unknown";
+  validation_sources?: Record<string, any>;
+  last_verified_at?: string;
   tags:             string[];
   criticality:      number;
   environment?:     string;

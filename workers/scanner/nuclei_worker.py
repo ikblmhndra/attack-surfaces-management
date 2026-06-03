@@ -55,6 +55,45 @@ CATEGORY_MAP = {
 
 # Template severity allow-list (don't run info templates by default)
 DEFAULT_SEVERITIES = ["critical", "high", "medium", "low"]
+MAX_RAW_FIELD_CHARS = 10000
+MAX_RESPONSE_RAW_CHARS = 5000
+MAX_BATCH_TIMEOUT = int(os.getenv("NUCLEI_MAX_BATCH_TIMEOUT", "600"))
+MAX_ENDPOINT_BATCH_TIMEOUT = int(os.getenv("NUCLEI_ENDPOINT_MAX_BATCH_TIMEOUT", "300"))
+
+NOISY_INFO_TEMPLATE_IDS = {
+    "favicon-detect",
+    "fingerprinthub-web-fingerprints",
+    "metatag-cms",
+    "php-detect",
+    "tech-detect",
+    "waf-detect",
+    "wordpress-detect",
+    "wordpress-passive-detection",
+    "wordpress-plugin-detect",
+}
+
+WORDPRESS_INFO_ALLOWLIST = {
+    "wordpress-eol",
+    "wordpress-rdf-user-enum",
+    "wordpress-readme-file",
+}
+
+INFO_SECURITY_KEYWORDS = {
+    "debug",
+    "default",
+    "disclosure",
+    "eol",
+    "end-of-life",
+    "exposed",
+    "hsts",
+    "license",
+    "manager",
+    "readme",
+    "stacktrace",
+    "takeover",
+    "user-enum",
+    "weak",
+}
 
 TECH_TAG_ALIASES = {
     "apache http server": "apache",
@@ -192,14 +231,49 @@ class NucleiWorker(BaseWorker):
 
                 findings = [self._parse_finding(f, org_id, workspace_id, scan_id) for f in findings_raw]
                 findings = [f for f in findings if f is not None]
+                suppressed_count = 0
+                if not config.get("nuclei_persist_info_findings", False):
+                    before_filter = len(findings)
+                    findings = [f for f in findings if not self._is_low_value_info_finding(f)]
+                    suppressed_count = before_filter - len(findings)
+
+                if suppressed_count:
+                    log.info(
+                        "nuclei_info_findings_suppressed",
+                        count=suppressed_count,
+                        scan_id=scan_id,
+                    )
+                    async with get_session() as db:
+                        await update_scan_phase(
+                            db,
+                            scan_id,
+                            "nuclei",
+                            "running",
+                            suppressed_info_findings=suppressed_count,
+                        )
 
                 async with get_session() as db:
                     persisted = await self._persist_findings(db, findings, scan_id)
                     await self._update_scan_findings_count(db, scan_id, len(persisted))
             else:
                 if timed_out:
-                    raise RuntimeError(f"nuclei timed out after {config.get('scan_timeout', 600)}s with no parsed findings")
-                log.info("nuclei_no_findings", scan_id=scan_id, targets=len(targets))
+                    log.warning(
+                        "nuclei_timeout_no_findings",
+                        scan_id=scan_id,
+                        targets=len(targets),
+                        timeout=config.get("scan_timeout", 600),
+                    )
+                    async with get_session() as db:
+                        await update_scan_phase(
+                            db,
+                            scan_id,
+                            "nuclei",
+                            "running",
+                            warnings=1,
+                            last_warning="nuclei_timeout_no_findings",
+                        )
+                else:
+                    log.info("nuclei_no_findings", scan_id=scan_id, targets=len(targets))
 
             async with get_session() as db:
                 await self._mark_nuclei_task_complete(db, scan_id)
@@ -245,9 +319,20 @@ class NucleiWorker(BaseWorker):
         rate_limit = config.get("rate_limit", self.RATE_LIMIT)
         bulk_size = config.get("bulk_size", 10)
         concurrency = config.get("concurrency", 10)
-        template_timeout = int(config.get("template_timeout", 8))
+        template_timeout = min(int(config.get("template_timeout", 8)), 8)
         retries = int(config.get("retries", 0))
         scan_timeout = int(config.get("scan_timeout", 900))
+        profile_name = str(config.get("scan_profile") or config.get("vuln_depth") or "")
+        timeout_cap = MAX_ENDPOINT_BATCH_TIMEOUT if profile_name == "endpoint" else MAX_BATCH_TIMEOUT
+        if scan_timeout > timeout_cap:
+            log.info(
+                "nuclei_timeout_capped",
+                requested=scan_timeout,
+                capped=timeout_cap,
+                profile=profile_name or "default",
+                scan_id=scan_id,
+            )
+            scan_timeout = timeout_cap
         response_size_read = int(config.get("nuclei_response_size_read", 1048576))
         response_size_save = int(config.get("nuclei_response_size_save", 262144))
         nuclei_path = shutil.which("nuclei") or "/go/bin/nuclei"
@@ -391,7 +476,7 @@ class NucleiWorker(BaseWorker):
         """Parse nuclei JSON output, including partial files after timeout."""
         results = []
         if output_file.exists():
-            for line in output_file.read_text().splitlines():
+            for line in output_file.read_text(errors="replace").splitlines():
                 line = line.strip()
                 if not line:
                     continue
@@ -446,10 +531,10 @@ class NucleiWorker(BaseWorker):
             ).hexdigest()
 
             # Evidence
-            request_raw = raw.get("request", "")
-            response_raw = raw.get("response", "")
-            if len(response_raw) > 5000:
-                response_raw = response_raw[:5000] + "\n... [truncated]"
+            request_raw = self._clean_text(raw.get("request", ""), limit=MAX_RAW_FIELD_CHARS)
+            response_raw = self._clean_text(raw.get("response", ""), limit=MAX_RESPONSE_RAW_CHARS)
+            if isinstance(raw.get("response", ""), str) and len(raw.get("response", "")) > MAX_RESPONSE_RAW_CHARS:
+                response_raw = f"{response_raw}\n... [truncated]"
 
             # References
             references = template_info.get("reference", [])
@@ -460,21 +545,24 @@ class NucleiWorker(BaseWorker):
                 "org_id": org_id,
                 "workspace_id": workspace_id,
                 "scan_id": scan_id,
-                "title": template_info.get("name", template_id)[:500],
-                "description": template_info.get("description", "")[:5000],
+                "title": self._clean_text(template_info.get("name", template_id), limit=500),
+                "description": self._clean_text(template_info.get("description", ""), limit=5000),
                 "severity": severity,
                 "category": category,
                 "source": "nuclei",
-                "template_id": template_id[:255],
-                "template_url": f"https://github.com/projectdiscovery/nuclei-templates/blob/main/{template_id}.yaml",
+                "template_id": self._clean_text(template_id, limit=255),
+                "template_url": self._clean_text(
+                    f"https://github.com/projectdiscovery/nuclei-templates/blob/main/{template_id}.yaml",
+                    limit=1000,
+                ),
                 "scanner": "nuclei",
-                "cve_ids": cve_ids[:10],
+                "cve_ids": [self._clean_text(cve_id, limit=100) for cve_id in cve_ids[:10]],
                 "cvss_score": float(cvss_score) if cvss_score else None,
-                "affected_url": matched[:1000],
-                "evidence": f"Template: {template_id}\nMatch: {matched}",
-                "request_raw": request_raw[:10000],
-                "response_raw": response_raw[:10000],
-                "proof": {
+                "affected_url": self._clean_text(matched, limit=1000),
+                "evidence": self._clean_text(f"Template: {template_id}\nMatch: {matched}", limit=5000),
+                "request_raw": request_raw,
+                "response_raw": response_raw,
+                "proof": self._clean_json({
                     "matched_at": matched,
                     "matcher_name": raw.get("matcher-name", ""),
                     "extracted_results": raw.get("extracted-results", []),
@@ -483,9 +571,9 @@ class NucleiWorker(BaseWorker):
                     "timestamp": raw.get("timestamp", ""),
                     "template_id": template_id,
                     "tags": tags,
-                },
-                "remediation": template_info.get("remediation", "")[:5000],
-                "references": references[:20],
+                }),
+                "remediation": self._clean_text(template_info.get("remediation", ""), limit=5000),
+                "references": [self._clean_text(ref, limit=1000) for ref in references[:20]],
                 "fingerprint": fingerprint,
                 "status": "open",
                 "first_seen": datetime.now(timezone.utc),
@@ -494,6 +582,55 @@ class NucleiWorker(BaseWorker):
         except Exception as e:
             log.warning("finding_parse_error", error=str(e))
             return None
+
+    def _clean_text(self, value: Any, *, limit: int) -> str:
+        """Return Postgres-safe text from tool output."""
+        if value is None:
+            return ""
+        if not isinstance(value, str):
+            value = str(value)
+        cleaned = value.replace("\x00", "")
+        cleaned = "".join(
+            char if char in {"\n", "\r", "\t"} or ord(char) >= 32 else " "
+            for char in cleaned
+        )
+        return cleaned[:limit]
+
+    def _clean_json(self, value: Any) -> Any:
+        """Recursively remove values PostgreSQL JSONB cannot store."""
+        if isinstance(value, dict):
+            return {self._clean_text(k, limit=500): self._clean_json(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._clean_json(item) for item in value]
+        if isinstance(value, str):
+            return self._clean_text(value, limit=10000)
+        return value
+
+    def _is_low_value_info_finding(self, finding: Dict[str, Any]) -> bool:
+        """Suppress technology inventory signals that should not become findings."""
+        if finding.get("severity") != "info":
+            return False
+
+        template_id = str(finding.get("template_id") or "").lower()
+        title = str(finding.get("title") or "").lower()
+        tags = [
+            str(tag).lower()
+            for tag in (finding.get("proof") or {}).get("tags", [])
+            if tag
+        ]
+        haystack = " ".join([template_id, title, *tags])
+
+        if template_id in WORDPRESS_INFO_ALLOWLIST:
+            return False
+        if any(keyword in haystack for keyword in INFO_SECURITY_KEYWORDS):
+            return False
+        if template_id in NOISY_INFO_TEMPLATE_IDS:
+            return True
+        if template_id.startswith("wordpress-"):
+            return True
+        if any(tag in {"tech", "favicon", "waf", "wordpress", "plugin", "fingerprint"} for tag in tags):
+            return True
+        return finding.get("category") == "exposed_service"
 
     def _map_category(self, template_id: str, tags: List[str]) -> str:
         """Map nuclei template to platform finding category."""

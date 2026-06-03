@@ -153,6 +153,40 @@ export default function AssetDetailPage() {
           {/* Tab content */}
           {activeTab === "overview" && (
             <div className="space-y-4">
+              <div className="glass-card p-5 space-y-3">
+                <h2 className="text-sm font-semibold text-foreground">Validation</h2>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                  <ValidationMetric label="Scope" value={asset.scope_status || "unknown"} />
+                  <ValidationMetric label="Liveness" value={asset.liveness_status || "unknown"} />
+                  <ValidationMetric label="Exposure" value={asset.exposure_status || "unknown"} />
+                  <div>
+                    <p className="text-xs text-muted-foreground">Ownership</p>
+                    <p className="text-sm font-mono text-foreground">
+                      {Math.round((asset.ownership_confidence || 0) * 100)}%
+                    </p>
+                  </div>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div>
+                    <p className="text-xs text-muted-foreground">Reason</p>
+                    <p className="text-sm text-foreground">{asset.ownership_reason || "—"}</p>
+                  </div>
+                  <div>
+                    <p className="text-xs text-muted-foreground">Last Verified</p>
+                    <p className="text-sm text-foreground">{asset.last_verified_at ? formatRelative(asset.last_verified_at) : "—"}</p>
+                  </div>
+                </div>
+                {(asset.validation_sources?.reasons || []).length > 0 && (
+                  <div className="flex flex-wrap gap-1.5">
+                    {asset.validation_sources.reasons.slice(0, 8).map((reason: string) => (
+                      <span key={reason} className="text-xs bg-surface-700 text-muted-foreground px-2 py-1 rounded">
+                        {reason.replaceAll("_", " ")}
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+
               {/* Subdomain detail */}
               {sub && (
                 <div className="glass-card p-5 space-y-3">
@@ -610,5 +644,26 @@ function HttpStatusBadge({ status, statusClass }: { status?: number; statusClass
       <span className="font-mono">{status || "—"}</span>
       <span>{cfg.label}</span>
     </span>
+  );
+}
+
+function ValidationMetric({ label, value }: { label: string; value: string }) {
+  const normalized = value.replaceAll("_", " ");
+  const className =
+    value === "in_scope" || value === "alive" || value === "exposed"
+      ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
+      : value === "probable" || value === "limited" || value === "dns_only"
+        ? "bg-amber-500/10 text-amber-400 border-amber-500/20"
+        : value === "out_of_scope" || value === "unresolved" || value === "not_exposed"
+          ? "bg-red-500/10 text-red-400 border-red-500/20"
+          : "bg-surface-700 text-muted-foreground border-border";
+
+  return (
+    <div>
+      <p className="text-xs text-muted-foreground">{label}</p>
+      <span className={cn("inline-flex mt-1 text-xs border rounded px-2 py-1 capitalize", className)}>
+        {normalized}
+      </span>
+    </div>
   );
 }

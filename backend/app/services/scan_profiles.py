@@ -4,6 +4,8 @@ Central scan profiles and target candidate selection.
 from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
+from app.services.asset_validation import should_scan_validated_asset, validation_skip_reason
+
 SAFE_EXCLUDED_TAGS = ["dos", "bruteforce", "intrusive", "destructive", "unsafe"]
 
 PROFILE_TEMPLATE_DIRS = {
@@ -82,6 +84,10 @@ SCAN_PROFILES: Dict[str, Dict[str, Any]] = {
         "template_timeout": 8,
         "concurrency": 8,
         "bulk_size": 8,
+        "nuclei_batch_size": 10,
+        "crawl_nuclei_max_targets": 30,
+        "crawl_nuclei_batch_size": 6,
+        "crawl_nuclei_scan_timeout": 300,
     },
     "deep_authorized": {
         "scan_profile": "deep_authorized",
@@ -95,6 +101,10 @@ SCAN_PROFILES: Dict[str, Dict[str, Any]] = {
         "template_timeout": 8,
         "concurrency": 6,
         "bulk_size": 6,
+        "nuclei_batch_size": 8,
+        "crawl_nuclei_max_targets": 25,
+        "crawl_nuclei_batch_size": 5,
+        "crawl_nuclei_scan_timeout": 300,
     },
     "endpoint": {
         "scan_profile": "endpoint",
@@ -105,9 +115,10 @@ SCAN_PROFILES: Dict[str, Dict[str, Any]] = {
         "template_dirs": PROFILE_TEMPLATE_DIRS["endpoint"],
         "exclude_tags": SAFE_EXCLUDED_TAGS,
         "scan_timeout": 600,
-        "template_timeout": 8,
-        "concurrency": 6,
-        "bulk_size": 6,
+        "template_timeout": 6,
+        "concurrency": 4,
+        "bulk_size": 4,
+        "nuclei_batch_size": 5,
     },
     "limited": {
         "scan_profile": "limited",
@@ -121,6 +132,7 @@ SCAN_PROFILES: Dict[str, Dict[str, Any]] = {
         "template_timeout": 8,
         "concurrency": 4,
         "bulk_size": 4,
+        "nuclei_batch_size": 8,
     },
 }
 
@@ -243,14 +255,18 @@ def build_target_candidates(
     config: Dict[str, Any],
     direct_targets: Optional[List[str]] = None,
     alive_hosts: Optional[Dict[str, Dict[str, Any]]] = None,
+    validation_by_host: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     profile_name = resolve_scan_profile(config.get("scan_type", "full"), config)
     alive_hosts = alive_hosts or {}
+    validation_by_host = validation_by_host or {}
     skipped_by_status: Dict[str, int] = {}
+    skipped_by_validation: Dict[str, int] = {}
     web_standard: List[str] = []
     web_limited: List[str] = []
     crawl_targets: List[Dict[str, Any]] = []
     screenshot_targets: List[str] = []
+    validation_skipped_targets: List[Dict[str, Any]] = []
     tech_map: Dict[str, List[Any]] = {}
 
     if direct_targets:
@@ -258,6 +274,17 @@ def build_target_candidates(
     else:
         for host in dedupe_preserve_order(subdomains):
             info = alive_hosts.get(host) or {}
+            validation = validation_by_host.get(host) or info.get("validation") or {}
+            require_validation = bool(config.get("enforce_scope_validation", True))
+            if not should_scan_validated_asset(validation, require_validation=require_validation):
+                reason = validation_skip_reason(validation)
+                skipped_by_validation[reason] = skipped_by_validation.get(reason, 0) + 1
+                validation_skipped_targets.append({
+                    "host": host,
+                    "reason": reason,
+                    "validation": validation,
+                })
+                continue
             status_class = info.get("status_class") or classify_http_status(info.get("status_code"))
             url = info.get("url")
             technologies = info.get("technologies", [])
@@ -290,6 +317,7 @@ def build_target_candidates(
         "crawl_targets": crawl_targets,
         "network_targets": network_targets,
         "screenshot_targets": dedupe_preserve_order(screenshot_targets),
+        "validation_skipped_targets": validation_skipped_targets,
         "tech_map": tech_map,
         "summary": {
             "profile": profile_name,
@@ -300,6 +328,7 @@ def build_target_candidates(
             "screenshot": len(dedupe_preserve_order(screenshot_targets)),
             "direct": len(direct_targets or []),
             "skipped_by_status": skipped_by_status,
+            "skipped_by_validation": skipped_by_validation,
         },
     }
     return candidates

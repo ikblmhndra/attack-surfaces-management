@@ -329,13 +329,45 @@ class PortWorker(BaseWorker):
                 "value": ip,
                 "status": "active",
                 "discovery_method": "dns_resolution",
+                "confidence": 0.65,
+                "is_in_scope": True,
+                "scope_status": "probable",
+                "ownership_confidence": 0.65,
+                "ownership_reason": "resolved from validated in-scope host",
+                "exposure_status": "exposed",
+                "liveness_status": "alive",
+                "validation_sources": {
+                    "method": "dns_resolution_port_scan",
+                    "reasons": ["resolved_from_validated_host", "port_scan_target"],
+                    "validated_at": now.isoformat(),
+                },
+                "last_verified_at": now,
                 "last_seen": now,
-                "metadata": {"source": "port_worker"},
+                "metadata": {
+                    "source": "port_worker",
+                    "validation": {
+                        "method": "dns_resolution_port_scan",
+                        "reasons": ["resolved_from_validated_host", "port_scan_target"],
+                    },
+                },
             }
             asset_stmt = pg_insert(Asset.__table__).values(**asset_values)
             asset_stmt = asset_stmt.on_conflict_do_update(
                 constraint="uq_asset_org_type_value",
-                set_={"last_seen": now, "status": "active"},
+                set_={
+                    "last_seen": now,
+                    "status": "active",
+                    "confidence": asset_values["confidence"],
+                    "is_in_scope": asset_values["is_in_scope"],
+                    "scope_status": asset_values["scope_status"],
+                    "ownership_confidence": asset_values["ownership_confidence"],
+                    "ownership_reason": asset_values["ownership_reason"],
+                    "exposure_status": asset_values["exposure_status"],
+                    "liveness_status": asset_values["liveness_status"],
+                    "validation_sources": asset_values["validation_sources"],
+                    "last_verified_at": asset_values["last_verified_at"],
+                    "metadata": asset_values["metadata"],
+                },
             ).returning(Asset.__table__.c.id)
             asset_id = (await db.execute(asset_stmt)).scalar_one()
 

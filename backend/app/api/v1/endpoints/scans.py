@@ -205,6 +205,14 @@ def _why_no_findings(scan_data: dict) -> list[dict]:
             "label": "No web targets selected",
             "detail": "Discovery did not select live standard or limited web targets for nuclei.",
         })
+    skipped_by_validation = targeting.get("skipped_by_validation") or {}
+    if skipped_by_validation:
+        total_skipped = sum(int(value or 0) for value in skipped_by_validation.values())
+        reasons.append({
+            "code": "validation_gated_targets",
+            "label": "Targets gated by validation",
+            "detail": f"{total_skipped} targets were skipped by scope or liveness validation: {skipped_by_validation}.",
+        })
     if crawl.get("endpoints") and not crawl.get("selected_for_nuclei"):
         reasons.append({
             "code": "no_endpoint_targets",
