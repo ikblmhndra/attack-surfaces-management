@@ -18,6 +18,7 @@ from app.services.scan_profiles import SAFE_EXCLUDED_TAGS
 from workers.base_worker import BaseWorker
 from workers.db import get_session
 from workers.queue_client import QueueClient
+from workers.scan_observability import record_target_selections
 from workers.scan_phase import update_scan_phase
 from workers.scan_state import mark_scan_running
 
@@ -124,6 +125,26 @@ class NucleiWorker(BaseWorker):
                 log.info("nuclei_skipped_inactive_scan", scan_id=scan_id)
                 return
             await update_scan_phase(db, scan_id, "nuclei", "running", targets_total=len(targets))
+            await record_target_selections(
+                db,
+                scan_id=scan_id,
+                phase="nuclei",
+                targets=[
+                    {
+                        "target": target,
+                        "target_type": "url" if str(target).startswith(("http://", "https://")) else "host",
+                        "profile": config.get("vuln_depth") or config.get("scan_profile") or "default",
+                        "selected": True,
+                        "reasons": ["nuclei_batch_target"],
+                        "metadata": {
+                            "batch_size": len(targets),
+                            "automatic_scan": config.get("automatic_scan"),
+                            "template_dirs": config.get("template_dirs") or [],
+                        },
+                    }
+                    for target in targets
+                ],
+            )
 
         if not targets:
             log.warning("nuclei_no_targets", scan_id=scan_id)

@@ -22,6 +22,7 @@ from app.services.scan_profiles import child_profile_config
 from workers.base_worker import BaseWorker
 from workers.db import get_session
 from workers.queue_client import QueueClient
+from workers.scan_observability import record_target_selections
 from workers.scan_phase import update_scan_phase
 from workers.scan_state import mark_scan_running, should_process_scan
 from workers.task_coordinator import TaskCoordinator
@@ -198,8 +199,15 @@ class WebCrawlWorker(BaseWorker):
                 log.info("crawl_results_skipped_inactive_scan", scan_id=scan_id)
                 await self._mark_crawl_done(scan_id, org_id, workspace_id)
                 return
-            persisted, selected = await self._persist_endpoints(
+            persisted, selected_records = await self._persist_endpoints(
                 db, org_id, workspace_id, validated
+            )
+            selected_records = selected_records[: int(config.get("crawl_nuclei_max_targets", 200))]
+            await record_target_selections(
+                db,
+                scan_id=scan_id,
+                phase="crawl",
+                targets=selected_records,
             )
             await self._update_progress(db, scan_id, persisted)
             await update_scan_phase(
@@ -209,10 +217,10 @@ class WebCrawlWorker(BaseWorker):
                 "completed",
                 targets_total=len(targets),
                 endpoints=persisted,
-                selected_for_nuclei=len(selected),
+                selected_for_nuclei=len(selected_records),
             )
 
-        selected = selected[: int(config.get("crawl_nuclei_max_targets", 200))]
+        selected = [item["target"] for item in selected_records]
         await self._publish_selected_nuclei(scan_id, org_id, workspace_id, selected, config)
         await self._mark_crawl_done(scan_id, org_id, workspace_id)
         log.info("crawl_completed", scan_id=scan_id, endpoints=persisted, selected=len(selected))
@@ -476,7 +484,7 @@ class WebCrawlWorker(BaseWorker):
             sources[normalized] = f"{existing}+ffuf" if existing else "ffuf"
         return sources
 
-    async def _persist_endpoints(self, db, org_id: str, workspace_id: str, endpoints: List[Dict[str, Any]]) -> tuple[int, List[str]]:
+    async def _persist_endpoints(self, db, org_id: str, workspace_id: str, endpoints: List[Dict[str, Any]]) -> tuple[int, List[Dict[str, Any]]]:
         from workers.db_models import Asset, WebEndpoint
 
         if not endpoints:
@@ -492,7 +500,7 @@ class WebCrawlWorker(BaseWorker):
         )).all()
         asset_by_host = {value: asset_id for asset_id, value in asset_rows}
         now = datetime.now(timezone.utc)
-        selected: List[tuple[int, str]] = []
+        selected: List[tuple[int, Dict[str, Any]]] = []
         persisted = 0
         skipped_oversized = 0
 
@@ -533,7 +541,25 @@ class WebCrawlWorker(BaseWorker):
             await db.execute(stmt)
             persisted += 1
             if score >= 25 and values["status_class"] in {"ok", "redirect", "auth_required", "server_error", "rate_limited"}:
-                selected.append((score, url))
+                selected.append((
+                    score,
+                    {
+                        "target": url,
+                        "target_type": "url",
+                        "profile": "endpoint",
+                        "asset_id": asset_id,
+                        "selected": True,
+                        "score": score,
+                        "reasons": score_reasons,
+                        "metadata": {
+                            "downstream_phase": "nuclei",
+                            "source": values["source"],
+                            "status_class": values["status_class"],
+                            "http_status": values["http_status"],
+                            "asset_id": str(asset_id),
+                        },
+                    },
+                ))
         await db.commit()
         if skipped_oversized:
             log.info(
@@ -544,7 +570,7 @@ class WebCrawlWorker(BaseWorker):
                 max_url_length=MAX_ENDPOINT_URL_LENGTH,
             )
         selected.sort(key=lambda item: item[0], reverse=True)
-        return persisted, [url for _, url in selected]
+        return persisted, [item for _, item in selected]
 
     async def _update_progress(self, db, scan_id: str, endpoints_found: int) -> None:
         from workers.db_models import Scan

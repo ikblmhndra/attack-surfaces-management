@@ -6,6 +6,14 @@ All notable changes to this project are documented below, sorted newest-first.
 
 ## 2026-06-03 — Scan Pipeline Progress and Result UI
 
+### Added: Durable scan observability milestone
+- **Files**: `backend/app/db/migrations/versions/008_scan_observability.py`, `backend/app/db/models/models.py`, `workers/scan_phase.py`, `workers/scan_observability.py`, `workers/scanner/discovery_worker.py`, `workers/crawler/web_crawl_worker.py`, `workers/scanner/nuclei_worker.py`, `backend/app/api/v1/endpoints/scans.py`, `frontend/src/app/dashboard/scans/[id]/page.tsx`
+- Added durable `scan_phase_runs` and `scan_target_selections` tables for phase timelines, target coverage, and selected/skipped target evidence.
+- Scan phase updates now upsert durable phase summaries alongside existing `phase_status` JSONB.
+- Discovery, crawl, and nuclei now persist selected targets with phase, profile, score/reasons, and downstream metadata.
+- Added authenticated scan detail response fields: `phase_runs`, `target_summary`, `target_selections`, and `why_no_findings`.
+- Added `/dashboard/scans/[id]` to show phase timeline, target coverage, target selections, and no-finding explanations.
+
 ### Fixed: Accurate nuclei and crawl task accounting
 - **Files**: `workers/task_coordinator.py`, `workers/crawler/web_crawl_worker.py`, `workers/scanner/nuclei_worker.py`
 - Crawl-fed endpoint nuclei batches now increment scan `total_tasks`, preventing progress from jumping too far ahead during deep scans.

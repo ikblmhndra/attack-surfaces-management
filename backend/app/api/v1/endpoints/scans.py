@@ -1,4 +1,5 @@
 import uuid
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from uuid import UUID
 from typing import List, Optional
@@ -7,7 +8,7 @@ from fastapi import APIRouter, Depends, Query, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
 from app.api.v1.dependencies.auth import get_current_user, get_workspace_id, get_db, RequireRole
-from app.db.models.models import User, Scan, Organization
+from app.db.models.models import User, Scan, Organization, ScanPhaseRun, ScanTargetSelection
 from app.services.scan_profiles import apply_scan_profile, normalize_scan_profile
 from app.services.scan_progress import merge_runtime_phase_status
 from app.services.outbox_service import create_queue_event, dispatch_pending_outbox_once
@@ -71,10 +72,10 @@ async def get_scan(scan_id: UUID, workspace_id: UUID = Depends(get_workspace_id)
     result = await db.execute(select(Scan).where(Scan.id == scan_id, Scan.workspace_id == workspace_id))
     scan = result.scalar_one_or_none()
     if not scan: raise HTTPException(404, "Scan not found")
-    return await _scan_to_dict(scan, detailed=True)
+    return await _scan_to_dict(scan, detailed=True, db=db)
 
 
-async def _scan_to_dict(scan: Scan, detailed: bool = False) -> dict:
+async def _scan_to_dict(scan: Scan, detailed: bool = False, db: AsyncSession | None = None) -> dict:
     phase_status = await merge_runtime_phase_status(str(scan.id), scan.phase_status or {})
     config = scan.config or {}
     data = {
@@ -100,9 +101,134 @@ async def _scan_to_dict(scan: Scan, detailed: bool = False) -> dict:
         "completed_at": scan.completed_at.isoformat() if scan.completed_at else None,
         "created_at": scan.created_at.isoformat(),
     }
-    if detailed:
+    if detailed and db is not None:
         data["config"] = config
+        data["phase_runs"] = await _scan_phase_runs(db, scan)
+        selections = await _scan_target_selections(db, scan)
+        data["target_summary"] = _target_summary(selections)
+        data["target_selections"] = selections[:500]
+        data["why_no_findings"] = _why_no_findings(data)
     return data
+
+
+async def _scan_phase_runs(db: AsyncSession, scan: Scan) -> list[dict]:
+    rows = (await db.execute(
+        select(ScanPhaseRun)
+        .where(ScanPhaseRun.scan_id == scan.id, ScanPhaseRun.workspace_id == scan.workspace_id)
+        .order_by(ScanPhaseRun.started_at.nulls_last(), ScanPhaseRun.created_at)
+    )).scalars().all()
+    return [
+        {
+            "phase": row.phase,
+            "status": row.status,
+            "started_at": row.started_at.isoformat() if row.started_at else None,
+            "completed_at": row.completed_at.isoformat() if row.completed_at else None,
+            "duration_seconds": row.duration_seconds,
+            "expected_tasks": row.expected_tasks,
+            "completed_tasks": row.completed_tasks,
+            "failed_tasks": row.failed_tasks,
+            "targets_total": row.targets_total,
+            "targets_selected": row.targets_selected,
+            "targets_skipped": row.targets_skipped,
+            "errors": row.errors,
+            "warnings": row.warnings,
+            "summary": row.summary or {},
+        }
+        for row in rows
+    ]
+
+
+async def _scan_target_selections(db: AsyncSession, scan: Scan) -> list[dict]:
+    rows = (await db.execute(
+        select(ScanTargetSelection)
+        .where(ScanTargetSelection.scan_id == scan.id, ScanTargetSelection.workspace_id == scan.workspace_id)
+        .order_by(ScanTargetSelection.phase, ScanTargetSelection.selected.desc(), ScanTargetSelection.score.desc().nulls_last())
+        .limit(1000)
+    )).scalars().all()
+    return [
+        {
+            "id": str(row.id),
+            "asset_id": str(row.asset_id) if row.asset_id else None,
+            "target": row.target,
+            "target_type": row.target_type,
+            "phase": row.phase,
+            "profile": row.profile,
+            "selected": row.selected,
+            "score": row.score,
+            "reasons": row.reasons or [],
+            "skip_reason": row.skip_reason,
+            "metadata": row.metadata_ or {},
+            "created_at": row.created_at.isoformat(),
+            "updated_at": row.updated_at.isoformat(),
+        }
+        for row in rows
+    ]
+
+
+def _target_summary(selections: list[dict]) -> dict:
+    by_phase: dict[str, Counter] = defaultdict(Counter)
+    by_type: Counter = Counter()
+    selected = 0
+    skipped = 0
+    for row in selections:
+        phase = row.get("phase") or "unknown"
+        if row.get("selected"):
+            selected += 1
+            by_phase[phase]["selected"] += 1
+        else:
+            skipped += 1
+            by_phase[phase]["skipped"] += 1
+        by_type[row.get("target_type") or "unknown"] += 1
+    return {
+        "total": len(selections),
+        "selected": selected,
+        "skipped": skipped,
+        "by_phase": {phase: dict(counts) for phase, counts in by_phase.items()},
+        "by_type": dict(by_type),
+    }
+
+
+def _why_no_findings(scan_data: dict) -> list[dict]:
+    if scan_data.get("findings_found", 0) > 0:
+        return []
+    phase_status = scan_data.get("phase_status") or {}
+    target_summary = scan_data.get("target_summary") or {}
+    reasons = []
+    targeting = phase_status.get("targeting") or {}
+    nuclei = phase_status.get("nuclei") or {}
+    crawl = phase_status.get("crawl") or {}
+
+    if not targeting.get("web_standard") and not targeting.get("web_limited"):
+        reasons.append({
+            "code": "no_web_targets",
+            "label": "No web targets selected",
+            "detail": "Discovery did not select live standard or limited web targets for nuclei.",
+        })
+    if crawl.get("endpoints") and not crawl.get("selected_for_nuclei"):
+        reasons.append({
+            "code": "no_endpoint_targets",
+            "label": "No endpoint targets selected",
+            "detail": "Crawler persisted endpoints, but none met the endpoint nuclei scoring threshold.",
+        })
+    if nuclei.get("expected_batches") and nuclei.get("completed_batches", 0) < nuclei.get("expected_batches", 0):
+        reasons.append({
+            "code": "nuclei_incomplete",
+            "label": "Nuclei still running",
+            "detail": f"{nuclei.get('completed_batches', 0)}/{nuclei.get('expected_batches')} nuclei batches are complete.",
+        })
+    if target_summary.get("total") == 0:
+        reasons.append({
+            "code": "no_target_records",
+            "label": "No durable target records",
+            "detail": "This scan has no persisted target selections yet. It may have started before observability tracking was enabled.",
+        })
+    if scan_data.get("status") == "failed" and scan_data.get("error_message"):
+        reasons.append({
+            "code": "scan_failed",
+            "label": "Scan failed",
+            "detail": scan_data["error_message"],
+        })
+    return reasons
 
 @router.post("/manual", status_code=201)
 async def manual_scan(

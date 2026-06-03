@@ -613,6 +613,61 @@ class ScanFinding(Base):
     finding = relationship("Finding", back_populates="scan_findings")
 
 
+class ScanPhaseRun(TimestampMixin, Base):
+    __tablename__ = "scan_phase_runs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    scan_id = Column(UUID(as_uuid=True), ForeignKey("scans.id", ondelete="CASCADE"), nullable=False, index=True)
+    org_id = Column(UUID(as_uuid=True), nullable=False, index=True)
+    workspace_id = Column(UUID(as_uuid=True), nullable=False, index=True)
+
+    phase = Column(String(50), nullable=False)
+    status = Column(String(50), nullable=False, default="queued")
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    duration_seconds = Column(Integer, nullable=True)
+
+    expected_tasks = Column(Integer, nullable=False, default=0)
+    completed_tasks = Column(Integer, nullable=False, default=0)
+    failed_tasks = Column(Integer, nullable=False, default=0)
+    targets_total = Column(Integer, nullable=False, default=0)
+    targets_selected = Column(Integer, nullable=False, default=0)
+    targets_skipped = Column(Integer, nullable=False, default=0)
+    errors = Column(Integer, nullable=False, default=0)
+    warnings = Column(Integer, nullable=False, default=0)
+    summary = Column(JSONB, nullable=False, default=dict)
+
+    __table_args__ = (
+        UniqueConstraint("scan_id", "phase", name="uq_scan_phase_runs_scan_phase"),
+        Index("ix_scan_phase_runs_workspace", "workspace_id"),
+    )
+
+
+class ScanTargetSelection(TimestampMixin, Base):
+    __tablename__ = "scan_target_selections"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    scan_id = Column(UUID(as_uuid=True), ForeignKey("scans.id", ondelete="CASCADE"), nullable=False, index=True)
+    org_id = Column(UUID(as_uuid=True), nullable=False, index=True)
+    workspace_id = Column(UUID(as_uuid=True), nullable=False, index=True)
+    asset_id = Column(UUID(as_uuid=True), nullable=True)
+
+    target = Column(String(2000), nullable=False)
+    target_type = Column(String(50), nullable=False)
+    phase = Column(String(50), nullable=False)
+    profile = Column(String(100), nullable=False, default="")
+    selected = Column(Boolean, nullable=False, default=True)
+    score = Column(Float, nullable=True)
+    reasons = Column(JSONB, nullable=False, default=list)
+    skip_reason = Column(String(255), nullable=True)
+    metadata_ = Column("metadata", JSONB, nullable=False, default=dict)
+
+    __table_args__ = (
+        UniqueConstraint("scan_id", "phase", "target", "target_type", "profile", name="uq_scan_target_selection"),
+        Index("ix_scan_target_selections_phase_selected", "phase", "selected"),
+    )
+
+
 # ============================================================
 # OUTBOX EVENTS
 # ============================================================

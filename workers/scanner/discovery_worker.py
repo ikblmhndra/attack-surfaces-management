@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from workers.base_worker import BaseWorker
 from workers.db import get_session
 from workers.queue_client import QueueClient
+from workers.scan_observability import record_target_selections
 from workers.scan_phase import update_scan_phase
 from workers.scan_state import mark_scan_running
 from app.services.scan_profiles import build_target_candidates, child_profile_config
@@ -920,6 +921,12 @@ class DiscoveryWorker(BaseWorker):
 
         async with get_session() as db:
             await update_scan_phase(db, scan_id, "targeting", "completed", **candidates["summary"])
+            await record_target_selections(
+                db,
+                scan_id=scan_id,
+                phase="targeting",
+                targets=self._target_selection_rows(candidates),
+            )
 
         # Port scan task per IP batch (100 IPs per task)
         if "port" in modules:
@@ -1033,6 +1040,61 @@ class DiscoveryWorker(BaseWorker):
         await coord.close()
 
         return bool(port_batches_queued or crawl_batches_queued or nuclei_batches_queued or screenshot_queued)
+
+    def _target_selection_rows(self, candidates: Dict[str, Any]) -> List[Dict[str, Any]]:
+        profile = candidates.get("profile") or ""
+        rows: List[Dict[str, Any]] = []
+        for target in candidates.get("network_targets") or []:
+            rows.append({
+                "target": target,
+                "target_type": "ip",
+                "profile": profile,
+                "selected": True,
+                "reasons": ["network_target", "resolved_ip"],
+                "metadata": {"downstream_phase": "port"},
+            })
+        for target in candidates.get("web_standard_targets") or []:
+            rows.append({
+                "target": target,
+                "target_type": "host",
+                "profile": profile,
+                "selected": True,
+                "reasons": ["live_web", "standard_nuclei"],
+                "metadata": {"downstream_phase": "nuclei", "target_group": "web_standard"},
+            })
+        for target in candidates.get("web_limited_targets") or []:
+            rows.append({
+                "target": target,
+                "target_type": "host",
+                "profile": "limited",
+                "selected": True,
+                "reasons": ["limited_web_status", "conservative_nuclei"],
+                "metadata": {"downstream_phase": "nuclei", "target_group": "web_limited"},
+            })
+        for target in candidates.get("crawl_targets") or []:
+            rows.append({
+                "target": target.get("url") or target.get("host"),
+                "target_type": "url",
+                "profile": profile,
+                "selected": True,
+                "reasons": ["crawl_candidate", target.get("status_class")],
+                "metadata": {
+                    "downstream_phase": "crawl",
+                    "host": target.get("host"),
+                    "status_code": target.get("status_code"),
+                    "technologies": target.get("technologies") or [],
+                },
+            })
+        for target in candidates.get("screenshot_targets") or []:
+            rows.append({
+                "target": target,
+                "target_type": "host",
+                "profile": profile,
+                "selected": True,
+                "reasons": ["screenshot_candidate"],
+                "metadata": {"downstream_phase": "screenshot"},
+            })
+        return rows
 
     # ── Utilities ─────────────────────────────────────────────
 

@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useMemo, useCallback } from "react";
+import Link from "next/link";
 import {
   Scan, RefreshCw, AlertTriangle, Activity,
   ChevronLeft, ChevronRight, XCircle, Search,
@@ -185,7 +186,12 @@ export default function ScansPage() {
                   return (
                     <tr key={scan.id} className="border-b border-border/30 hover:bg-surface-700/20 transition-colors">
                       <td className="px-4 py-3">
-                        <span className="text-sm text-foreground capitalize">{scan.scan_type}</span>
+                        <Link href={`/dashboard/scans/${scan.id}`} className="text-sm text-foreground hover:text-brand-400 capitalize">
+                          {scan.scan_type}
+                        </Link>
+                        {scan.scan_profile && (
+                          <span className="block text-[10px] text-muted-foreground/70">{scan.scan_profile}</span>
+                        )}
                       </td>
                       <td className="px-4 py-3">
                         <div className="flex items-center gap-1.5">
