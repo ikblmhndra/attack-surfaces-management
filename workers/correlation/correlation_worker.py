@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from workers.base_worker import BaseWorker
 from workers.db import get_session
 from workers.queue_client import QueueClient
+from workers.scan_phase import update_scan_phase
 from workers.scan_state import mark_scan_completed, should_process_scan
 
 log = structlog.get_logger()
@@ -66,9 +67,10 @@ class CorrelationWorker(BaseWorker):
             if not await should_process_scan(db, scan_id):
                 log.info("correlation_skipped_inactive_scan", scan_id=scan_id)
                 return
+            await update_scan_phase(db, scan_id, "correlation", "running", is_terminal=is_terminal)
 
             # ── Step 1: Asset Deduplication ───────────────────
-            await self._deduplicate_assets(db, org_id)
+            deduplicated = await self._deduplicate_assets(db, org_id)
 
             # ── Step 2: Build Relationships ───────────────────
             relationships = await self._build_relationships(db, org_id)
@@ -99,8 +101,33 @@ class CorrelationWorker(BaseWorker):
             if changes:
                 await self._queue_change_notifications(scan_id, org_id, workspace_id, changes)
 
+            async with get_session() as db:
+                await update_scan_phase(
+                    db,
+                    scan_id,
+                    "correlation",
+                    "completed",
+                    is_terminal=True,
+                    deduplicated=deduplicated,
+                    relationships=len(relationships),
+                    changes=len(changes),
+                    risk_queued=True,
+                    notifications_queued=len(changes),
+                )
+
             log.info("correlation_completed", scan_id=scan_id, changes=len(changes))
         else:
+            async with get_session() as db:
+                await update_scan_phase(
+                    db,
+                    scan_id,
+                    "correlation",
+                    "running",
+                    is_terminal=False,
+                    deduplicated=deduplicated,
+                    relationships=len(relationships),
+                    indexed=True,
+                )
             log.info("correlation_intermediate", scan_id=scan_id)
 
     # ── Asset Deduplication ───────────────────────────────────

@@ -197,6 +197,7 @@ def _why_no_findings(scan_data: dict) -> list[dict]:
     targeting = phase_status.get("targeting") or {}
     nuclei = phase_status.get("nuclei") or {}
     crawl = phase_status.get("crawl") or {}
+    config = scan_data.get("config") or {}
 
     if not targeting.get("web_standard") and not targeting.get("web_limited"):
         reasons.append({
@@ -215,6 +216,38 @@ def _why_no_findings(scan_data: dict) -> list[dict]:
             "code": "nuclei_incomplete",
             "label": "Nuclei still running",
             "detail": f"{nuclei.get('completed_batches', 0)}/{nuclei.get('expected_batches')} nuclei batches are complete.",
+        })
+    if nuclei.get("expected_batches") and nuclei.get("completed_batches", 0) >= nuclei.get("expected_batches", 0) and not nuclei.get("findings"):
+        reasons.append({
+            "code": "nuclei_completed_no_findings",
+            "label": "Nuclei completed with no findings",
+            "detail": "All tracked nuclei batches completed, but no findings were persisted after parsing and deduplication.",
+        })
+    if nuclei.get("status") in {"failed", "skipped"}:
+        reasons.append({
+            "code": f"nuclei_{nuclei.get('status')}",
+            "label": f"Nuclei {nuclei.get('status')}",
+            "detail": "The vulnerability scanning phase did not complete normally.",
+        })
+    if crawl.get("endpoints") and crawl.get("selected_for_nuclei") and config.get("crawl_nuclei_max_targets"):
+        cap = int(config.get("crawl_nuclei_max_targets") or 0)
+        if cap and int(crawl.get("selected_for_nuclei") or 0) >= cap and int(crawl.get("endpoints") or 0) > cap:
+            reasons.append({
+                "code": "endpoint_budget_cap_reached",
+                "label": "Endpoint scan budget reached",
+                "detail": f"Crawler found {crawl.get('endpoints')} endpoints and selected the top {cap} for endpoint nuclei.",
+            })
+    if config.get("exclude_tags"):
+        reasons.append({
+            "code": "safety_policy_exclusions",
+            "label": "Safety policy exclusions active",
+            "detail": f"Templates tagged {', '.join(config.get('exclude_tags') or [])} were excluded from this scan.",
+        })
+    if scan_data.get("error_count"):
+        reasons.append({
+            "code": "scan_errors_present",
+            "label": "Scan errors were recorded",
+            "detail": f"{scan_data.get('error_count')} scan errors were recorded. Check phase errors and worker logs for detail.",
         })
     if target_summary.get("total") == 0:
         reasons.append({

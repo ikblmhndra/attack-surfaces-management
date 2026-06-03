@@ -19,6 +19,7 @@ import structlog
 from workers.base_worker import BaseWorker
 from workers.db import get_session
 from workers.queue_client import QueueClient
+from workers.scan_observability import record_target_selections
 from workers.scan_phase import update_scan_phase
 from workers.scan_state import mark_scan_running
 
@@ -66,6 +67,22 @@ class PortWorker(BaseWorker):
             if not await mark_scan_running(db, scan_id, progress_floor=25):
                 log.info("port_scan_skipped_inactive_scan", scan_id=scan_id)
                 return
+            await record_target_selections(
+                db,
+                scan_id=scan_id,
+                phase="port",
+                targets=[
+                    {
+                        "target": ip,
+                        "target_type": "ip",
+                        "profile": config.get("scan_profile") or config.get("vuln_depth") or "default",
+                        "selected": True,
+                        "reasons": ["port_scan_batch_target"],
+                        "metadata": {"batch_size": len(ips)},
+                    }
+                    for ip in ips
+                ],
+            )
             await update_scan_phase(db, scan_id, "port", "running", targets_total=len(ips))
 
         if not ips:

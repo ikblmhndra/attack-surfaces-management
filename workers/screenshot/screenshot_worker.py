@@ -19,6 +19,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from workers.base_worker import BaseWorker
 from workers.db import get_session
 from workers.queue_client import QueueClient
+from workers.scan_observability import record_target_selections
 from workers.scan_phase import update_scan_phase
 from workers.scan_state import mark_scan_running
 
@@ -113,8 +114,26 @@ class ScreenshotWorker(BaseWorker):
             if not await mark_scan_running(db, scan_id, progress_floor=75):
                 log.info("screenshot_skipped_inactive_scan", scan_id=scan_id)
                 return
+            await record_target_selections(
+                db,
+                scan_id=scan_id,
+                phase="screenshot",
+                targets=[
+                    {
+                        "target": target,
+                        "target_type": "url" if str(target).startswith(("http://", "https://")) else "host",
+                        "profile": "screenshot",
+                        "selected": True,
+                        "reasons": ["screenshot_candidate"],
+                        "metadata": {"batch_size": len(targets)},
+                    }
+                    for target in targets
+                ],
+            )
             await update_scan_phase(db, scan_id, "screenshot", "running", targets_total=len(targets))
 
+        success = 0
+        failed = 0
         if not targets:
             log.info("screenshot_no_targets", scan_id=scan_id)
         else:
@@ -140,7 +159,15 @@ class ScreenshotWorker(BaseWorker):
         # Always update progress
         async with get_session() as db:
             await self._update_scan_progress(db, scan_id)
-            await update_scan_phase(db, scan_id, "screenshot", "completed", targets_total=len(targets))
+            await update_scan_phase(
+                db,
+                scan_id,
+                "screenshot",
+                "completed",
+                targets_total=len(targets),
+                success=success,
+                failed=failed,
+            )
 
         # Flag screenshot as done. Atomically claim terminal slot —
         # only one worker (screenshot or nuclei) will send the terminal

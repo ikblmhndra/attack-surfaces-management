@@ -16,6 +16,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from workers.base_worker import BaseWorker
 from workers.db import get_session
 from workers.queue_client import QueueClient
+from workers.scan_observability import record_target_selections
 from workers.scan_phase import update_scan_phase
 from workers.scan_state import mark_scan_running
 
@@ -39,14 +40,35 @@ class EnrichmentWorker(BaseWorker):
                 if not await mark_scan_running(db, scan_id, progress_floor=55):
                     log.info("enrichment_skipped_inactive_scan", scan_id=scan_id)
                     return
+                await record_target_selections(
+                    db,
+                    scan_id=scan_id,
+                    phase="enrich",
+                    targets=[
+                        {
+                            "target": asset.get("value"),
+                            "target_type": asset.get("asset_type") or "asset",
+                            "asset_id": asset.get("asset_id"),
+                            "profile": "enrichment",
+                            "selected": True,
+                            "reasons": ["enrichment_target"],
+                            "metadata": {
+                                "provider_mode": "baseline+plugins" if config.get("enrichment_api_plugins", True) else "baseline",
+                            },
+                        }
+                        for asset in assets
+                    ],
+                )
                 await update_scan_phase(db, scan_id, "enrich", "running", targets_total=len(assets))
 
         processed = 0
+        failed = 0
         for asset in assets:
             try:
                 await self._enrich_asset(asset, org_id or asset.get("org_id"), config)
                 processed += 1
             except Exception as exc:
+                failed += 1
                 log.warning(
                     "asset_enrichment_failed",
                     asset_id=asset.get("asset_id"),
@@ -63,6 +85,7 @@ class EnrichmentWorker(BaseWorker):
                     "completed",
                     targets_total=len(assets),
                     completed=processed,
+                    failed=failed,
                 )
                 await self._update_scan_progress(db, scan_id)
             await self._mark_enrich_done(scan_id, org_id, workspace_id)

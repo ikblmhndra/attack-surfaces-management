@@ -13,6 +13,9 @@ All notable changes to this project are documented below, sorted newest-first.
 - Discovery, crawl, and nuclei now persist selected targets with phase, profile, score/reasons, and downstream metadata.
 - Added authenticated scan detail response fields: `phase_runs`, `target_summary`, `target_selections`, and `why_no_findings`.
 - Added `/dashboard/scans/[id]` to show phase timeline, target coverage, target selections, and no-finding explanations.
+- Completed the remaining Milestone 1 observability gaps for current workers: port, screenshot, and enrichment now record target selections; screenshot/enrichment phase summaries include success/failed counts; correlation now writes intermediate and terminal phase summaries.
+- Expanded no-finding explanations for completed nuclei with no findings, active safety exclusions, endpoint budget caps, and recorded scan errors.
+- Fixed scan target selection upserts to merge duplicate targets within a batch before `ON CONFLICT`, preventing DiscoveryWorker cardinality violations and retry exhaustion.
 
 ### Fixed: Accurate nuclei and crawl task accounting
 - **Files**: `workers/task_coordinator.py`, `workers/crawler/web_crawl_worker.py`, `workers/scanner/nuclei_worker.py`
