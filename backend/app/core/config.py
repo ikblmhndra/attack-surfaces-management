@@ -92,15 +92,6 @@ class Settings(BaseSettings):
     OPENSEARCH_INDEX_FINDINGS: str = "asm-findings"
     OPENSEARCH_INDEX_LOGS: str = "asm-audit-logs"
 
-    # ── Threat Intelligence ───────────────────────────────────
-    SHODAN_API_KEY: Optional[str] = None
-    CENSYS_API_ID: Optional[str] = None
-    CENSYS_API_SECRET: Optional[str] = None
-    VIRUSTOTAL_API_KEY: Optional[str] = None
-    ABUSEIPDB_API_KEY: Optional[str] = None
-    OTX_API_KEY: Optional[str] = None
-    CRIMINALIP_API_KEY: Optional[str] = None
-
     # ── Email ─────────────────────────────────────────────────
     SMTP_HOST: Optional[str] = None
     SMTP_PORT: int = 587

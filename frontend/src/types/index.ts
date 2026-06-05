@@ -154,6 +154,7 @@ export interface Asset {
   criticality:      number;
   environment?:     string;
   discovery_method?: string;
+  discovery_evidence?: Record<string, any>;
   open_findings:    number;
   first_seen:       string;
   last_seen:        string;
@@ -222,6 +223,16 @@ export interface WebEndpoint {
   is_api: boolean;
   is_auth: boolean;
   is_interesting: boolean;
+  score: number;
+  score_reasons: string[];
+  endpoint_type: "root" | "api" | "auth" | "admin" | "upload" | "static" | "parameterized" | "graphql" | "swagger" | "health" | "debug" | "unknown";
+  selected_for_scan: boolean;
+  selected_reason?: string;
+  scan_status: "not_scanned" | "queued" | "running" | "completed" | "failed";
+  last_scanned_at?: string;
+  sources: string[];
+  source_count: number;
+  metadata?: Record<string, any>;
   last_seen?: string;
 }
 

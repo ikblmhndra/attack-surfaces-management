@@ -1,6 +1,6 @@
 """
-ASM Platform — Asset Enrichment Worker
-Adds no-key network baseline data and optional threat-intel plugin results.
+ASM Platform - Asset Enrichment Worker
+Adds no-key network baseline data.
 """
 import asyncio
 import ipaddress
@@ -53,7 +53,7 @@ class EnrichmentWorker(BaseWorker):
                             "selected": True,
                             "reasons": ["enrichment_target"],
                             "metadata": {
-                                "provider_mode": "baseline+plugins" if config.get("enrichment_api_plugins", True) else "baseline",
+                                "provider_mode": "baseline",
                             },
                         }
                         for asset in assets
@@ -114,24 +114,6 @@ class EnrichmentWorker(BaseWorker):
                         indicator_type="ip",
                         data=baseline,
                         expires_at=datetime.now(timezone.utc) + timedelta(days=14),
-                    )
-
-            if config.get("enrichment_api_plugins", True):
-                for source, result in (await self._run_api_plugins(value, indicator_type)).items():
-                    if not getattr(result, "success", False):
-                        continue
-                    await self._persist_intel(
-                        db,
-                        asset_id,
-                        org_id,
-                        source=source,
-                        indicator_type=indicator_type,
-                        data=result.data,
-                        risk_score=result.risk_score,
-                        is_malicious=result.is_malicious,
-                        tags=result.tags,
-                        categories=result.categories,
-                        expires_at=result.expires_at,
                     )
 
             await db.commit()
@@ -211,18 +193,6 @@ class EnrichmentWorker(BaseWorker):
             "network_end": raw.get("endAddress"),
             "registry_org": org,
         }
-
-    async def _run_api_plugins(self, value: str, indicator_type: str) -> Dict[str, Any]:
-        try:
-            from app.integrations.enrichment.engine import enrichment_engine
-        except Exception as exc:
-            log.warning("enrichment_engine_unavailable", error=str(exc))
-            return {}
-        try:
-            return await enrichment_engine.enrich(value, indicator_type)
-        except Exception as exc:
-            log.warning("enrichment_plugins_failed", indicator=value, error=str(exc))
-            return {}
 
     def _classify_provider(self, text: str) -> Dict[str, Any]:
         lower = text.lower()

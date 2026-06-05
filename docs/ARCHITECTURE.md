@@ -27,7 +27,7 @@
 | Asset Discovery | Automated subdomain, IP, port, service discovery |
 | Exposure Management | Continuous vulnerability and misconfiguration detection |
 | Risk Scoring | Per-category weighted scoring (0–100) with grade system |
-| Threat Intel | Enrichment via Shodan, Censys, VirusTotal, AbuseIPDB |
+| Asset Enrichment | No-key ASN/RDAP and network ownership enrichment |
 | Continuous Monitoring | Scheduled scans with diff-based change detection |
 | Multi-Tenancy | Workspace isolation, RBAC, API keys |
 | Executive Reporting | PDF exports, dashboards, trend analytics |
@@ -85,11 +85,8 @@ graph TB
     end
 
     subgraph ENRICH["Enrichment Layer"]
-        SHODAN["Shodan API"]
-        CENSYS["Censys API"]
-        VT["VirusTotal API"]
-        ABUSEIPDB["AbuseIPDB"]
-        OTX["AlienVault OTX"]
+        CYMRU["Team Cymru whois"]
+        RDAP["RDAP"]
     end
 
     subgraph OBS["Observability"]
@@ -554,12 +551,8 @@ flowchart LR
     end
 
     subgraph ENRICH["Enrichment Phase"]
-        SHODAN["Shodan\nLookup"]
-        VT["VirusTotal\nReputation"]
-        ABUSE["AbuseIPDB\nReputation"]
-        NUC --> SHODAN
-        NUC --> VT
-        NUC --> ABUSE
+        BASELINE["ASN/RDAP\nBaseline"]
+        NUC --> BASELINE
     end
 
     subgraph OUTPUT["Output Phase"]
@@ -567,7 +560,6 @@ flowchart LR
         RISK["Risk Scoring\nEngine"]
         INDEX["OpenSearch\nIndexing"]
         NOTIFY["Notifications"]
-        SHODAN --> CORR
         VT --> CORR
         ABUSE --> CORR
         CORR --> RISK

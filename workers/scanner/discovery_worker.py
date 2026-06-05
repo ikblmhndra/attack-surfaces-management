@@ -4,16 +4,20 @@ Runs subdomain discovery, DNS enumeration, HTTP probing, endpoint crawling, and 
 Integrates: subfinder, amass, assetfinder, dnsx, httpx, naabu, katana, ffuf
 """
 import asyncio
+import ipaddress
 import re
 import hashlib
 import json
 import os
+import random
 import shutil
 import subprocess
+import string
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import urlparse
 
 import aio_pika
 import structlog
@@ -25,11 +29,18 @@ from workers.queue_client import QueueClient
 from workers.scan_observability import record_target_selections
 from workers.scan_phase import update_scan_phase
 from workers.scan_state import mark_scan_running
+from workers.discovery.dns_candidates import (
+    dns_fingerprint,
+    generate_bruteforce_hosts,
+    generate_permutation_hosts,
+    normalize_host,
+)
 from app.services.scan_profiles import build_target_candidates, child_profile_config
 from app.services.asset_validation import (
     apply_scope_controls,
     should_scan_validated_asset,
     validate_discovered_host,
+    validation_skip_reason,
 )
 
 log = structlog.get_logger()
@@ -75,6 +86,25 @@ def normalize_technology(raw: Any) -> Optional[Dict[str, Optional[str]]]:
     if not name:
         return None
     return {"name": name[:255], "version": version[:100] if version else ""}
+
+
+def json_safe(value: Any) -> Any:
+    """Convert scanner evidence into values PostgreSQL JSONB can serialize."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(k): json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    if isinstance(value, set):
+        return [json_safe(item) for item in sorted(value, key=str)]
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        return str(value)
 
 
 def classify_http_status(status_code: Optional[int]) -> str:
@@ -163,15 +193,30 @@ class DiscoveryWorker(BaseWorker):
             tmpdir = Path(tmpdir)
 
             # ── Phase 1: Subdomain Discovery ──────────────────
-            all_subdomains: Set[str] = set()
+            discovery_evidence: Dict[str, Dict[str, Any]] = {}
+            source_health: Dict[str, Dict[str, Any]] = {}
+            extra_discoveries: List[Dict[str, Any]] = []
 
             for domain in targets.get("domains", []):
-                subdomains = await self._discover_subdomains(domain, tmpdir, config)
-                all_subdomains.update(subdomains)
+                subdomains = await self._discover_subdomains_with_sources(domain, tmpdir, config, source_health)
+                self._merge_discovery_evidence(discovery_evidence, subdomains)
                 log.info("subdomains_discovered", domain=domain, count=len(subdomains))
+
+            extra_discoveries.extend(await self._expand_asn_targets(targets.get("asns", []), config, source_health))
+            extra_discoveries.extend(await self._discover_reverse_dns_targets(targets, config, source_health))
+            extra_discoveries.extend(await self._discover_cloud_storage(targets, config, source_health))
+
+            all_subdomains: Set[str] = set(discovery_evidence)
 
             # ── Phase 2: DNS Resolution ───────────────────────
             resolved = await self._resolve_dns(list(all_subdomains), tmpdir)
+            wildcard_report = await self._detect_wildcard_dns(targets.get("domains", []), tmpdir, config)
+            resolved, wildcard_skipped = self._suppress_wildcard_generated_hosts(
+                resolved,
+                discovery_evidence,
+                wildcard_report,
+            )
+            all_subdomains.difference_update(wildcard_skipped)
             log.info("dns_resolved", total=len(resolved))
 
             # ── Phase 3: HTTP Probing ─────────────────────────
@@ -184,6 +229,29 @@ class DiscoveryWorker(BaseWorker):
                     dns_info=dns_info,
                     http_info=alive_hosts.get(host, {}),
                 )
+                sources = validation.setdefault("validation_sources", {})
+                evidence = sources.setdefault("evidence", {})
+                evidence["discovery"] = self._serializable_discovery_evidence(
+                    discovery_evidence.get(host, {})
+                )
+                validation_by_host[host] = apply_scope_controls(
+                    validation,
+                    target=host,
+                    allow_patterns=targets.get("scope_allow_patterns", []),
+                    deny_patterns=targets.get("scope_deny_patterns", []),
+                )
+            for host in sorted(all_subdomains - set(validation_by_host)):
+                validation = validate_discovered_host(
+                    host=host,
+                    root_domains=targets.get("domains", []),
+                    dns_info={},
+                    http_info={},
+                )
+                sources = validation.setdefault("validation_sources", {})
+                evidence = sources.setdefault("evidence", {})
+                evidence["discovery"] = self._serializable_discovery_evidence(
+                    discovery_evidence.get(host, {})
+                )
                 validation_by_host[host] = apply_scope_controls(
                     validation,
                     target=host,
@@ -194,13 +262,39 @@ class DiscoveryWorker(BaseWorker):
                 http_data["validation"] = validation_by_host.get(host)
             log.info("http_probed", alive=len(alive_hosts))
 
+            persisted_hosts = {}
+            for host in resolved:
+                http_data = dict(alive_hosts.get(host, {}))
+                http_data["validation"] = validation_by_host.get(host)
+                persisted_hosts[host] = http_data
+
             # ── Phase 4: Persist Assets ───────────────────────
             async with get_session() as db:
-                new_count = await self._persist_assets(
+                new_count, asset_ids_by_host = await self._persist_assets(
                     db, org_id, workspace_id, scan_id,
-                    alive_hosts, resolved
+                    persisted_hosts, resolved, discovery_evidence
                 )
-                await self._update_scan_progress(db, scan_id, assets_found=len(alive_hosts))
+                cloud_new_count, cloud_asset_ids = await self._persist_cloud_assets(
+                    db, org_id, workspace_id, scan_id, extra_discoveries
+                )
+                new_count += cloud_new_count
+                await self._persist_discovered_assets(
+                    db,
+                    org_id,
+                    workspace_id,
+                    scan_id,
+                    discovery_evidence,
+                    validation_by_host,
+                    asset_ids_by_host,
+                    wildcard_skipped,
+                    extra_discoveries,
+                    cloud_asset_ids,
+                )
+                await self._update_scan_progress(
+                    db,
+                    scan_id,
+                    assets_found=len(persisted_hosts) + len(cloud_asset_ids),
+                )
                 await update_scan_phase(
                     db,
                     scan_id,
@@ -210,6 +304,18 @@ class DiscoveryWorker(BaseWorker):
                     resolved_hosts=len(resolved),
                     alive_hosts=len(alive_hosts),
                     new_assets=new_count,
+                    source_breakdown=self._source_breakdown(discovery_evidence),
+                    wildcard_dns=wildcard_report,
+                    wildcard_skipped=len(wildcard_skipped),
+                    source_health=source_health,
+                    asn_candidates=sum(1 for item in extra_discoveries if item.get("asset_type") == "cidr"),
+                    reverse_dns_candidates=sum(1 for item in extra_discoveries if item.get("source") == "reverse_dns"),
+                    cloud_candidates=sum(1 for item in extra_discoveries if item.get("asset_type") == "cloud_bucket"),
+                    generated_candidates=sum(
+                        1
+                        for evidence in discovery_evidence.values()
+                        if evidence.get("generated")
+                    ),
                 )
 
             # ── Phase 5: Queue downstream tasks ───────────────
@@ -251,36 +357,576 @@ class DiscoveryWorker(BaseWorker):
         tmpdir: Path,
         config: Dict,
     ) -> Set[str]:
-        results: Set[str] = set()
+        discovered = await self._discover_subdomains_with_sources(domain, tmpdir, config, {})
+        return set(discovered)
 
-        # Run all discovery methods in parallel
-        tasks = [
-            self._run_subfinder(domain, tmpdir, config),
-            self._run_assetfinder(domain, tmpdir),
-            self._run_crtsh(domain),
-            self._run_chaos(domain, tmpdir, config),
+    async def _discover_subdomains_with_sources(
+        self,
+        domain: str,
+        tmpdir: Path,
+        config: Dict,
+        source_health: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        """Run passive/generated discovery and keep per-host source evidence."""
+        candidates: Dict[str, Dict[str, Any]] = {}
+        source_tasks = [
+            ("subfinder", self._run_subfinder(domain, tmpdir, config)),
+            ("assetfinder", self._run_assetfinder(domain, tmpdir)),
+            ("crtsh", self._run_crtsh(domain, source_health)),
         ]
 
         if config.get("use_amass", False):
-            tasks.append(self._run_amass(domain, tmpdir))
+            source_tasks.append(("amass", self._run_amass(domain, tmpdir)))
+        if config.get("wayback_discovery", True):
+            source_tasks.append(("wayback", self._run_wayback(domain, config, source_health)))
+        if config.get("commoncrawl_discovery", True):
+            source_tasks.append(("commoncrawl", self._run_commoncrawl(domain, config, source_health)))
 
-        discovered = await asyncio.gather(*tasks, return_exceptions=True)
+        discovered = await asyncio.gather(
+            *(task for _, task in source_tasks),
+            return_exceptions=True,
+        )
 
-        for result in discovered:
+        for (source, _), result in zip(source_tasks, discovered):
             if isinstance(result, Exception):
-                log.warning("discovery_tool_failed", error=str(result))
+                log.warning("discovery_tool_failed", source=source, error=str(result))
+                self._record_source_health(source_health, source, domain, "failed", error=str(result)[:200])
                 continue
-            if isinstance(result, set):
-                results.update(result)
+            if not isinstance(result, set):
+                continue
+            existing = (source_health.get(source, {}).get("domains") or {}).get(domain, {})
+            if existing.get("status") not in {"failed", "skipped"}:
+                self._record_source_health(source_health, source, domain, "ok", count=len(result))
+            for host in result:
+                self._add_discovery_candidate(
+                    candidates,
+                    host,
+                    domain,
+                    source,
+                    generated=False,
+                    evidence={"source": source},
+                )
 
-        # Sanitize
-        clean = set()
-        for sub in results:
-            sub = sub.strip().lower().rstrip(".")
-            if sub and domain in sub and self._is_valid_hostname(sub):
-                clean.add(sub)
+        if config.get("dns_bruteforce", True):
+            max_hosts = int(config.get("dns_bruteforce_max_hosts", 80))
+            words = config.get("dns_bruteforce_words") or None
+            generated = generate_bruteforce_hosts(domain, words=words, max_hosts=max_hosts)
+            self._record_source_health(source_health, "dns_bruteforce", domain, "ok", count=len(generated))
+            for host in generated:
+                self._add_discovery_candidate(
+                    candidates,
+                    host,
+                    domain,
+                    "dns_bruteforce",
+                    generated=True,
+                    evidence={"source": "dns_bruteforce", "strategy": "wordlist"},
+                )
 
-        return clean
+        if config.get("dns_permutations", True):
+            max_hosts = int(config.get("dns_permutation_max_hosts", 80))
+            generated = generate_permutation_hosts(domain, candidates.keys(), max_hosts=max_hosts)
+            self._record_source_health(source_health, "dns_permutation", domain, "ok", count=len(generated))
+            for host in generated:
+                self._add_discovery_candidate(
+                    candidates,
+                    host,
+                    domain,
+                    "dns_permutation",
+                    generated=True,
+                    evidence={"source": "dns_permutation", "strategy": "env_affix"},
+                )
+
+        return candidates
+
+    def _add_discovery_candidate(
+        self,
+        candidates: Dict[str, Dict[str, Any]],
+        host: str,
+        domain: str,
+        source: str,
+        *,
+        generated: bool,
+        evidence: Dict[str, Any],
+    ) -> None:
+        host = normalize_host(host).lstrip("*.")
+        domain = normalize_host(domain)
+        if not host or not (host == domain or host.endswith(f".{domain}")) or not self._is_valid_hostname(host):
+            return
+        entry = candidates.setdefault(
+            host,
+            {
+                "sources": set(),
+                "evidence": {},
+                "generated": False,
+            },
+        )
+        entry["sources"].add(source)
+        entry["generated"] = bool(entry.get("generated")) or generated
+        entry.setdefault("evidence", {})[source] = evidence
+
+    def _merge_discovery_evidence(
+        self,
+        target: Dict[str, Dict[str, Any]],
+        source: Dict[str, Dict[str, Any]],
+    ) -> None:
+        for host, evidence in source.items():
+            entry = target.setdefault(
+                host,
+                {
+                    "sources": set(),
+                    "evidence": {},
+                    "generated": False,
+                },
+            )
+            entry["sources"].update(evidence.get("sources") or [])
+            entry["evidence"].update(evidence.get("evidence") or {})
+            entry["generated"] = bool(entry.get("generated")) or bool(evidence.get("generated"))
+
+    def _serializable_discovery_evidence(self, evidence: Dict[str, Any]) -> Dict[str, Any]:
+        sources = sorted(evidence.get("sources") or [])
+        return {
+            "sources": sources,
+            "source_count": len(sources),
+            "generated": bool(evidence.get("generated", False)),
+            "evidence": json_safe(evidence.get("evidence") or {}),
+        }
+
+    def _source_breakdown(self, discovery_evidence: Dict[str, Dict[str, Any]]) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for evidence in discovery_evidence.values():
+            for source in evidence.get("sources") or []:
+                counts[source] = counts.get(source, 0) + 1
+        return dict(sorted(counts.items(), key=lambda item: item[0]))
+
+    def _record_source_health(
+        self,
+        source_health: Dict[str, Dict[str, Any]],
+        source: str,
+        domain: str,
+        status: str,
+        *,
+        count: int = 0,
+        error: Optional[str] = None,
+    ) -> None:
+        entry = source_health.setdefault(
+            source,
+            {"status": "ok", "count": 0, "errors": [], "domains": {}},
+        )
+        previous = entry["domains"].get(domain, {})
+        domain_count = int(previous.get("count") or 0) + int(count or 0)
+        domain_entry = {
+            "status": status,
+            "count": domain_count,
+        }
+        if error:
+            domain_entry["error"] = error
+            entry["errors"].append({"domain": domain, "error": error})
+        entry["domains"][domain] = domain_entry
+        entry["count"] = sum(int(item.get("count") or 0) for item in entry["domains"].values())
+        statuses = {item.get("status") for item in entry["domains"].values()}
+        if "failed" in statuses:
+            entry["status"] = "partial" if statuses - {"failed"} else "failed"
+        elif "skipped" in statuses and statuses <= {"skipped"}:
+            entry["status"] = "skipped"
+        else:
+            entry["status"] = "ok"
+
+    def _in_domain(self, host: str, domain: str) -> bool:
+        host = normalize_host(host).lstrip("*.")
+        domain = normalize_host(domain)
+        return bool(host and (host == domain or host.endswith(f".{domain}")))
+
+    async def _run_wayback(
+        self,
+        domain: str,
+        config: Dict,
+        source_health: Dict[str, Dict[str, Any]],
+    ) -> Set[str]:
+        """Extract hostnames from the Internet Archive CDX API."""
+        import aiohttp
+
+        limit = int(config.get("wayback_limit", 500))
+        url = (
+            "https://web.archive.org/cdx"
+            f"?url=*.{domain}/*&output=json&fl=original&collapse=urlkey&limit={limit}"
+        )
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25)) as session:
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        log.warning("wayback_http_error", domain=domain, status=resp.status)
+                        self._record_source_health(source_health, "wayback", domain, "failed", error=f"http_{resp.status}")
+                        return set()
+                    rows = await resp.json(content_type=None)
+        except Exception as exc:
+            log.warning("wayback_error", domain=domain, error=str(exc)[:200])
+            self._record_source_health(source_health, "wayback", domain, "failed", error=f"{type(exc).__name__}: {exc}"[:200])
+            return set()
+
+        hosts = set()
+        for row in rows[1:] if isinstance(rows, list) else []:
+            raw_url = row[0] if isinstance(row, list) and row else ""
+            host = self._host_from_url(raw_url)
+            if self._in_domain(host, domain):
+                hosts.add(host)
+        return hosts
+
+    async def _run_commoncrawl(
+        self,
+        domain: str,
+        config: Dict,
+        source_health: Dict[str, Dict[str, Any]],
+    ) -> Set[str]:
+        """Extract hostnames from the latest Common Crawl index."""
+        import aiohttp
+
+        limit = int(config.get("commoncrawl_limit", 500))
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+                async with session.get("https://index.commoncrawl.org/collinfo.json") as resp:
+                    if resp.status != 200:
+                        self._record_source_health(source_health, "commoncrawl", domain, "failed", error=f"collinfo_http_{resp.status}")
+                        return set()
+                    indexes = await resp.json(content_type=None)
+                if not indexes:
+                    return set()
+                index_id = indexes[0].get("id")
+                if not index_id:
+                    return set()
+                query_url = (
+                    f"https://index.commoncrawl.org/{index_id}-index"
+                    f"?url=*.{domain}/*&output=json&fl=url&limit={limit}"
+                )
+                async with session.get(query_url) as resp:
+                    if resp.status != 200:
+                        log.warning("commoncrawl_http_error", domain=domain, status=resp.status)
+                        self._record_source_health(source_health, "commoncrawl", domain, "failed", error=f"http_{resp.status}")
+                        return set()
+                    text = await resp.text()
+        except Exception as exc:
+            log.warning("commoncrawl_error", domain=domain, error=str(exc)[:200])
+            self._record_source_health(source_health, "commoncrawl", domain, "failed", error=f"{type(exc).__name__}: {exc}"[:200])
+            return set()
+
+        hosts = set()
+        for line in text.splitlines():
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            host = self._host_from_url(row.get("url", ""))
+            if self._in_domain(host, domain):
+                hosts.add(host)
+        return hosts
+
+    def _host_from_url(self, raw_url: str) -> str:
+        parsed = urlparse(raw_url if "://" in raw_url else f"https://{raw_url}")
+        return normalize_host(parsed.hostname or "")
+
+    async def _expand_asn_targets(
+        self,
+        asns: List[str],
+        config: Dict,
+        source_health: Dict[str, Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        if not config.get("asn_expansion", True):
+            return []
+        candidates: List[Dict[str, Any]] = []
+        max_prefixes = int(config.get("asn_prefix_max", 25))
+        for raw_asn in asns or []:
+            asn = str(raw_asn or "").upper().replace("AS", "").strip()
+            if not asn.isdigit():
+                continue
+            source_key = f"AS{asn}"
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection("whois.cymru.com", 43),
+                    timeout=10,
+                )
+                query = f"begin\nverbose\nAS{asn}\nend\n"
+                writer.write(query.encode())
+                await writer.drain()
+                data = await asyncio.wait_for(reader.read(65536), timeout=15)
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+            except Exception as exc:
+                self._record_source_health(
+                    source_health,
+                    "asn_expansion",
+                    source_key,
+                    "failed",
+                    error=f"{type(exc).__name__}: {exc}"[:200],
+                )
+                continue
+
+            prefixes = []
+            for line in data.decode(errors="ignore").splitlines():
+                if "|" not in line or "BGP Prefix" in line:
+                    continue
+                parts = [part.strip() for part in line.split("|")]
+                if len(parts) < 3:
+                    continue
+                prefix = parts[2]
+                try:
+                    ipaddress.ip_network(prefix, strict=False)
+                except ValueError:
+                    continue
+                prefixes.append({
+                    "value": prefix,
+                    "asset_type": "cidr",
+                    "source": "asn_expansion",
+                    "confidence": 0.65,
+                    "status": "candidate",
+                    "selected": False,
+                    "skip_reason": "asn_prefix_not_auto_scanned",
+                    "evidence": {
+                        "asn": f"AS{asn}",
+                        "asn_org": parts[6] if len(parts) > 6 else None,
+                        "country": parts[3] if len(parts) > 3 else None,
+                        "registry": parts[4] if len(parts) > 4 else None,
+                    },
+                })
+                if len(prefixes) >= max_prefixes:
+                    break
+            candidates.extend(prefixes)
+            self._record_source_health(source_health, "asn_expansion", source_key, "ok", count=len(prefixes))
+        return candidates
+
+    async def _discover_reverse_dns_targets(
+        self,
+        targets: Dict[str, Any],
+        config: Dict,
+        source_health: Dict[str, Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        if not config.get("reverse_dns_discovery", True):
+            return []
+        ip_ranges = targets.get("ip_ranges") or []
+        if not ip_ranges:
+            self._record_source_health(source_health, "reverse_dns", "ip_ranges", "skipped", error="no_ip_ranges")
+            return []
+
+        max_ips = max(0, int(config.get("reverse_dns_max_ips", 64)))
+        if max_ips <= 0:
+            self._record_source_health(source_health, "reverse_dns", "ip_ranges", "skipped", error="budget_zero")
+            return []
+
+        ips: List[str] = []
+        for raw_target in ip_ranges:
+            if len(ips) >= max_ips:
+                break
+            try:
+                network = ipaddress.ip_network(str(raw_target).strip(), strict=False)
+            except ValueError:
+                try:
+                    address = ipaddress.ip_address(str(raw_target).strip())
+                except ValueError:
+                    continue
+                if address.version == 4:
+                    ips.append(str(address))
+                continue
+            if network.version != 4:
+                continue
+            for address in network.hosts():
+                ips.append(str(address))
+                if len(ips) >= max_ips:
+                    break
+
+        if not ips:
+            self._record_source_health(source_health, "reverse_dns", "ip_ranges", "skipped", error="no_ipv4_candidates")
+            return []
+
+        root_domains = [normalize_host(domain) for domain in targets.get("domains", []) if normalize_host(domain)]
+        semaphore = asyncio.Semaphore(max(1, int(config.get("reverse_dns_concurrency", 16))))
+
+        async def lookup(ip: str) -> Optional[Dict[str, Any]]:
+            async with semaphore:
+                try:
+                    loop = asyncio.get_running_loop()
+                    host, _ = await asyncio.wait_for(loop.getnameinfo((ip, 0), 0), timeout=3)
+                except Exception:
+                    return None
+            host = normalize_host(str(host).rstrip("."))
+            if not host or host == ip:
+                return None
+            in_scope = any(self._in_domain(host, domain) for domain in root_domains)
+            return {
+                "value": host,
+                "asset_type": "subdomain",
+                "source": "reverse_dns",
+                "confidence": 0.7 if in_scope else 0.45,
+                "status": "candidate",
+                "selected": False,
+                "skip_reason": "reverse_dns_not_auto_scanned",
+                "evidence": {
+                    "ip": ip,
+                    "ptr": host,
+                    "scope_match": in_scope,
+                    "ownership_confidence": "medium" if in_scope else "low",
+                },
+            }
+
+        results = await asyncio.gather(*(lookup(ip) for ip in ips))
+        discoveries = [item for item in results if item]
+        self._record_source_health(source_health, "reverse_dns", "ip_ranges", "ok", count=len(discoveries))
+        return discoveries
+
+    async def _discover_cloud_storage(
+        self,
+        targets: Dict[str, Any],
+        config: Dict,
+        source_health: Dict[str, Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        if not config.get("cloud_storage_discovery", True):
+            return []
+        import aiohttp
+
+        bucket_names = self._cloud_bucket_names(targets, int(config.get("cloud_bucket_max_candidates", 24)))
+        if not bucket_names:
+            return []
+
+        providers = [
+            ("aws_s3", "https://{bucket}.s3.amazonaws.com/"),
+            ("gcs", "https://storage.googleapis.com/{bucket}/"),
+            ("azure_blob", "https://{bucket}.blob.core.windows.net/"),
+        ]
+        discoveries: List[Dict[str, Any]] = []
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for provider, template in providers:
+                provider_count = 0
+                for bucket in bucket_names:
+                    url = template.format(bucket=bucket)
+                    try:
+                        async with session.head(url, allow_redirects=True) as resp:
+                            status_code = resp.status
+                    except Exception:
+                        try:
+                            async with session.get(url, allow_redirects=True) as resp:
+                                status_code = resp.status
+                        except Exception as exc:
+                            discoveries.append(self._cloud_candidate(provider, bucket, url, None, "unknown", f"{type(exc).__name__}: {exc}"[:200]))
+                            continue
+
+                    exposure = self._classify_bucket_status(status_code)
+                    discoveries.append(self._cloud_candidate(provider, bucket, url, status_code, exposure, None))
+                    if exposure in {"public", "private_exists"}:
+                        provider_count += 1
+                self._record_source_health(source_health, provider, "cloud_storage", "ok", count=provider_count)
+        return discoveries
+
+    def _cloud_bucket_names(self, targets: Dict[str, Any], max_candidates: int) -> List[str]:
+        values = []
+        raw_values = list(targets.get("domains", []) or [])
+        raw_values.extend([targets.get("organization_name"), targets.get("company_name")])
+        for value in raw_values:
+            normalized = re.sub(r"[^a-z0-9.-]+", "-", str(value or "").lower()).strip("-.")
+            if not normalized:
+                continue
+            no_dot = normalized.replace(".", "")
+            dashed = normalized.replace(".", "-")
+            first = normalized.split(".")[0]
+            values.extend([normalized, no_dot, dashed, first])
+            values.extend([f"{first}-assets", f"{first}-static", f"{first}-backup", f"{first}-media"])
+        return dedupe_preserve_order([value for value in values if 3 <= len(value) <= 63])[:max_candidates]
+
+    def _classify_bucket_status(self, status_code: Optional[int]) -> str:
+        if status_code in {200, 206}:
+            return "public"
+        if status_code in {401, 403}:
+            return "private_exists"
+        if status_code == 404:
+            return "not_found"
+        return "unknown"
+
+    def _cloud_candidate(
+        self,
+        provider: str,
+        bucket: str,
+        url: str,
+        status_code: Optional[int],
+        exposure: str,
+        error: Optional[str],
+    ) -> Dict[str, Any]:
+        return {
+            "value": f"{provider}:{bucket}",
+            "asset_type": "cloud_bucket",
+            "source": provider,
+            "confidence": 0.7 if exposure in {"public", "private_exists"} else 0.25,
+            "status": exposure,
+            "selected": False,
+            "skip_reason": "cloud_storage_safe_check_only",
+            "evidence": {
+                "provider": provider,
+                "bucket": bucket,
+                "url": url,
+                "http_status": status_code,
+                "exposure": exposure,
+                "error": error,
+            },
+        }
+
+    async def _detect_wildcard_dns(
+        self,
+        domains: List[str],
+        tmpdir: Path,
+        config: Dict,
+    ) -> Dict[str, Any]:
+        if not config.get("wildcard_dns_detection", True):
+            return {"enabled": False, "domains": {}}
+
+        report = {"enabled": True, "domains": {}}
+        for domain in domains:
+            labels = [
+                "asm-wildcard-"
+                + "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(12))
+                for _ in range(3)
+            ]
+            probes = [f"{label}.{domain}" for label in labels]
+            resolved = await self._resolve_dns(probes, tmpdir)
+            fingerprints = [dns_fingerprint(record) for record in resolved.values()]
+            fingerprints = [fp for fp in fingerprints if fp]
+            wildcard_fingerprints = []
+            for fp in fingerprints:
+                if fingerprints.count(fp) >= 2 and fp not in wildcard_fingerprints:
+                    wildcard_fingerprints.append(fp)
+            report["domains"][domain] = {
+                "probes": probes,
+                "wildcard": bool(wildcard_fingerprints),
+                "fingerprints": [list(fp) for fp in wildcard_fingerprints],
+            }
+        return report
+
+    def _suppress_wildcard_generated_hosts(
+        self,
+        resolved: Dict[str, Dict[str, Any]],
+        discovery_evidence: Dict[str, Dict[str, Any]],
+        wildcard_report: Dict[str, Any],
+    ) -> tuple[Dict[str, Dict[str, Any]], list[str]]:
+        wildcard_fps = {
+            tuple(fingerprint)
+            for domain_report in (wildcard_report.get("domains") or {}).values()
+            for fingerprint in domain_report.get("fingerprints") or []
+        }
+        if not wildcard_fps:
+            return resolved, []
+
+        filtered = {}
+        skipped = []
+        for host, record in resolved.items():
+            evidence = discovery_evidence.get(host, {})
+            fingerprint = dns_fingerprint(record)
+            generated_only = bool(evidence.get("generated")) and not (
+                set(evidence.get("sources") or []) - {"dns_bruteforce", "dns_permutation"}
+            )
+            if generated_only and fingerprint in wildcard_fps:
+                skipped.append(host)
+                evidence["wildcard_suppressed"] = True
+                continue
+            filtered[host] = record
+        return filtered, skipped
 
     async def _run_subfinder(self, domain: str, tmpdir: Path, config: Dict) -> Set[str]:
         subfinder_path = tool_path("subfinder")
@@ -349,7 +995,7 @@ class DiscoveryWorker(BaseWorker):
         except Exception as e:
             log.warning("assetfinder_error", domain=domain, error=f"{type(e).__name__}: {e}"[:200])
 
-    async def _run_crtsh(self, domain: str) -> Set[str]:
+    async def _run_crtsh(self, domain: str, source_health: Dict[str, Dict[str, Any]]) -> Set[str]:
         """Query crt.sh certificate transparency logs with retries."""
         import aiohttp
         results = set()
@@ -373,7 +1019,7 @@ class DiscoveryWorker(BaseWorker):
                                 name_value = entry.get("name_value", "")
                                 for name in name_value.splitlines():
                                     name = name.strip().lstrip("*.")
-                                    if name and domain in name:
+                                    if name and (name == domain or name.endswith(f".{domain}")):
                                         results.add(name.lower())
                             return results
                         elif resp.status in (502, 503, 429) and attempt < 2:
@@ -382,6 +1028,7 @@ class DiscoveryWorker(BaseWorker):
                             await asyncio.sleep(wait)
                         else:
                             log.warning("crtsh_http_error", domain=domain, status=resp.status, attempt=attempt)
+                            self._record_source_health(source_health, "crtsh", domain, "failed", error=f"http_{resp.status}")
                             return results
             except (asyncio.TimeoutError, aiohttp.ClientError) as e:
                 if attempt < 2:
@@ -390,31 +1037,9 @@ class DiscoveryWorker(BaseWorker):
                     await asyncio.sleep(wait)
                 else:
                     log.warning("crtsh_failed", domain=domain, error=f"{type(e).__name__}: {e}"[:200])
+                    self._record_source_health(source_health, "crtsh", domain, "failed", error=f"{type(e).__name__}: {e}"[:200])
 
         return results
-
-    async def _run_chaos(self, domain: str, tmpdir: Path, config: Dict) -> Set[str]:
-        """Query ProjectDiscovery Chaos dataset."""
-        chaos_key = os.getenv("CHAOS_API_KEY", "")
-        chaos_path = tool_path("chaos")
-        if not chaos_key or not chaos_path:
-            return set()
-
-        outfile = tmpdir / f"chaos_{domain}.txt"
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                chaos_path, "-d", domain, "-o", str(outfile), "-silent",
-                env={**os.environ, "CHAOS_KEY": chaos_key},
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await asyncio.wait_for(proc.communicate(), timeout=60)
-            if outfile.exists():
-                return set(outfile.read_text().splitlines())
-        except Exception as e:
-            log.warning("chaos_error", domain=domain, error=str(e))
-
-        return set()
 
     async def _run_amass(self, domain: str, tmpdir: Path) -> Set[str]:
         amass_path = tool_path("amass")
@@ -791,17 +1416,22 @@ class DiscoveryWorker(BaseWorker):
         scan_id: str,
         alive_hosts: Dict[str, Dict],
         dns_data: Dict[str, Dict],
-    ) -> int:
+        discovery_evidence: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> tuple[int, Dict[str, Any]]:
         """Upsert discovered assets into the database."""
         from sqlalchemy import select, update
         from sqlalchemy.dialects.postgresql import insert as pg_insert
         from workers.db_models import Asset, Subdomain, Technology
 
         new_count = 0
+        asset_ids_by_host: Dict[str, Any] = {}
         now = datetime.now(timezone.utc)
 
         for host, http_data in alive_hosts.items():
             validation = http_data.get("validation") or {}
+            discovery = self._serializable_discovery_evidence(
+                (discovery_evidence or {}).get(host, {})
+            )
             # Upsert Asset
             asset_values = {
                 "org_id": org_id,
@@ -822,6 +1452,11 @@ class DiscoveryWorker(BaseWorker):
                 "last_seen": now,
                 "metadata": {
                     "source": "discovery_worker",
+                    "discovery": {
+                        **discovery,
+                        "scan_id": scan_id,
+                        "last_observed_at": now.isoformat(),
+                    },
                     "validation": validation.get("validation_sources", {}),
                 },
             }
@@ -848,6 +1483,7 @@ class DiscoveryWorker(BaseWorker):
             result = await db.execute(stmt)
             row = result.fetchone()
             asset_id = row[0]
+            asset_ids_by_host[host] = asset_id
             is_new = row[1] and (now - row[1]).seconds < 5
             if is_new:
                 new_count += 1
@@ -882,14 +1518,16 @@ class DiscoveryWorker(BaseWorker):
                     "txt": dns_info.get("txt", []),
                     "ns": dns_info.get("ns", []),
                     "cname": dns_info.get("cname", []),
+                    "discovery_sources": discovery.get("sources", []),
+                    "discovery_evidence": discovery.get("evidence", {}),
                 },
                 "http_status": http_data.get("status_code"),
-                "http_title": http_data.get("title", "")[:500],
-                "http_server": http_data.get("webserver", "")[:255],
+                "http_title": (http_data.get("title") or "")[:500],
+                "http_server": (http_data.get("webserver") or "")[:255],
                 "content_length": http_data.get("content_length"),
-                "response_hash": http_data.get("hash", "")[:64],
+                "response_hash": (http_data.get("hash") or "")[:64],
                 "technologies": [tech["name"] for tech in technologies],
-                "cdn_provider": http_data.get("cdn_name", "")[:100] or None,
+                "cdn_provider": (http_data.get("cdn_name") or "")[:100] or None,
                 "tls_info": tls if tls else None,
                 "tls_expiry": self._parse_tls_expiry(tls),
                 "tls_issuer": tls.get("issuer", {}).get("organization", "")[:500] if tls else None,
@@ -941,7 +1579,177 @@ class DiscoveryWorker(BaseWorker):
 
         await db.commit()
         log.info("assets_persisted", org_id=org_id, total=len(alive_hosts), new=new_count)
-        return new_count
+        return new_count, asset_ids_by_host
+
+    async def _persist_cloud_assets(
+        self,
+        db: AsyncSession,
+        org_id: str,
+        workspace_id: str,
+        scan_id: str,
+        discoveries: List[Dict[str, Any]],
+    ) -> tuple[int, Dict[str, Any]]:
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+        from workers.db_models import Asset
+
+        new_count = 0
+        asset_ids: Dict[str, Any] = {}
+        now = datetime.now(timezone.utc)
+        for item in discoveries:
+            if item.get("asset_type") != "cloud_bucket":
+                continue
+            exposure = item.get("status")
+            if exposure not in {"public", "private_exists"}:
+                continue
+            value = item["value"]
+            evidence = item.get("evidence") or {}
+            validation = {
+                "method": "cloud_storage_safe_check",
+                "evidence": evidence,
+                "validated_at": now.isoformat(),
+            }
+            asset_values = {
+                "org_id": org_id,
+                "workspace_id": workspace_id,
+                "asset_type": "cloud_bucket",
+                "value": value,
+                "status": "active",
+                "discovery_method": "cloud_storage",
+                "confidence": item.get("confidence", 0.7),
+                "is_in_scope": True,
+                "scope_status": "probable",
+                "ownership_confidence": item.get("confidence", 0.7),
+                "ownership_reason": "bucket name matched organization/domain candidate pattern",
+                "exposure_status": "exposed" if exposure == "public" else "not_exposed",
+                "liveness_status": "alive" if exposure == "public" else "dns_only",
+                "validation_sources": validation,
+                "last_verified_at": now,
+                "last_seen": now,
+                "metadata": {
+                    "source": "discovery_worker",
+                    "discovery": {
+                        "sources": [item.get("source")],
+                        "source_count": 1,
+                        "generated": True,
+                        "scan_id": scan_id,
+                        "last_observed_at": now.isoformat(),
+                        "evidence": {item.get("source"): evidence},
+                    },
+                    "validation": validation,
+                },
+            }
+            stmt = pg_insert(Asset.__table__).values(**asset_values)
+            stmt = stmt.on_conflict_do_update(
+                constraint="uq_asset_org_type_value",
+                set_={
+                    "last_seen": now,
+                    "status": "active",
+                    "confidence": asset_values["confidence"],
+                    "scope_status": asset_values["scope_status"],
+                    "ownership_confidence": asset_values["ownership_confidence"],
+                    "ownership_reason": asset_values["ownership_reason"],
+                    "exposure_status": asset_values["exposure_status"],
+                    "liveness_status": asset_values["liveness_status"],
+                    "validation_sources": asset_values["validation_sources"],
+                    "last_verified_at": now,
+                    "metadata": asset_values["metadata"],
+                },
+            ).returning(Asset.__table__.c.id, Asset.__table__.c.first_seen)
+            result = await db.execute(stmt)
+            row = result.fetchone()
+            asset_ids[value] = row[0]
+            if row[1] and (now - row[1]).seconds < 5:
+                new_count += 1
+        return new_count, asset_ids
+
+    async def _persist_discovered_assets(
+        self,
+        db: AsyncSession,
+        org_id: str,
+        workspace_id: str,
+        scan_id: str,
+        discovery_evidence: Dict[str, Dict[str, Any]],
+        validation_by_host: Dict[str, Dict[str, Any]],
+        asset_ids_by_host: Dict[str, Any],
+        wildcard_skipped: List[str],
+        extra_discoveries: List[Dict[str, Any]],
+        extra_asset_ids: Dict[str, Any],
+    ) -> None:
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+        from workers.db_models import DiscoveredAsset
+
+        now = datetime.now(timezone.utc)
+        suppressed = set(wildcard_skipped or [])
+        rows: List[Dict[str, Any]] = []
+        for host, evidence in discovery_evidence.items():
+            validation = validation_by_host.get(host)
+            selected = should_scan_validated_asset(validation, require_validation=True)
+            status = "suppressed" if host in suppressed else (validation or {}).get("liveness_status", "candidate")
+            skip_reason = "wildcard_suppressed" if host in suppressed else (None if selected else validation_skip_reason(validation))
+            for source in sorted(evidence.get("sources") or []):
+                rows.append({
+                    "id": self._uuid4(),
+                    "org_id": org_id,
+                    "workspace_id": workspace_id,
+                    "scan_id": scan_id,
+                    "asset_id": asset_ids_by_host.get(host),
+                    "value": host,
+                    "asset_type": "subdomain",
+                    "source": source,
+                    "confidence": (validation or {}).get("confidence", 0.5),
+                    "status": status,
+                    "selected": selected,
+                    "skip_reason": skip_reason,
+                    "evidence": json_safe({
+                        "source_evidence": (evidence.get("evidence") or {}).get(source, {}),
+                        "generated": bool(evidence.get("generated")),
+                        "wildcard_suppressed": host in suppressed,
+                        "validation": validation or {},
+                    }),
+                    "last_seen": now,
+                    "updated_at": now,
+                })
+        for item in extra_discoveries:
+            rows.append({
+                "id": self._uuid4(),
+                "org_id": org_id,
+                "workspace_id": workspace_id,
+                "scan_id": scan_id,
+                "asset_id": extra_asset_ids.get(item.get("value")),
+                "value": item.get("value"),
+                "asset_type": item.get("asset_type"),
+                "source": item.get("source"),
+                "confidence": item.get("confidence", 0.5),
+                "status": item.get("status", "candidate"),
+                "selected": bool(item.get("selected", False)),
+                "skip_reason": item.get("skip_reason"),
+                "evidence": json_safe(item.get("evidence") or {}),
+                "last_seen": now,
+                "updated_at": now,
+            })
+        for row in rows:
+            if not row.get("value") or not row.get("source") or not row.get("asset_type"):
+                continue
+            stmt = pg_insert(DiscoveredAsset.__table__).values(**row)
+            stmt = stmt.on_conflict_do_update(
+                constraint="uq_discovered_asset_scan_source",
+                set_={
+                    "scan_id": row["scan_id"],
+                    "asset_id": row["asset_id"],
+                    "confidence": row["confidence"],
+                    "status": row["status"],
+                    "selected": row["selected"],
+                    "skip_reason": row["skip_reason"],
+                    "evidence": row["evidence"],
+                    "last_seen": now,
+                    "updated_at": now,
+                },
+            )
+            await db.execute(stmt)
+
+    def _uuid4(self):
+        import uuid
+        return uuid.uuid4()
 
     # ── Queue downstream tasks ────────────────────────────────
 

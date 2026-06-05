@@ -184,6 +184,13 @@ class NucleiWorker(BaseWorker):
                     for target in targets
                 ],
             )
+            await self._mark_endpoint_targets(
+                db,
+                org_id=org_id,
+                workspace_id=workspace_id,
+                targets=targets,
+                scan_status="running",
+            )
 
         if not targets:
             log.warning("nuclei_no_targets", scan_id=scan_id)
@@ -226,6 +233,7 @@ class NucleiWorker(BaseWorker):
             )
 
             findings = []
+            findings_linked = 0
             if findings_raw:
                 log.info("nuclei_raw_findings", count=len(findings_raw), scan_id=scan_id)
 
@@ -254,6 +262,7 @@ class NucleiWorker(BaseWorker):
 
                 async with get_session() as db:
                     persisted = await self._persist_findings(db, findings, scan_id)
+                    findings_linked = len(persisted)
                     await self._update_scan_findings_count(db, scan_id, len(persisted))
             else:
                 if timed_out:
@@ -285,10 +294,20 @@ class NucleiWorker(BaseWorker):
                 org_id,
                 workspace_id,
                 targets_scanned=len(targets),
-                findings_found=len(findings),
+                findings_found=findings_linked,
             )
 
-        log.info("nuclei_scan_completed", scan_id=scan_id, findings=len(findings))
+        log.info("nuclei_scan_completed", scan_id=scan_id, findings=findings_linked)
+
+        async with get_session() as db:
+            await self._mark_endpoint_targets(
+                db,
+                org_id=org_id,
+                workspace_id=workspace_id,
+                targets=targets,
+                scan_status="completed",
+                last_scanned=True,
+            )
 
     def _tech_tags(self, techs: List[Any]) -> List[str]:
         tags = []
@@ -303,6 +322,42 @@ class NucleiWorker(BaseWorker):
             if tag:
                 tags.append(tag)
         return tags
+
+    async def _mark_endpoint_targets(
+        self,
+        db,
+        *,
+        org_id: str,
+        workspace_id: str,
+        targets: List[str],
+        scan_status: str,
+        last_scanned: bool = False,
+    ) -> None:
+        endpoint_targets = [
+            str(target).strip()
+            for target in targets
+            if str(target).startswith(("http://", "https://"))
+        ]
+        if not endpoint_targets:
+            return
+
+        from sqlalchemy import update
+        from workers.db_models import WebEndpoint
+
+        values: Dict[str, Any] = {"scan_status": scan_status}
+        if last_scanned:
+            values["last_scanned_at"] = datetime.now(timezone.utc)
+
+        await db.execute(
+            update(WebEndpoint)
+            .where(
+                WebEndpoint.org_id == org_id,
+                WebEndpoint.workspace_id == workspace_id,
+                WebEndpoint.url.in_(endpoint_targets),
+            )
+            .values(**values)
+        )
+        await db.commit()
 
     async def _run_nuclei(
         self,
@@ -731,14 +786,18 @@ class NucleiWorker(BaseWorker):
                 change_type = "new" if is_new else "recurring"
 
                 # Link to scan
-                await db.execute(
+                link_result = await db.execute(
                     pg_insert(ScanFinding.__table__).values(
                         scan_id=scan_id,
                         finding_id=finding_id,
                         change_type=change_type,
-                    ).on_conflict_do_nothing()
+                    ).on_conflict_do_nothing(
+                        constraint="uq_scan_findings_scan_finding"
+                    ).returning(ScanFinding.__table__.c.finding_id)
                 )
-                persisted_ids.append(str(finding_id))
+                link_row = link_result.fetchone()
+                if link_row:
+                    persisted_ids.append(str(finding_id))
 
         await db.commit()
         return persisted_ids
@@ -775,11 +834,15 @@ class NucleiWorker(BaseWorker):
             await db.commit()
 
     async def _update_scan_findings_count(self, db, scan_id: str, count: int) -> None:
-        from sqlalchemy import update, func
-        from workers.db_models import Scan
+        from sqlalchemy import update, func, select
+        from workers.db_models import Scan, ScanFinding
+        result = await db.execute(
+            select(func.count(ScanFinding.finding_id)).where(ScanFinding.scan_id == scan_id)
+        )
+        total_findings = result.scalar() or 0
         await db.execute(
             update(Scan).where(Scan.id == scan_id).values(
-                findings_found=Scan.findings_found + count,
+                findings_found=total_findings,
                 progress_pct=func.greatest(Scan.progress_pct, 75),
             )
         )

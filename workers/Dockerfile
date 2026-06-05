@@ -54,7 +54,6 @@ RUN go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest 
     && go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest \
     && go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest \
     && go install -v github.com/projectdiscovery/katana/cmd/katana@latest \
-    && go install -v github.com/projectdiscovery/chaos-client/cmd/chaos@latest \
     && go install -v github.com/lc/gau/v2/cmd/gau@latest \
     && go install -v github.com/ffuf/ffuf/v2@latest \
     && go install -v github.com/tomnomnom/assetfinder@latest \
@@ -79,7 +78,6 @@ RUN pip install --no-cache-dir --upgrade pip \
     && ln -sf /go/bin/amass /usr/local/bin/amass \
     && ln -sf /go/bin/dnsx /usr/local/bin/dnsx \
     && ln -sf /go/bin/naabu /usr/local/bin/naabu \
-    && ln -sf /go/bin/chaos /usr/local/bin/chaos \
     && ln -sf /go/bin/httpx /usr/local/bin/httpx \
     && ln -sf /go/bin/katana /usr/local/bin/katana \
     && ln -sf /go/bin/gau /usr/local/bin/gau \

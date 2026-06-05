@@ -6,7 +6,7 @@ Upgrade the platform from a working scanner pipeline into a production-grade Att
 
 ## Implementation Status
 
-Last updated: 2026-06-04.
+Last updated: 2026-06-05.
 
 ### Completed
 
@@ -78,20 +78,47 @@ Last updated: 2026-06-04.
   - [x] Add RDAP/ASN ownership evidence and confidence scoring.
   - [x] Add organization-level allow/deny pattern controls beyond root domains.
   - [x] Add explicit analyst review workflow for `needs_review` assets.
+- [x] **Milestone 3: Discovery Engine V2 - achieved as of 2026-06-04**
+  - [x] Added per-host discovery source evidence for subfinder, assetfinder, crt.sh, optional amass, Wayback, Common Crawl, DNS brute force, and DNS permutations.
+  - [x] Added bounded passive archive host extraction from Wayback and Common Crawl.
+  - [x] Added bounded DNS brute-force candidates and conservative environment-style permutations.
+  - [x] Added wildcard DNS probe detection and suppression for generated-only wildcard matches.
+  - [x] Discovery now records unresolved candidates with validation evidence instead of generic `missing_validation`.
+  - [x] Discovery now persists resolved DNS-only hosts as assets, not only HTTP-alive hosts.
+  - [x] Discovery phase summaries now include source breakdown, generated candidate count, wildcard DNS report, and wildcard skipped count.
+  - [x] Asset detail API/UI now exposes discovery source evidence for persisted assets.
+  - [x] Scan detail UI now shows discovery source distribution and wildcard suppression details.
+  - [x] Runtime validation completed with fresh `indomaret.co.id` and `comika.id` scans: discovery evidence, wildcard handling, skip reasons, DNS-only asset persistence, and deduplicated findings counters are working.
+  - [x] Added unique scan-finding association guard so result counts stay aligned with distinct findings.
+  - [x] Added normalized `discovered_assets` records for raw discovery candidates, per-scan source persistence, first/last seen timestamps, status, skip reasons, and JSON evidence.
+  - [x] Added source health reporting for crt.sh, Wayback, Common Crawl, generated DNS sources, reverse DNS, cloud checks, and optional providers so failed/partial/skipped sources are visible in scan detail UI.
+  - [x] Removed Shodan, SecurityTrails, Censys, and Chaos API integrations from discovery so the default discovery stack stays focused on open-source tooling and no paid/entitled provider APIs.
+  - [x] Removed VirusTotal, AbuseIPDB, OTX, and CriminalIP API configuration/plugin paths from enrichment so runtime enrichment stays no-key by default.
+  - [x] Added ASN-to-prefix expansion plus bounded reverse DNS candidate extraction with conservative ownership confidence and no default auto-scan.
+  - [x] Added cloud object storage candidate generation and safe exposure checks for S3, GCS, and Azure Blob.
 
 ### Not Started
 
-- [ ] Milestone 3: Discovery Engine V2.
-- [ ] Milestone 4: Endpoint Intelligence V2.
+- [x] **Milestone 4: Endpoint Intelligence V2 - implemented on 2026-06-04**
+  - [x] Added first-class endpoint score, score reasons, endpoint type, sources, source count, selected state, selected reason, scan status, and last scanned timestamp fields.
+  - [x] Added Alembic migration `014_endpoint_intelligence_v2` with safe backfill from legacy endpoint metadata.
+  - [x] Crawler now normalizes and deduplicates URLs across Katana, GAU, and FFUF source lists.
+  - [x] Crawler now validates and persists each crawl target root URL as a low-score `root_probe` endpoint (added 2026-06-05), so reachable hosts still show crawl evidence when no child paths are found.
+  - [x] Crawler now classifies endpoint type (`root`, `api`, `auth`, `admin`, `upload`, `static`, `parameterized`, `graphql`, `swagger`, `health`, `debug`, `unknown`).
+  - [x] Crawler now scores endpoints deterministically with explicit reasons and source-count signal.
+  - [x] Crawler now selects bounded endpoint nuclei targets by score, URL tie-breaker, status eligibility, threshold, and configured cap.
+  - [x] Endpoint nuclei runs now update endpoint scan status and `last_scanned_at`.
+  - [x] Asset endpoint API/UI now exposes score, reasons, source list, classification, selected state, and scan status.
+  - [x] Scan detail now shows endpoint coverage summary from the crawl phase.
 - [ ] Milestone 5: Scanner Coverage Expansion.
 - [ ] Milestone 6: Risk and Finding Lifecycle V2.
 
 ## Current Gaps
 
-- Discovery is still mostly domain/subdomain and web-first. It needs stronger passive sources, DNS brute force, permutations, ASN/IP expansion, and cloud exposure discovery.
+- Discovery now has source attribution, passive archive extraction, bounded DNS generation, wildcard suppression, optional provider hooks, ASN/reverse-DNS expansion, cloud storage safe checks, normalized discovery records, and UI source health. Future work should deepen provider coverage and add dedicated scanner phases for cloud/DNS/TLS/takeover findings.
 - Asset validation is now first-class for the current ASM core. Future work should refine provider coverage and UI review ergonomics as new discovery sources are added.
 - Vulnerability scanning is too nuclei-centric. Nuclei is useful, but ASM also needs TLS, DNS, takeover, secrets, cloud bucket, service, and exposure-specific checks.
-- Endpoint crawling exists, but endpoint intelligence is not yet a complete phase with lifecycle, scoring, selected-for-scan tracking, and UI explanations.
+- Endpoint intelligence now has first-class scoring, classification, selected-for-scan tracking, scan status, and UI explanations. Future work should add richer response-shape analysis and endpoint-to-finding grouping.
 - Risk scoring still needs more business and exposure context, not just scanner severity.
 - UI shows results, but it does not yet behave like an analyst workflow: scan timeline, "why no findings", target coverage, endpoint reasoning, evidence, and remediation flow are still incomplete.
 
@@ -146,15 +173,11 @@ Acceptance criteria:
 Existing tools:
 - `subfinder`
 - `assetfinder`
-- `chaos` where configured
 
 Add or improve sources:
 - crt.sh certificate transparency puller.
 - Common Crawl URL/domain extraction.
 - Wayback host extraction.
-- SecurityTrails integration, optional API key.
-- Censys host/cert integration, optional API key.
-- Shodan domain/host integration, optional API key.
 
 Required output:
 - `discovered_assets` or equivalent normalized records with:
@@ -199,7 +222,6 @@ Suggested sources:
 - Team Cymru whois.
 - RDAP.
 - BGPView optional.
-- Shodan/Censys optional.
 
 Required output:
 - Candidate IP ranges.
@@ -374,7 +396,7 @@ Endpoint fields to add:
 - `selected_reason`
 - `last_scanned_at`
 - `scan_status`
-- `endpoint_type`: api, auth, admin, upload, static, parameterized, graphql, swagger, health, debug, unknown.
+- `endpoint_type`: root, api, auth, admin, upload, static, parameterized, graphql, swagger, health, debug, unknown.
 - `source_count`
 - `sources`
 
@@ -780,16 +802,18 @@ Acceptance:
 ### Milestone 3: Discovery Engine V2
 
 Scope:
-- Add CT logs, Common Crawl/Wayback host extraction, optional SecurityTrails/Censys/Shodan providers.
+- Add CT logs plus Common Crawl/Wayback host extraction.
 - Add DNS brute force and permutations.
 - Add ASN/IP expansion.
 - Add cloud bucket candidates.
 - Persist discovery evidence.
 
 Acceptance:
-- Discovery source breakdown appears in scan detail.
-- Wildcard DNS and duplicate sources are handled.
-- New asset source evidence is visible in asset detail.
+- [x] Discovery source breakdown appears in scan detail.
+- [x] Wildcard DNS and duplicate sources are handled.
+- [x] New asset source evidence is visible in asset detail.
+- [x] Raw discovery candidates persist in `discovered_assets` with source, status, skip reason, and evidence.
+- [x] Runtime smoke scan completed against `comika.id` with 26 discovered subdomains, source health, cloud candidates, and validation-gated target selections.
 
 ### Milestone 4: Endpoint Intelligence V2
 

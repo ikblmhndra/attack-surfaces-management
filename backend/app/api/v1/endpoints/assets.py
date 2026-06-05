@@ -363,7 +363,9 @@ async def get_asset_endpoints(
     interesting: Optional[bool] = Query(None),
     source: Optional[str] = Query(None),
     status_class: Optional[str] = Query(None),
-    limit: int = Query(200, ge=1, le=1000),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=200),
+    limit: Optional[int] = Query(None, ge=1, le=1000, description="Deprecated; use page_size"),
     workspace_id: UUID = Depends(get_workspace_id),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -374,13 +376,23 @@ async def get_asset_endpoints(
     if interesting is not None:
         query = query.where(WebEndpoint.is_interesting == interesting)
     if source:
-        query = query.where(WebEndpoint.source == source)
+        query = query.where(or_(WebEndpoint.source == source, WebEndpoint.sources.contains([source])))
     if status_class:
         query = query.where(WebEndpoint.status_class == status_class)
+    effective_page_size = limit or page_size
+    total = (await db.execute(select(func.count()).select_from(query.subquery()))).scalar_one()
     rows = (await db.execute(
-        query.order_by(WebEndpoint.is_interesting.desc(), WebEndpoint.last_seen.desc()).limit(limit)
+        query.order_by(WebEndpoint.score.desc(), WebEndpoint.is_interesting.desc(), WebEndpoint.last_seen.desc())
+        .offset((page - 1) * effective_page_size)
+        .limit(effective_page_size)
     )).scalars().all()
-    return {"items": [_endpoint_to_dict(row) for row in rows], "total": len(rows)}
+    return {
+        "items": [_endpoint_to_dict(row) for row in rows],
+        "total": total,
+        "page": page,
+        "page_size": effective_page_size,
+        "pages": max(1, (total + effective_page_size - 1) // effective_page_size),
+    }
 
 
 @router.get("/{asset_id:uuid}/findings")
@@ -632,6 +644,7 @@ def _asset_to_dict(asset, sub=None, ip=None, detailed=False) -> dict:
         "criticality": asset.criticality,
         "environment": asset.environment,
         "discovery_method": asset.discovery_method,
+        "discovery_evidence": (asset.metadata_ or {}).get("discovery", {}),
         "first_seen": asset.first_seen.isoformat() if asset.first_seen else None,
         "last_seen": asset.last_seen.isoformat() if asset.last_seen else None,
     }
@@ -716,6 +729,15 @@ def _endpoint_to_dict(endpoint) -> dict:
         "is_api": endpoint.is_api,
         "is_auth": endpoint.is_auth,
         "is_interesting": endpoint.is_interesting,
+        "score": endpoint.score,
+        "score_reasons": endpoint.score_reasons or [],
+        "endpoint_type": endpoint.endpoint_type,
+        "selected_for_scan": endpoint.selected_for_scan,
+        "selected_reason": endpoint.selected_reason,
+        "scan_status": endpoint.scan_status,
+        "last_scanned_at": endpoint.last_scanned_at.isoformat() if endpoint.last_scanned_at else None,
+        "sources": endpoint.sources or [],
+        "source_count": endpoint.source_count,
         "metadata": endpoint.metadata_ or {},
         "last_seen": endpoint.last_seen.isoformat() if endpoint.last_seen else None,
     }

@@ -1,11 +1,11 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import {
   ArrowLeft, Globe, Server, Shield, RefreshCw, AlertTriangle,
   Layers, Lock, Network, Activity, Eye, ExternalLink,
-  MapPin, Clock, Cpu, ChevronRight, ChevronDown
+  MapPin, Clock, Cpu, ChevronLeft, ChevronRight, ChevronDown
 } from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { formatDistanceToNow, format } from "date-fns";
@@ -25,6 +25,8 @@ const HTTP_STATUS_CONFIG: Record<string, { label: string; className: string }> =
   other:         { label: "Other",         className: "bg-surface-700 text-muted-foreground border-border" },
 };
 
+const ENDPOINTS_PAGE_SIZE = 25;
+
 export default function AssetDetailPage() {
   const params = useParams();
   const router = useRouter();
@@ -32,6 +34,7 @@ export default function AssetDetailPage() {
   const assetId = params.id as string;
 
   const [activeTab, setActiveTab] = useState<"overview" | "endpoints" | "findings" | "screenshots" | "intel">("overview");
+  const [endpointPage, setEndpointPage] = useState(1);
 
   const { data: asset, isLoading } = useQuery({
     queryKey: ["asset", assetId],
@@ -54,9 +57,9 @@ export default function AssetDetailPage() {
     enabled: !!assetId && activeTab === "findings",
   });
 
-  const { data: endpoints } = useQuery({
-    queryKey: ["asset-endpoints", assetId],
-    queryFn: () => assetsAPI.getEndpoints(assetId).then(r => r.data),
+  const { data: endpoints, isFetching: endpointsFetching } = useQuery({
+    queryKey: ["asset-endpoints", assetId, endpointPage],
+    queryFn: () => assetsAPI.getEndpoints(assetId, { page: endpointPage, page_size: ENDPOINTS_PAGE_SIZE }).then(r => r.data),
     enabled: !!assetId && activeTab === "endpoints",
   });
 
@@ -79,6 +82,11 @@ export default function AssetDetailPage() {
   const openFindingsCount = Array.isArray(asset?.open_findings)
     ? asset.open_findings.length
     : Number(asset?.open_findings || 0);
+  const endpointPages = endpoints?.pages ?? 1;
+
+  useEffect(() => {
+    setEndpointPage(1);
+  }, [assetId]);
 
   const TABS: { id: "overview" | "endpoints" | "findings" | "screenshots" | "intel"; label: string; count?: number }[] = [
     { id: "overview", label: "Overview" },
@@ -222,6 +230,33 @@ export default function AssetDetailPage() {
                   </div>
                 )}
               </div>
+
+              {asset.discovery_evidence?.sources?.length > 0 && (
+                <div className="glass-card p-5 space-y-3">
+                  <h2 className="text-sm font-semibold text-foreground">Discovery Evidence</h2>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <div>
+                      <p className="text-xs text-muted-foreground">Sources</p>
+                      <p className="text-sm font-mono text-foreground">{asset.discovery_evidence.source_count || asset.discovery_evidence.sources.length}</p>
+                    </div>
+                    <div>
+                      <p className="text-xs text-muted-foreground">Generated</p>
+                      <p className="text-sm text-foreground">{asset.discovery_evidence.generated ? "Yes" : "No"}</p>
+                    </div>
+                    <div>
+                      <p className="text-xs text-muted-foreground">Scan</p>
+                      <p className="text-sm font-mono text-foreground truncate">{asset.discovery_evidence.scan_id || "—"}</p>
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {asset.discovery_evidence.sources.map((source: string) => (
+                      <span key={source} className="text-xs bg-surface-700 text-muted-foreground px-2 py-1 rounded">
+                        {source.replaceAll("_", " ")}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {/* Subdomain detail */}
               {sub && (
@@ -413,55 +448,114 @@ export default function AssetDetailPage() {
 
           {activeTab === "endpoints" && (
             <div className="space-y-3">
+              {endpoints && endpoints.total > 0 && (
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between text-xs text-muted-foreground">
+                  <span>
+                    Showing {((endpointPage - 1) * endpoints.page_size + 1).toLocaleString()}-
+                    {Math.min(endpointPage * endpoints.page_size, endpoints.total).toLocaleString()} of {endpoints.total.toLocaleString()} endpoints
+                  </span>
+                  {endpointsFetching && (
+                    <span className="inline-flex items-center gap-1.5">
+                      <RefreshCw className="w-3 h-3 animate-spin" /> Updating
+                    </span>
+                  )}
+                </div>
+              )}
               {endpoints?.items?.length > 0 ? (
-                endpoints.items.map((endpoint: any) => (
-                  <div key={endpoint.id} className="glass-card p-4 space-y-2">
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="min-w-0">
-                        <a href={endpoint.url} target="_blank" rel="noopener noreferrer"
-                          className="text-sm font-mono text-foreground hover:text-brand-400 break-all">
-                          {endpoint.url}
-                        </a>
-                        <div className="mt-1 flex flex-wrap items-center gap-1.5">
-                          <HttpStatusBadge status={endpoint.http_status} statusClass={endpoint.status_class} />
-                          <span className="text-xs bg-surface-700 text-muted-foreground border border-surface-600 px-1.5 py-0.5 rounded">
-                            {endpoint.source}
-                          </span>
-                          {endpoint.is_interesting && (
-                            <span className="text-xs bg-brand-500/10 text-brand-400 border border-brand-500/20 px-1.5 py-0.5 rounded">
-                              Interesting
+                <>
+                  {endpoints.items.map((endpoint: any) => (
+                    <div key={endpoint.id} className="glass-card p-4 space-y-2">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <a href={endpoint.url} target="_blank" rel="noopener noreferrer"
+                            className="text-sm font-mono text-foreground hover:text-brand-400 break-all">
+                            {endpoint.url}
+                          </a>
+                          <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                            <HttpStatusBadge status={endpoint.http_status} statusClass={endpoint.status_class} />
+                            <span className="text-xs bg-surface-700 text-muted-foreground border border-surface-600 px-1.5 py-0.5 rounded">
+                              {endpoint.endpoint_type || "unknown"}
+                            </span>
+                            <span className="text-xs bg-surface-700 text-muted-foreground border border-surface-600 px-1.5 py-0.5 rounded">
+                              score {endpoint.score ?? 0}
+                            </span>
+                            <span className={`text-xs border px-1.5 py-0.5 rounded ${
+                              endpoint.scan_status === "completed" ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20" :
+                              endpoint.scan_status === "running" ? "bg-cyan-500/10 text-cyan-400 border-cyan-500/20" :
+                              endpoint.scan_status === "queued" ? "bg-amber-500/10 text-amber-400 border-amber-500/20" :
+                              "bg-surface-700 text-muted-foreground border-surface-600"
+                            }`}>
+                              {String(endpoint.scan_status || "not_scanned").replace(/_/g, " ")}
+                            </span>
+                            {endpoint.is_interesting && (
+                              <span className="text-xs bg-brand-500/10 text-brand-400 border border-brand-500/20 px-1.5 py-0.5 rounded">
+                                Interesting
+                              </span>
+                            )}
+                            {endpoint.is_api && <span className="text-xs bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 px-1.5 py-0.5 rounded">API</span>}
+                            {endpoint.is_auth && <span className="text-xs bg-sky-500/10 text-sky-400 border border-sky-500/20 px-1.5 py-0.5 rounded">Auth</span>}
+                            {endpoint.has_params && <span className="text-xs bg-amber-500/10 text-amber-400 border border-amber-500/20 px-1.5 py-0.5 rounded">Params</span>}
+                          </div>
+                        </div>
+                        <span className="text-xs text-muted-foreground whitespace-nowrap">
+                          {endpoint.last_seen ? formatRelative(endpoint.last_seen) : "—"}
+                        </span>
+                      </div>
+                      {(endpoint.title || endpoint.content_type) && (
+                        <p className="text-xs text-muted-foreground truncate">
+                          {[endpoint.title, endpoint.content_type].filter(Boolean).join(" · ")}
+                        </p>
+                      )}
+                      {((endpoint.sources?.length || 0) > 0 || (endpoint.score_reasons?.length || 0) > 0 || endpoint.selected_for_scan) && (
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          {endpoint.selected_for_scan && (
+                            <span className="text-xs bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-1.5 py-0.5 rounded">
+                              selected
                             </span>
                           )}
-                          {endpoint.is_api && <span className="text-xs bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 px-1.5 py-0.5 rounded">API</span>}
-                          {endpoint.is_auth && <span className="text-xs bg-sky-500/10 text-sky-400 border border-sky-500/20 px-1.5 py-0.5 rounded">Auth</span>}
-                          {endpoint.has_params && <span className="text-xs bg-amber-500/10 text-amber-400 border border-amber-500/20 px-1.5 py-0.5 rounded">Params</span>}
+                          {endpoint.sources?.slice(0, 4).map((source: string) => (
+                            <span key={source} className="text-xs bg-surface-700 text-muted-foreground border border-surface-600 px-1.5 py-0.5 rounded">
+                              {source}
+                            </span>
+                          ))}
+                          {endpoint.score_reasons?.slice(0, 5).map((reason: string) => (
+                            <span key={reason} className="text-xs bg-surface-700 text-muted-foreground border border-surface-600 px-1.5 py-0.5 rounded">
+                              {reason}
+                            </span>
+                          ))}
                         </div>
-                      </div>
-                      <span className="text-xs text-muted-foreground whitespace-nowrap">
-                        {endpoint.last_seen ? formatRelative(endpoint.last_seen) : "—"}
-                      </span>
+                      )}
+                      {endpoint.last_scanned_at && (
+                        <p className="text-xs text-muted-foreground">
+                          Last scanned {formatRelative(endpoint.last_scanned_at)}
+                        </p>
+                      )}
                     </div>
-                    {(endpoint.title || endpoint.content_type) && (
-                      <p className="text-xs text-muted-foreground truncate">
-                        {[endpoint.title, endpoint.content_type].filter(Boolean).join(" · ")}
-                      </p>
-                    )}
-                    {(endpoint.metadata?.score || endpoint.metadata?.score_reasons?.length > 0) && (
-                      <div className="flex flex-wrap items-center gap-1.5">
-                        {endpoint.metadata?.score != null && (
-                          <span className="text-xs bg-surface-700 text-muted-foreground border border-surface-600 px-1.5 py-0.5 rounded">
-                            score {endpoint.metadata.score}
-                          </span>
-                        )}
-                        {endpoint.metadata?.score_reasons?.slice(0, 4).map((reason: string) => (
-                          <span key={reason} className="text-xs bg-surface-700 text-muted-foreground border border-surface-600 px-1.5 py-0.5 rounded">
-                            {reason}
-                          </span>
-                        ))}
+                  ))}
+                  {endpointPages > 1 && (
+                    <div className="flex items-center justify-between px-1 py-2">
+                      <span className="text-xs text-muted-foreground">
+                        Page {endpointPage} of {endpointPages}
+                      </span>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          onClick={() => setEndpointPage(p => Math.max(1, p - 1))}
+                          disabled={endpointPage <= 1 || endpointsFetching}
+                          className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded bg-surface-700 hover:bg-surface-600 disabled:opacity-40 text-foreground"
+                        >
+                          <ChevronLeft className="w-3 h-3" /> Prev
+                        </button>
+                        <button
+                          onClick={() => setEndpointPage(p => Math.min(endpointPages, p + 1))}
+                          disabled={endpointPage >= endpointPages || endpointsFetching}
+                          className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded bg-surface-700 hover:bg-surface-600 disabled:opacity-40 text-foreground"
+                        >
+                          Next <ChevronRight className="w-3 h-3" />
+                        </button>
                       </div>
-                    )}
-                  </div>
-                ))
+                    </div>
+                  )}
+                </>
               ) : (
                 <div className="glass-card p-8 text-center text-muted-foreground">
                   <Globe className="w-8 h-8 mx-auto mb-2 opacity-30" />

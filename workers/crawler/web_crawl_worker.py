@@ -31,6 +31,13 @@ log = structlog.get_logger()
 
 API_PATH_RE = re.compile(r"(^|/)(api|v[0-9]+|graphql|rest|rpc)(/|$)", re.I)
 AUTH_PATH_RE = re.compile(r"(login|signin|signup|auth|oauth|sso|admin|dashboard|wp-admin)", re.I)
+ADMIN_PATH_RE = re.compile(r"(admin|dashboard|manage|console|jenkins|grafana|kibana)", re.I)
+UPLOAD_PATH_RE = re.compile(r"(upload|uploads|file|files|media|import)", re.I)
+STATIC_PATH_RE = re.compile(r"\.(js|css|png|jpe?g|gif|svg|ico|woff2?|ttf|map|pdf|zip|tar|gz)$", re.I)
+GRAPHQL_PATH_RE = re.compile(r"graphql", re.I)
+SWAGGER_PATH_RE = re.compile(r"(swagger|openapi|api-docs|redoc)", re.I)
+HEALTH_PATH_RE = re.compile(r"(health|status|ready|live|metrics)", re.I)
+DEBUG_PATH_RE = re.compile(r"(debug|trace|actuator|phpinfo|server-status|\.env|\.git)", re.I)
 INTERESTING_PATH_RE = re.compile(
     r"(admin|login|signin|api|graphql|swagger|openapi|upload|backup|config|debug|status|health|\.env|\.git|wp-admin|jenkins)",
     re.I,
@@ -116,10 +123,38 @@ def _endpoint_flags(url: str) -> Dict[str, bool]:
     }
 
 
-def _endpoint_score(endpoint: Dict[str, Any], flags: Dict[str, bool]) -> tuple[int, List[str]]:
+def _endpoint_type(url: str, flags: Dict[str, bool]) -> str:
+    parsed = urlsplit(url)
+    path = parsed.path or "/"
+    if path == "/" and not parsed.query:
+        return "root"
+    if GRAPHQL_PATH_RE.search(path):
+        return "graphql"
+    if SWAGGER_PATH_RE.search(path):
+        return "swagger"
+    if DEBUG_PATH_RE.search(path):
+        return "debug"
+    if HEALTH_PATH_RE.search(path):
+        return "health"
+    if UPLOAD_PATH_RE.search(path):
+        return "upload"
+    if ADMIN_PATH_RE.search(path):
+        return "admin"
+    if flags.get("is_auth"):
+        return "auth"
+    if flags.get("is_api"):
+        return "api"
+    if parsed.query:
+        return "parameterized"
+    if STATIC_PATH_RE.search(path):
+        return "static"
+    return "unknown"
+
+
+def _endpoint_score(endpoint: Dict[str, Any], flags: Dict[str, bool], endpoint_type: str) -> tuple[int, List[str]]:
     score = 0
     reasons: List[str] = []
-    source = endpoint.get("source", "")
+    sources = endpoint.get("sources") or str(endpoint.get("source", "")).split("+")
     status_class = endpoint.get("status_class") or _status_class(endpoint.get("http_status"))
     content_type = (endpoint.get("content_type") or "").lower()
 
@@ -133,12 +168,30 @@ def _endpoint_score(endpoint: Dict[str, Any], flags: Dict[str, bool]) -> tuple[i
             score += weight
             reasons.append(reason)
 
-    if "ffuf" in source:
+    type_weights = {
+        "graphql": (30, "graphql_endpoint"),
+        "swagger": (30, "api_documentation"),
+        "debug": (35, "debug_endpoint"),
+        "admin": (25, "admin_endpoint"),
+        "upload": (25, "upload_endpoint"),
+        "parameterized": (15, "parameterized_endpoint"),
+        "health": (10, "health_endpoint"),
+        "root": (5, "root_endpoint"),
+    }
+    if endpoint_type in type_weights:
+        weight, reason = type_weights[endpoint_type]
+        score += weight
+        reasons.append(reason)
+
+    if "ffuf" in sources:
         score += 20
         reasons.append("fuzz_discovered")
-    if "gau" in source:
+    if "gau" in sources:
         score += 10
         reasons.append("passive_history")
+    if len(set(sources)) > 1:
+        score += 10
+        reasons.append("multiple_sources")
     if status_class in {"ok", "redirect"}:
         score += 10
         reasons.append(status_class)
@@ -149,7 +202,7 @@ def _endpoint_score(endpoint: Dict[str, Any], flags: Dict[str, bool]) -> tuple[i
         score += 10
         reasons.append("json")
 
-    return score, reasons
+    return min(score, 100), list(dict.fromkeys(reasons))
 
 
 class WebCrawlWorker(BaseWorker):
@@ -186,23 +239,29 @@ class WebCrawlWorker(BaseWorker):
             gau_urls = await self._run_gau(targets, tmpdir, config)
             ffuf_urls = await self._run_ffuf(targets, tmpdir, config)
 
-            source_by_url = self._build_source_map(katana_urls, gau_urls, ffuf_urls)
+            root_urls = [str(target.get("url") or "").strip() for target in targets if target.get("url")]
+            source_by_url = self._build_source_map(root_urls, katana_urls, gau_urls, ffuf_urls)
             normalized = list(source_by_url.keys())
             max_total = int(config.get("crawl_max_total_urls", 2000))
             normalized = normalized[:max_total]
             validated = await self._validate_urls(normalized, tmpdir, config)
             for endpoint in validated:
-                endpoint["source"] = source_by_url.get(endpoint["url"], endpoint.get("source", "crawl"))
+                sources = source_by_url.get(endpoint["url"], [endpoint.get("source", "crawl")])
+                endpoint["sources"] = sources
+                endpoint["source"] = "+".join(sources)
 
         async with get_session() as db:
             if not await should_process_scan(db, scan_id):
                 log.info("crawl_results_skipped_inactive_scan", scan_id=scan_id)
                 await self._mark_crawl_done(scan_id, org_id, workspace_id)
                 return
-            persisted, selected_records = await self._persist_endpoints(
-                db, org_id, workspace_id, validated
+            persisted, selected_records, endpoint_summary = await self._persist_endpoints(
+                db,
+                org_id,
+                workspace_id,
+                validated,
+                max_selected=int(config.get("crawl_nuclei_max_targets", 200)),
             )
-            selected_records = selected_records[: int(config.get("crawl_nuclei_max_targets", 200))]
             await record_target_selections(
                 db,
                 scan_id=scan_id,
@@ -218,6 +277,7 @@ class WebCrawlWorker(BaseWorker):
                 targets_total=len(targets),
                 endpoints=persisted,
                 selected_for_nuclei=len(selected_records),
+                **endpoint_summary,
             )
 
         selected = [item["target"] for item in selected_records]
@@ -462,33 +522,55 @@ class WebCrawlWorker(BaseWorker):
             result.append(normalized)
         return result
 
-    def _build_source_map(self, katana_urls: List[str], gau_urls: List[str], ffuf_urls: List[str]) -> Dict[str, str]:
-        sources: Dict[str, str] = {}
+    def _build_source_map(
+        self,
+        root_urls: List[str],
+        katana_urls: List[str],
+        gau_urls: List[str],
+        ffuf_urls: List[str],
+    ) -> Dict[str, List[str]]:
+        sources: Dict[str, List[str]] = {}
+        for raw in root_urls:
+            normalized = _normalize_url(raw)
+            if not normalized:
+                continue
+            sources.setdefault(normalized, [])
+            if "root_probe" not in sources[normalized]:
+                sources[normalized].append("root_probe")
         for raw in katana_urls:
             normalized = _normalize_url(raw)
             if normalized:
-                sources.setdefault(normalized, "katana")
+                sources.setdefault(normalized, [])
+                if "katana" not in sources[normalized]:
+                    sources[normalized].append("katana")
         for raw in gau_urls:
             normalized = _normalize_url(raw)
             if not normalized:
                 continue
-            if sources.get(normalized) == "katana":
-                sources[normalized] = "katana+gau"
-            else:
-                sources.setdefault(normalized, "gau")
+            sources.setdefault(normalized, [])
+            if "gau" not in sources[normalized]:
+                sources[normalized].append("gau")
         for raw in ffuf_urls:
             normalized = _normalize_url(raw)
             if not normalized:
                 continue
-            existing = sources.get(normalized)
-            sources[normalized] = f"{existing}+ffuf" if existing else "ffuf"
+            sources.setdefault(normalized, [])
+            if "ffuf" not in sources[normalized]:
+                sources[normalized].append("ffuf")
         return sources
 
-    async def _persist_endpoints(self, db, org_id: str, workspace_id: str, endpoints: List[Dict[str, Any]]) -> tuple[int, List[Dict[str, Any]]]:
+    async def _persist_endpoints(
+        self,
+        db,
+        org_id: str,
+        workspace_id: str,
+        endpoints: List[Dict[str, Any]],
+        max_selected: int,
+    ) -> tuple[int, List[Dict[str, Any]], Dict[str, Any]]:
         from workers.db_models import Asset, WebEndpoint
 
         if not endpoints:
-            return 0, []
+            return 0, [], {}
 
         hosts = sorted({urlsplit(e["url"]).hostname for e in endpoints if urlsplit(e["url"]).hostname})
         asset_rows = (await db.execute(
@@ -500,11 +582,12 @@ class WebCrawlWorker(BaseWorker):
         )).all()
         asset_by_host = {value: asset_id for asset_id, value in asset_rows}
         now = datetime.now(timezone.utc)
-        selected: List[tuple[int, Dict[str, Any]]] = []
+        prepared: List[Dict[str, Any]] = []
+        eligible: List[tuple[int, str, int]] = []
         persisted = 0
         skipped_oversized = 0
 
-        for endpoint in endpoints:
+        for index, endpoint in enumerate(endpoints):
             url = endpoint["url"]
             parsed = urlsplit(url)
             host = parsed.hostname or ""
@@ -515,7 +598,11 @@ class WebCrawlWorker(BaseWorker):
             if not asset_id:
                 continue
             flags = _endpoint_flags(url)
-            score, score_reasons = _endpoint_score(endpoint, flags)
+            endpoint_type = _endpoint_type(url, flags)
+            score, score_reasons = _endpoint_score(endpoint, flags, endpoint_type)
+            sources = endpoint.get("sources") or [s for s in str(endpoint.get("source", "crawl")).split("+") if s]
+            sources = list(dict.fromkeys(sources or ["crawl"]))
+            status_class = endpoint.get("status_class") or _status_class(endpoint.get("http_status"))
             values = {
                 "asset_id": asset_id,
                 "org_id": org_id,
@@ -523,16 +610,46 @@ class WebCrawlWorker(BaseWorker):
                 "url": url,
                 "host": host,
                 "path": (parsed.path or "/")[:MAX_ENDPOINT_PATH_LENGTH],
-                "source": endpoint.get("source", "crawl")[:MAX_ENDPOINT_SOURCE_LENGTH],
+                "source": "+".join(sources)[:MAX_ENDPOINT_SOURCE_LENGTH],
                 "http_status": endpoint.get("http_status"),
-                "status_class": endpoint.get("status_class") or _status_class(endpoint.get("http_status")),
+                "status_class": status_class,
                 "content_type": (endpoint.get("content_type") or "")[:MAX_ENDPOINT_CONTENT_TYPE_LENGTH] or None,
                 "content_length": endpoint.get("content_length"),
                 "title": (endpoint.get("title") or "")[:MAX_ENDPOINT_TITLE_LENGTH] or None,
                 **flags,
-                "metadata": {"query": parsed.query, "score": score, "score_reasons": score_reasons},
+                "score": score,
+                "score_reasons": score_reasons,
+                "endpoint_type": endpoint_type,
+                "selected_for_scan": False,
+                "selected_reason": None,
+                "scan_status": "not_scanned",
+                "sources": sources,
+                "source_count": len(sources),
+                "metadata": {"query": parsed.query},
                 "last_seen": now,
             }
+            prepared.append({"values": values, "asset_id": asset_id})
+            if score >= 25 and status_class in {"ok", "redirect", "auth_required", "server_error", "rate_limited"}:
+                eligible.append((score, url, len(prepared) - 1))
+
+        selected_indices = {
+            index
+            for _, _, index in sorted(eligible, key=lambda item: (-item[0], item[1]))[: max(0, max_selected)]
+        }
+        selected: List[tuple[int, str, Dict[str, Any]]] = []
+        endpoint_type_counts: Dict[str, int] = {}
+        source_counts: Dict[str, int] = {}
+
+        for index, item in enumerate(prepared):
+            values = item["values"]
+            asset_id = item["asset_id"]
+            endpoint_type_counts[values["endpoint_type"]] = endpoint_type_counts.get(values["endpoint_type"], 0) + 1
+            for source in values["sources"]:
+                source_counts[source] = source_counts.get(source, 0) + 1
+            if index in selected_indices:
+                values["selected_for_scan"] = True
+                values["selected_reason"] = "endpoint_score"
+                values["scan_status"] = "queued"
             stmt = pg_insert(WebEndpoint.__table__).values(**values, first_seen=now)
             stmt = stmt.on_conflict_do_update(
                 constraint="uq_web_endpoint_org_url",
@@ -540,20 +657,23 @@ class WebCrawlWorker(BaseWorker):
             )
             await db.execute(stmt)
             persisted += 1
-            if score >= 25 and values["status_class"] in {"ok", "redirect", "auth_required", "server_error", "rate_limited"}:
+            if values["selected_for_scan"]:
                 selected.append((
-                    score,
+                    values["score"],
+                    values["url"],
                     {
-                        "target": url,
+                        "target": values["url"],
                         "target_type": "url",
                         "profile": "endpoint",
                         "asset_id": asset_id,
                         "selected": True,
-                        "score": score,
-                        "reasons": score_reasons,
+                        "score": values["score"],
+                        "reasons": values["score_reasons"],
                         "metadata": {
                             "downstream_phase": "nuclei",
                             "source": values["source"],
+                            "sources": values["sources"],
+                            "endpoint_type": values["endpoint_type"],
                             "status_class": values["status_class"],
                             "http_status": values["http_status"],
                             "asset_id": str(asset_id),
@@ -569,8 +689,15 @@ class WebCrawlWorker(BaseWorker):
                 skipped=skipped_oversized,
                 max_url_length=MAX_ENDPOINT_URL_LENGTH,
             )
-        selected.sort(key=lambda item: item[0], reverse=True)
-        return persisted, [item for _, item in selected]
+        selected.sort(key=lambda item: (-item[0], item[1]))
+        summary = {
+            "endpoint_types": endpoint_type_counts,
+            "endpoint_sources": source_counts,
+            "endpoint_selection_cap": max_selected,
+            "endpoint_selection_threshold": 25,
+            "endpoint_candidates_eligible": len(eligible),
+        }
+        return persisted, [item for _, _, item in selected], summary
 
     async def _update_progress(self, db, scan_id: str, endpoints_found: int) -> None:
         from workers.db_models import Scan

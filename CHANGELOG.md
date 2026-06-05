@@ -4,6 +4,62 @@ All notable changes to this project are documented below, sorted newest-first.
 
 ---
 
+## 2026-06-06 — Asset Endpoint Pagination
+
+### Added: Paginated asset endpoint tab
+- **Files**: `backend/app/api/v1/endpoints/assets.py`, `frontend/src/app/dashboard/assets/[id]/page.tsx`
+- Asset endpoint API now supports `page`, `page_size`, `total`, and `pages` while keeping the legacy `limit` parameter for compatibility.
+- Asset detail endpoint tab now loads 25 endpoints per page with total range text and previous/next controls, improving usability for assets with thousands of crawled endpoints.
+
+---
+
+## 2026-06-05 — Crawl Root Endpoint Coverage
+
+### Fixed: Empty endpoint tabs for reachable crawl roots
+- **Files**: `workers/crawler/web_crawl_worker.py`, `frontend/src/types/index.ts`, `PLAN_ASM_CORE_V2.md`
+- Crawler now includes each crawl target root URL as a low-score `root_probe` endpoint after validation, so reachable subdomains do not appear empty when no child paths are discovered.
+- Added `root` endpoint classification for crawl target roots; these remain low priority and do not bypass endpoint selection thresholds.
+
+---
+
+## 2026-06-04 — Endpoint Intelligence V2 Milestone 4
+
+### Added: First-class endpoint intelligence lifecycle
+- **Files**: `backend/app/db/migrations/versions/014_endpoint_intelligence_v2.py`, `backend/app/db/models/models.py`, `workers/crawler/web_crawl_worker.py`, `workers/scanner/nuclei_worker.py`, `backend/app/api/v1/endpoints/assets.py`, `backend/app/services/scan_service.py`, `frontend/src/app/dashboard/assets/[id]/page.tsx`, `frontend/src/app/dashboard/scans/[id]/page.tsx`, `frontend/src/types/index.ts`, `PLAN_ASM_CORE_V2.md`
+- Extended `web_endpoints` with score, score reasons, endpoint type, source list/count, selected state, selected reason, scan status, and last scanned timestamp.
+- Crawler now merges Katana, GAU, and FFUF sources, classifies endpoint types, scores endpoints with explicit reasons, and selects bounded endpoint nuclei targets deterministically by score and URL tie-breaker.
+- Nuclei endpoint batches now update endpoint scan status from queued/running to completed and persist `last_scanned_at`.
+- Asset endpoint UI now shows endpoint score, source list, classification, selected state, score reasons, and scan status; scan detail shows endpoint coverage summary from the crawl phase.
+
+---
+
+## 2026-06-04 — Discovery Engine V2 Milestone 3 Start
+
+### Added: Normalized discovery inventory and provider health
+- **Files**: `backend/app/db/migrations/versions/012_discovered_assets.py`, `backend/app/db/migrations/versions/013_discovered_assets_per_scan_unique.py`, `backend/app/db/models/models.py`, `backend/app/api/v1/endpoints/scans.py`, `workers/db_models.py`, `workers/scanner/discovery_worker.py`, `frontend/src/app/dashboard/scans/[id]/page.tsx`, `docker-compose.yml`, `.env.example`, `PLAN_ASM_CORE_V2.md`
+- Added per-scan `discovered_assets` records for raw subdomain, CIDR, reverse-DNS, and cloud-storage candidates with source, status, selected state, skip reason, first/last seen timestamps, and JSON-safe evidence.
+- Discovery phase summaries now include source health for passive providers, generated DNS sources, reverse DNS, ASN expansion, and cloud checks, and scan detail UI surfaces provider health states.
+- Removed Shodan, SecurityTrails, Censys, and Chaos API integrations from discovery so default discovery relies on open-source tools and unauthenticated public sources.
+- Removed VirusTotal, AbuseIPDB, OTX, and CriminalIP API configuration/plugin paths from enrichment so the default runtime stays no-key and open-source/public-source focused.
+- Added safe ASN-to-prefix candidate expansion, bounded reverse DNS candidate extraction, and conservative ownership confidence without auto-scanning those candidates by default.
+- Added cloud object storage candidate generation and safe exposure checks for S3, GCS, and Azure Blob.
+- Fixed discovery evidence persistence by normalizing datetimes and other scanner values before writing JSONB.
+- Runtime smoke validation completed with scan `c2c0dbc0-ac67-45fe-bdca-703ad2f55de5`, which discovered 26 subdomains, persisted source-health data, and completed successfully after the JSONB fix.
+
+### Added: Discovery source evidence and wildcard control
+- **Files**: `workers/scanner/discovery_worker.py`, `workers/discovery/dns_candidates.py`, `workers/discovery/__init__.py`, `backend/app/api/v1/endpoints/assets.py`, `frontend/src/app/dashboard/assets/[id]/page.tsx`, `frontend/src/app/dashboard/scans/[id]/page.tsx`, `frontend/src/types/index.ts`, `PLAN_ASM_CORE_V2.md`
+- Discovery now keeps per-host source evidence across subfinder, assetfinder, crt.sh, optional amass, Wayback, Common Crawl, DNS brute force, and DNS permutations.
+- Added bounded Wayback/Common Crawl passive host extraction plus bounded DNS brute-force and conservative permutation generation.
+- Added wildcard DNS probes and suppression for generated-only candidates that match wildcard fingerprints, preventing wildcard domains from inflating downstream scan targets.
+- Discovery now records unresolved candidates with explicit validation evidence and persists resolved DNS-only hosts, giving target selection clearer skip reasons and better asset coverage.
+- Discovery phase summaries now expose source breakdown, generated candidate count, wildcard DNS report, and wildcard skipped count.
+- Asset detail now shows discovery evidence for persisted assets, and scan detail now shows discovery source distribution and wildcard suppression data.
+- Added migration `011_unique_scan_findings` and nuclei persistence conflict handling so the same finding cannot be linked to one scan multiple times.
+- Nuclei phase summaries and scan counters now use deduplicated `scan_findings` links, keeping `findings_found`, phase `findings`, and result rows consistent.
+- Tightened crt.sh host filtering to accept only exact root-domain matches or proper subdomain suffixes.
+
+---
+
 ## 2026-06-03 — Scan Pipeline Progress and Result UI
 
 ### Added: Asset validation worker and analyst review workflow
@@ -127,8 +183,8 @@ All notable changes to this project are documented below, sorted newest-first.
 - **Files**: `backend/app/services/scan_service.py`, `backend/app/db/migrations/versions/007_scan_policy_phase_status.py`, `workers/enrichment/enrichment_worker.py`, `workers/task_coordinator.py`, `workers/scanner/port_worker.py`, `docker-compose.yml`, `Makefile`, `frontend/src/app/dashboard/scans/page.tsx`, `frontend/src/app/dashboard/organizations/[id]/page.tsx`
 - Organizations now support a JSON `scan_policy` that is merged into scan config with bounded safety limits for nuclei, crawl, fuzz, and enrichment settings.
 - Scans now persist per-phase `phase_status` so UI and API consumers can see concrete pipeline phase state instead of relying only on coarse progress percentages.
-- Added a dedicated `worker-enrichment` service that enriches IP assets with no-key ASN/RDAP baseline data and optional Shodan/VirusTotal/AbuseIPDB/OTX plugin results when API keys are configured.
-- `.env.example` now documents enrichment provider keys and `ENRICHMENT_CONCURRENCY` for first-time setup.
+- Added a dedicated `worker-enrichment` service that enriches IP assets with no-key ASN/RDAP baseline data.
+- `.env.example` now documents `ENRICHMENT_CONCURRENCY` for first-time setup.
 - Task coordination now waits for enrichment batches before terminal correlation, preventing scans from completing before IP intelligence is persisted.
 - Endpoint crawl selection now scores high-signal URLs from Katana, GAU, and FFUF before feeding bounded endpoint targets into nuclei.
 - **Impact**: Full scans now preserve IP/ASN/org/country enrichment data, expose clearer phase progress, and send better-targeted endpoint nuclei batches.
@@ -138,15 +194,10 @@ All notable changes to this project are documented below, sorted newest-first.
 - Nginx now uses Docker DNS (`127.0.0.11`) with a short TTL and dynamic `proxy_pass` targets for API and frontend services.
 - **Impact**: Recreating or rebuilding `api`/`frontend` no longer leaves Nginx proxying to an old container IP and returning `502 Bad Gateway`.
 
-### Fixed: Enrichment worker provider plugin imports
+### Fixed: Enrichment worker dependency imports
 - **File**: `workers/requirements-workers.txt`
-- Worker images now include `pydantic` and `pydantic-settings`, matching backend configuration dependencies used by the optional enrichment provider engine.
-- **Impact**: `worker-enrichment` can load Shodan, VirusTotal, AbuseIPDB, and OTX plugins instead of logging `No module named 'pydantic'`.
-
-### Fixed: AbuseIPDB enrichment request parameters
-- **File**: `backend/app/integrations/enrichment/engine.py`
-- AbuseIPDB now sends the `verbose` request parameter as a string accepted by aiohttp/yarl.
-- **Impact**: AbuseIPDB enrichment no longer fails before the HTTP request with `Invalid variable type`.
+- Worker images now include `pydantic` and `pydantic-settings`, matching shared backend configuration dependencies used by workers.
+- **Impact**: `worker-enrichment` no longer logs `No module named 'pydantic'`.
 
 ### Fixed: Asset detail client-side crash
 - **File**: `frontend/src/app/dashboard/assets/[id]/page.tsx`

@@ -27,6 +27,7 @@ from app.db.models.models import (
     ScanFinding,
     ScanPhaseRun,
     ScanTargetSelection,
+    DiscoveredAsset,
     OutboxEvent,
     NotificationRule,
     Notification,
@@ -40,7 +41,7 @@ __all__ = [
     "Base", "Workspace", "User", "APIKey", "AuditLog",
     "Organization", "Asset", "Subdomain", "IPAddress", "Port",
     "Technology", "Finding", "RiskScore", "Scan", "ScanFinding", "ScanPhaseRun",
-    "ScanTargetSelection", "OutboxEvent",
+    "ScanTargetSelection", "DiscoveredAsset", "OutboxEvent",
     "NotificationRule", "Notification", "Screenshot", "ThreatIntel",
     "WebEndpoint", "AssetRelationship",
 ]

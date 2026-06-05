@@ -219,7 +219,6 @@ def _policy_to_config(policy: Dict[str, Any]) -> Dict[str, Any]:
         "bulk_size": rate_limits.get("nuclei_bulk_size"),
         "enrichment_enabled": enrichment.get("enabled", True),
         "enrichment_baseline": enrichment.get("baseline", True),
-        "enrichment_api_plugins": enrichment.get("api_plugins", True),
     }
     return {key: value for key, value in config.items() if value is not None}
 
@@ -496,19 +495,13 @@ class ScanService:
                 WebEndpoint.org_id == org_id,
                 WebEndpoint.workspace_id == workspace_id,
                 WebEndpoint.status_class.in_(["ok", "redirect", "auth_required", "server_error", "rate_limited"]),
-                or_(
-                    WebEndpoint.is_interesting.is_(True),
-                    WebEndpoint.has_params.is_(True),
-                    WebEndpoint.is_api.is_(True),
-                    WebEndpoint.is_auth.is_(True),
-                ),
+                WebEndpoint.score >= 25,
             )
             .order_by(
-                WebEndpoint.is_interesting.desc(),
-                WebEndpoint.has_params.desc(),
-                WebEndpoint.is_auth.desc(),
-                WebEndpoint.is_api.desc(),
+                WebEndpoint.score.desc(),
+                WebEndpoint.source_count.desc(),
                 WebEndpoint.last_seen.desc(),
+                WebEndpoint.url.asc(),
             )
             .limit(max(1, min(int(limit), 500)))
         )

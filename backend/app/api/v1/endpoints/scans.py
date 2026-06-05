@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, Query, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
 from app.api.v1.dependencies.auth import get_current_user, get_workspace_id, get_db, RequireRole
-from app.db.models.models import User, Scan, Organization, ScanPhaseRun, ScanTargetSelection
+from app.db.models.models import User, Scan, Organization, ScanPhaseRun, ScanTargetSelection, DiscoveredAsset
 from app.services.scan_profiles import apply_scan_profile, normalize_scan_profile
 from app.services.scan_progress import merge_runtime_phase_status
 from app.services.outbox_service import create_queue_event, dispatch_pending_outbox_once
@@ -107,6 +107,7 @@ async def _scan_to_dict(scan: Scan, detailed: bool = False, db: AsyncSession | N
         selections = await _scan_target_selections(db, scan)
         data["target_summary"] = _target_summary(selections)
         data["target_selections"] = selections[:500]
+        data["discovered_asset_summary"] = await _discovered_asset_summary(db, scan)
         data["why_no_findings"] = _why_no_findings(data)
     return data
 
@@ -185,6 +186,35 @@ def _target_summary(selections: list[dict]) -> dict:
         "skipped": skipped,
         "by_phase": {phase: dict(counts) for phase, counts in by_phase.items()},
         "by_type": dict(by_type),
+    }
+
+
+async def _discovered_asset_summary(db: AsyncSession, scan: Scan) -> dict:
+    rows = (await db.execute(
+        select(
+            DiscoveredAsset.asset_type,
+            DiscoveredAsset.source,
+            DiscoveredAsset.status,
+            func.count(DiscoveredAsset.id),
+        )
+        .where(
+            DiscoveredAsset.scan_id == scan.id,
+            DiscoveredAsset.workspace_id == scan.workspace_id,
+        )
+        .group_by(DiscoveredAsset.asset_type, DiscoveredAsset.source, DiscoveredAsset.status)
+    )).all()
+    by_type: Counter = Counter()
+    by_source: Counter = Counter()
+    by_status: Counter = Counter()
+    for asset_type, source, status, count in rows:
+        by_type[asset_type or "unknown"] += count
+        by_source[source or "unknown"] += count
+        by_status[status or "unknown"] += count
+    return {
+        "total": sum(by_type.values()),
+        "by_type": dict(by_type),
+        "by_source": dict(by_source),
+        "by_status": dict(by_status),
     }
 
 

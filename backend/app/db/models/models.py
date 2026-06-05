@@ -330,6 +330,15 @@ class WebEndpoint(TimestampMixin, Base):
     is_api = Column(Boolean, nullable=False, default=False, index=True)
     is_auth = Column(Boolean, nullable=False, default=False, index=True)
     is_interesting = Column(Boolean, nullable=False, default=False, index=True)
+    score = Column(Integer, nullable=False, default=0, index=True)
+    score_reasons = Column(JSONB, nullable=False, default=list)
+    endpoint_type = Column(String(50), nullable=False, default="unknown", index=True)
+    selected_for_scan = Column(Boolean, nullable=False, default=False, index=True)
+    selected_reason = Column(String(255), nullable=True)
+    scan_status = Column(String(50), nullable=False, default="not_scanned", index=True)
+    last_scanned_at = Column(DateTime(timezone=True), nullable=True)
+    sources = Column(JSONB, nullable=False, default=list)
+    source_count = Column(Integer, nullable=False, default=1)
     metadata_ = Column("metadata", JSONB, nullable=False, default=dict)
 
     first_seen = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
@@ -339,6 +348,7 @@ class WebEndpoint(TimestampMixin, Base):
         UniqueConstraint("org_id", "url", name="uq_web_endpoint_org_url"),
         Index("ix_web_endpoint_asset_interesting", "asset_id", "is_interesting"),
         Index("ix_web_endpoint_org_source", "org_id", "source"),
+        Index("ix_web_endpoint_asset_score", "asset_id", "score"),
     )
 
     asset = relationship("Asset")
@@ -623,6 +633,10 @@ class ScanFinding(Base):
     change_type = Column(String(50), nullable=False)  # new, recurring, resolved
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
+    __table_args__ = (
+        UniqueConstraint("scan_id", "finding_id", name="uq_scan_findings_scan_finding"),
+    )
+
     # Relationships
     scan = relationship("Scan", back_populates="scan_findings")
     finding = relationship("Finding", back_populates="scan_findings")
@@ -680,6 +694,33 @@ class ScanTargetSelection(TimestampMixin, Base):
     __table_args__ = (
         UniqueConstraint("scan_id", "phase", "target", "target_type", "profile", name="uq_scan_target_selection"),
         Index("ix_scan_target_selections_phase_selected", "phase", "selected"),
+    )
+
+
+class DiscoveredAsset(TimestampMixin, Base):
+    __tablename__ = "discovered_assets"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True)
+    workspace_id = Column(UUID(as_uuid=True), nullable=False, index=True)
+    scan_id = Column(UUID(as_uuid=True), ForeignKey("scans.id", ondelete="SET NULL"), nullable=True, index=True)
+    asset_id = Column(UUID(as_uuid=True), ForeignKey("assets.id", ondelete="SET NULL"), nullable=True, index=True)
+
+    value = Column(String(2000), nullable=False)
+    asset_type = Column(String(50), nullable=False)
+    source = Column(String(100), nullable=False)
+    confidence = Column(Float, nullable=False, default=0.5)
+    status = Column(String(50), nullable=False, default="candidate")
+    selected = Column(Boolean, nullable=False, default=False)
+    skip_reason = Column(String(255), nullable=True)
+    evidence = Column(JSONB, nullable=False, default=dict)
+    first_seen = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    last_seen = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("scan_id", "asset_type", "value", "source", name="uq_discovered_asset_scan_source"),
+        Index("ix_discovered_assets_scan_source", "scan_id", "source"),
+        Index("ix_discovered_assets_org_type_status", "org_id", "asset_type", "status"),
     )
 
 
@@ -798,7 +839,7 @@ class ThreatIntel(TimestampMixin, Base):
     asset_id = Column(UUID(as_uuid=True), ForeignKey("assets.id", ondelete="CASCADE"), nullable=False, index=True)
     org_id = Column(UUID(as_uuid=True), nullable=False, index=True)
 
-    source = Column(String(100), nullable=False, index=True)  # shodan, censys, virustotal, etc.
+    source = Column(String(100), nullable=False, index=True)  # network_baseline, scanner, etc.
     indicator_type = Column(String(50), nullable=False)  # ip, domain, url, hash
     data = Column(JSONB, nullable=False, default=dict)
     risk_score = Column(Integer, nullable=True)

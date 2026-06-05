@@ -134,6 +134,9 @@ export default function ScanDetailPage() {
             <MetricLine label="Total records" value={targetSummary.total ?? 0} />
             <MetricLine label="Selected" value={targetSummary.selected ?? 0} />
             <MetricLine label="Skipped" value={targetSummary.skipped ?? 0} />
+            {!!scan.discovered_asset_summary?.total && (
+              <MetricLine label="Discovered assets" value={scan.discovered_asset_summary.total} />
+            )}
             {Object.entries(targetSummary.by_type || {}).map(([type, count]) => (
               <MetricLine key={type} label={type} value={count as number} />
             ))}
@@ -203,8 +206,124 @@ function PhaseRow({ phase }: { phase: any }) {
             {!!phase.targets_selected && <span>{phase.targets_selected} selected</span>}
             {!!phase.errors && <span className="text-red-400">{phase.errors} errors</span>}
           </div>
+          {phase.phase === "discovery" && <DiscoverySummary summary={phase.summary || {}} />}
+          {phase.phase === "crawl" && <EndpointSummary summary={phase.summary || {}} />}
         </div>
       </div>
+    </div>
+  );
+}
+
+function EndpointSummary({ summary }: { summary: any }) {
+  const types = Object.entries(summary.endpoint_types || {});
+  const sources = Object.entries(summary.endpoint_sources || {});
+  const hasSummary = summary.endpoints != null || summary.selected_for_nuclei != null || types.length > 0 || sources.length > 0;
+
+  if (!hasSummary) return null;
+
+  return (
+    <div className="mt-2 space-y-2 border-t border-surface-700 pt-2">
+      <div className="flex flex-wrap gap-2 text-[11px] text-muted-foreground">
+        {summary.endpoints != null && (
+          <span className="rounded bg-surface-900 px-1.5 py-0.5">
+            endpoints {Number(summary.endpoints).toLocaleString()}
+          </span>
+        )}
+        {summary.selected_for_nuclei != null && (
+          <span className="rounded bg-surface-900 px-1.5 py-0.5">
+            selected {Number(summary.selected_for_nuclei).toLocaleString()}
+          </span>
+        )}
+        {summary.endpoint_candidates_eligible != null && (
+          <span className="rounded bg-surface-900 px-1.5 py-0.5">
+            eligible {Number(summary.endpoint_candidates_eligible).toLocaleString()}
+          </span>
+        )}
+        {summary.endpoint_selection_cap != null && (
+          <span className="rounded bg-surface-900 px-1.5 py-0.5">
+            cap {Number(summary.endpoint_selection_cap).toLocaleString()}
+          </span>
+        )}
+      </div>
+      {types.length > 0 && (
+        <div className="flex flex-wrap gap-1.5">
+          {types.map(([type, count]) => (
+            <span key={type} className="text-[10px] text-muted-foreground bg-surface-900 px-1.5 py-0.5 rounded">
+              {type.replaceAll("_", " ")} {Number(count).toLocaleString()}
+            </span>
+          ))}
+        </div>
+      )}
+      {sources.length > 0 && (
+        <div className="flex flex-wrap gap-1.5">
+          {sources.map(([source, count]) => (
+            <span key={source} className="text-[10px] text-muted-foreground bg-surface-900 px-1.5 py-0.5 rounded">
+              {source} {Number(count).toLocaleString()}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DiscoverySummary({ summary }: { summary: any }) {
+  const sourceBreakdown = summary.source_breakdown || {};
+  const sources = Object.entries(sourceBreakdown);
+  const sourceHealth = Object.entries(summary.source_health || {});
+  const wildcardDomains = Object.entries(summary.wildcard_dns?.domains || {})
+    .filter(([, value]: any) => value?.wildcard)
+    .map(([domain]) => domain);
+  const hasSummary = sources.length > 0 || sourceHealth.length > 0 || summary.generated_candidates != null || summary.wildcard_skipped != null || wildcardDomains.length > 0;
+
+  if (!hasSummary) return null;
+
+  return (
+    <div className="mt-2 space-y-2 border-t border-surface-700 pt-2">
+      <div className="flex flex-wrap gap-2 text-[11px] text-muted-foreground">
+        {summary.generated_candidates != null && (
+          <span className="rounded bg-surface-900 px-1.5 py-0.5">
+            generated {Number(summary.generated_candidates).toLocaleString()}
+          </span>
+        )}
+        {summary.wildcard_skipped != null && (
+          <span className="rounded bg-surface-900 px-1.5 py-0.5">
+            wildcard skipped {Number(summary.wildcard_skipped).toLocaleString()}
+          </span>
+        )}
+        {wildcardDomains.map((domain) => (
+          <span key={domain} className="rounded bg-yellow-500/10 text-yellow-300 px-1.5 py-0.5">
+            wildcard {domain}
+          </span>
+        ))}
+      </div>
+      {sources.length > 0 && (
+        <div className="flex flex-wrap gap-1.5">
+          {sources.map(([source, count]) => (
+            <span key={source} className="text-[10px] text-muted-foreground bg-surface-900 px-1.5 py-0.5 rounded">
+              {source.replaceAll("_", " ")} {Number(count).toLocaleString()}
+            </span>
+          ))}
+        </div>
+      )}
+      {sourceHealth.length > 0 && (
+        <div className="flex flex-wrap gap-1.5">
+          {sourceHealth.map(([source, health]: [string, any]) => (
+            <span
+              key={source}
+              className={cn(
+                "text-[10px] px-1.5 py-0.5 rounded",
+                health.status === "ok" && "bg-emerald-500/10 text-emerald-300",
+                health.status === "partial" && "bg-yellow-500/10 text-yellow-300",
+                health.status === "failed" && "bg-red-500/10 text-red-300",
+                health.status === "skipped" && "bg-surface-900 text-muted-foreground",
+              )}
+            >
+              {source.replaceAll("_", " ")} {health.status} {Number(health.count || 0).toLocaleString()}
+            </span>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
