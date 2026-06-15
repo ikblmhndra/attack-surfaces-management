@@ -205,11 +205,131 @@ function PhaseRow({ phase }: { phase: any }) {
             {!!phase.targets_total && <span>{phase.targets_total} targets</span>}
             {!!phase.targets_selected && <span>{phase.targets_selected} selected</span>}
             {!!phase.errors && <span className="text-red-400">{phase.errors} errors</span>}
+            {!!phase.warnings && <span className="text-orange-400">{phase.warnings} warnings</span>}
           </div>
           {phase.phase === "discovery" && <DiscoverySummary summary={phase.summary || {}} />}
           {phase.phase === "crawl" && <EndpointSummary summary={phase.summary || {}} />}
+          {phase.phase === "nuclei" && <NucleiSummary summary={phase.summary || {}} />}
+          {["tls", "dns_security", "takeover", "cloud_exposure", "service_fingerprint"].includes(phase.phase) && (
+            <ScannerSummary summary={phase.summary || {}} />
+          )}
         </div>
       </div>
+    </div>
+  );
+}
+
+function NucleiSummary({ summary }: { summary: any }) {
+  const hasSummary =
+    summary.targets_scanned != null ||
+    summary.findings != null ||
+    summary.timeout_batches != null ||
+    summary.endpoint_liveness_skipped != null ||
+    summary.suppressed_info_findings != null ||
+    summary.endpoint_completed != null ||
+    summary.endpoint_timeout != null ||
+    summary.endpoint_failed != null ||
+    summary.remaining_batches != null;
+
+  if (!hasSummary) return null;
+
+  return (
+    <div className="mt-2 flex flex-wrap gap-2 border-t border-surface-700 pt-2 text-[11px] text-muted-foreground">
+      {summary.active_profile && (
+        <span className="rounded bg-surface-900 px-1.5 py-0.5">
+          profile {String(summary.active_profile).replaceAll("_", " ")}
+        </span>
+      )}
+      {summary.targets_scanned != null && (
+        <span className="rounded bg-surface-900 px-1.5 py-0.5">
+          scanned {Number(summary.targets_scanned).toLocaleString()}
+        </span>
+      )}
+      {summary.findings != null && (
+        <span className="rounded bg-surface-900 px-1.5 py-0.5">
+          findings {Number(summary.findings).toLocaleString()}
+        </span>
+      )}
+      {summary.remaining_batches != null && (
+        <span className="rounded bg-surface-900 px-1.5 py-0.5">
+          remaining {Number(summary.remaining_batches).toLocaleString()}
+        </span>
+      )}
+      {summary.endpoint_liveness_skipped != null && (
+        <span className="rounded bg-surface-900 px-1.5 py-0.5">
+          inactive endpoints {Number(summary.endpoint_liveness_skipped).toLocaleString()}
+        </span>
+      )}
+      {summary.endpoint_completed != null && (
+        <span className="rounded bg-emerald-500/10 px-1.5 py-0.5 text-emerald-300">
+          endpoint completed {Number(summary.endpoint_completed).toLocaleString()}
+        </span>
+      )}
+      {summary.endpoint_timeout != null && (
+        <span className="rounded bg-orange-500/10 px-1.5 py-0.5 text-orange-300">
+          endpoint timeout {Number(summary.endpoint_timeout).toLocaleString()}
+        </span>
+      )}
+      {summary.endpoint_failed != null && (
+        <span className="rounded bg-red-500/10 px-1.5 py-0.5 text-red-300">
+          endpoint failed {Number(summary.endpoint_failed).toLocaleString()}
+        </span>
+      )}
+      {summary.suppressed_info_findings != null && (
+        <span className="rounded bg-surface-900 px-1.5 py-0.5">
+          info suppressed {Number(summary.suppressed_info_findings).toLocaleString()}
+        </span>
+      )}
+      {summary.timeout_batches != null && (
+        <span className="rounded bg-orange-500/10 px-1.5 py-0.5 text-orange-300">
+          timeout batches {Number(summary.timeout_batches).toLocaleString()}
+        </span>
+      )}
+      {summary.last_timeout_seconds != null && (
+        <span className="rounded bg-orange-500/10 px-1.5 py-0.5 text-orange-300">
+          last timeout {Number(summary.last_timeout_seconds).toLocaleString()}s
+        </span>
+      )}
+    </div>
+  );
+}
+
+function ScannerSummary({ summary }: { summary: any }) {
+  const hasSummary = summary.scanner_family || summary.observed != null || summary.findings != null;
+  if (!hasSummary) return null;
+
+  return (
+    <div className="mt-2 flex flex-wrap gap-2 border-t border-surface-700 pt-2 text-[11px] text-muted-foreground">
+      {summary.scanner_family && (
+        <span className="rounded bg-surface-900 px-1.5 py-0.5">
+          {String(summary.scanner_family).replaceAll("_", " ")}
+        </span>
+      )}
+      {summary.observed != null && (
+        <span className="rounded bg-surface-900 px-1.5 py-0.5">
+          observed {Number(summary.observed).toLocaleString()}
+        </span>
+      )}
+      {summary.findings != null && (
+        <span className="rounded bg-surface-900 px-1.5 py-0.5">
+          findings {Number(summary.findings).toLocaleString()}
+        </span>
+      )}
+      {summary.tlsx_available != null && (
+        <span className="rounded bg-surface-900 px-1.5 py-0.5">
+          tlsx {summary.tlsx_available ? "available" : "fallback"}
+        </span>
+      )}
+      {summary.subzy_available != null && (
+        <span className="rounded bg-surface-900 px-1.5 py-0.5">
+          subzy {summary.subzy_available ? "available" : "fallback"}
+        </span>
+      )}
+      {summary.nmap_available != null && (
+        <span className="rounded bg-surface-900 px-1.5 py-0.5">
+          nmap {summary.nmap_available ? "available" : "fallback"}
+        </span>
+      )}
     </div>
   );
 }

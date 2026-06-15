@@ -186,11 +186,23 @@ services:
       WORKER_TYPE: nuclei
       NUCLEI_TEMPLATES_PATH: /root/nuclei-templates
       NUCLEI_RATE_LIMIT: ${NUCLEI_RATE_LIMIT:-150}
+      NUCLEI_MAX_BATCH_TIMEOUT: ${NUCLEI_MAX_BATCH_TIMEOUT:-900}
+      NUCLEI_ENDPOINT_MAX_BATCH_TIMEOUT: ${NUCLEI_ENDPOINT_MAX_BATCH_TIMEOUT:-600}
     volumes:
       - ./workers:/app/workers
       - ./backend/app:/app/app:ro
       - worker-tmp:/tmp/asm-scans
       - nuclei-templates:/opt/nuclei-templates
+    cap_add:
+      - NET_RAW
+
+  worker-scanner:
+    <<: *worker-base
+    command: python -m workers.scanner.coverage_worker
+    environment:
+      <<: *common-env
+      WORKER_TYPE: scanner
+      SCANNER_CONCURRENCY: ${SCANNER_CONCURRENCY:-2}
     cap_add:
       - NET_RAW
 

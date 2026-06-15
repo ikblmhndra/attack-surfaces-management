@@ -6,7 +6,7 @@ Upgrade the platform from a working scanner pipeline into a production-grade Att
 
 ## Implementation Status
 
-Last updated: 2026-06-05.
+Last updated: 2026-06-07.
 
 ### Completed
 
@@ -97,8 +97,6 @@ Last updated: 2026-06-05.
   - [x] Added ASN-to-prefix expansion plus bounded reverse DNS candidate extraction with conservative ownership confidence and no default auto-scan.
   - [x] Added cloud object storage candidate generation and safe exposure checks for S3, GCS, and Azure Blob.
 
-### Not Started
-
 - [x] **Milestone 4: Endpoint Intelligence V2 - implemented on 2026-06-04**
   - [x] Added first-class endpoint score, score reasons, endpoint type, sources, source count, selected state, selected reason, scan status, and last scanned timestamp fields.
   - [x] Added Alembic migration `014_endpoint_intelligence_v2` with safe backfill from legacy endpoint metadata.
@@ -110,8 +108,48 @@ Last updated: 2026-06-05.
   - [x] Endpoint nuclei runs now update endpoint scan status and `last_scanned_at`.
   - [x] Asset endpoint API/UI now exposes score, reasons, source list, classification, selected state, and scan status.
   - [x] Scan detail now shows endpoint coverage summary from the crawl phase.
-- [ ] Milestone 5: Scanner Coverage Expansion.
+  - [x] Asset endpoint tab now uses server-side pagination with page totals and previous/next controls (added 2026-06-06), so high-volume assets remain usable.
+
+### Next Focus
+
+- [ ] Milestone 5: Scanner Coverage Expansion - core scanner implementation completed on 2026-06-06; runtime tuning remains open.
 - [ ] Milestone 6: Risk and Finding Lifecycle V2.
+
+## Current Progress Snapshot
+
+- Milestones 1-4 are implemented and runtime-validated through Docker-based smoke checks.
+- The current pipeline can explain phase progress, target selection, validation skips, endpoint source/type/score, endpoint scan lifecycle, and high-volume endpoint lists in the UI.
+- Default discovery and enrichment now prioritize open-source/no-key sources and safe validation gates.
+- The main remaining ASM-core gap is now finding lifecycle depth and continued calibration: scanner breadth has dedicated TLS, DNS, takeover, cloud exposure, service fingerprint, and tuned nuclei profile coverage, but needs more smoke scans against authorized targets to calibrate findings.
+
+## Milestone 5 Decisions
+
+Decision date: 2026-06-06.
+
+Authorization:
+- User confirmed authorization through Trusted Access for Cyber for the currently configured scan targets.
+- Milestone 5 may use deep scanning where it can find meaningful findings, but checks must remain non-destructive.
+- No credential brute force, destructive exploit validation, DoS/load testing, data modification, or unsafe payload execution.
+
+Finding policy:
+- Info-only scanner output must not become a finding because it creates noise.
+- Info-only data should be stored as scanner evidence, phase summary, asset metadata, or coverage detail.
+- Findings should be created only for actionable issues: misconfiguration, exposure, weak/insecure posture, takeover risk with sufficient confidence, cloud public exposure, risky service exposure, or vulnerability templates with actionable severity.
+
+Scanner policy:
+- Takeover checks may use HTTP probing and response fingerprinting against CNAME/service targets.
+- Service fingerprinting may use lightweight banner, TLS handshake, and version-detection probes for selected open ports.
+- Cloud exposure checks may use non-destructive HTTP `HEAD`/`GET` public-read validation against discovered candidates only.
+- Nuclei should be tuned toward exposure and misconfiguration coverage, prioritize medium/high signal where possible, and validate endpoint liveness before endpoint-level nuclei batches.
+
+Milestone 5 tool decisions:
+- Add `tlsx` for TLS certificate/protocol/cipher metadata and weak TLS posture checks.
+- Add `subzy` for bounded subdomain takeover fingerprint checks.
+- Reuse existing `dnsx`, Python DNS queries, and current DNS evidence for DNS security posture checks.
+- Reuse existing `httpx` for HTTP liveness/fingerprints before endpoint nuclei and exposure checks.
+- Reuse existing `nmap` for bounded `-sV --version-light` service fingerprinting on selected ports only.
+- Reuse existing `nuclei` but split/tune profiles for web baseline, endpoint high-signal, exposure, misconfiguration, takeover, and cloud checks.
+- Do not add heavy exploit frameworks or broad brute-force DNS/content tools as part of the first Milestone 5 implementation.
 
 ## Current Gaps
 
@@ -458,6 +496,7 @@ Add dedicated checks:
 
 Suggested tools:
 - `tlsx`
+- `subzy`
 - `dnsx`
 - Nuclei takeover templates plus custom CNAME validation.
 - Custom lightweight HTTP exposure checks.
@@ -740,11 +779,12 @@ Required worker behavior:
 
 ### Add Carefully
 
-- `tlsx`: TLS metadata and weak TLS checks.
-- `puredns` or `shuffledns`: high-quality DNS brute forcing with wildcard handling.
-- `gotator`: DNS permutation generation.
-- `nmap`: bounded `-sV --version-light` only for selected ports.
-- `waybackurls`: optional if archive URL coverage from GAU/Common Crawl is insufficient.
+- `tlsx`: TLS metadata and weak TLS checks for Milestone 5 TLS worker.
+- `subzy`: bounded takeover fingerprint checks for Milestone 5 takeover worker.
+- `nmap`: already present; use bounded `-sV --version-light` only for selected ports.
+- `puredns` or `shuffledns`: later DNS brute-force quality improvement only if current DNS generation becomes insufficient.
+- `gotator`: later DNS permutation quality improvement only if current conservative permutations become insufficient.
+- `waybackurls`: later archive URL coverage improvement only if GAU/Common Crawl coverage is insufficient.
 
 ### Avoid for Now
 
@@ -818,29 +858,54 @@ Acceptance:
 ### Milestone 4: Endpoint Intelligence V2
 
 Scope:
-- Extend `web_endpoints`.
-- Improve normalization, source merging, classification, scoring.
-- Track selected/scanned endpoint state.
-- Improve endpoint UI.
+- [x] Extend `web_endpoints`.
+- [x] Improve normalization, source merging, classification, scoring.
+- [x] Track selected/scanned endpoint state.
+- [x] Persist crawl target root URLs as low-score `root_probe` endpoints.
+- [x] Improve endpoint UI, including pagination for assets with high endpoint volume.
 
 Acceptance:
-- Endpoint tab explains source, type, score, reasons, and scan status.
-- Nuclei endpoint targets are deterministic and bounded.
+- [x] Endpoint tab explains source, type, score, reasons, and scan status.
+- [x] Nuclei endpoint targets are deterministic and bounded.
+- [x] Endpoint tab stays usable for assets with thousands of endpoints through server-side pagination.
 
 ### Milestone 5: Scanner Coverage Expansion
 
 Scope:
-- Add TLS worker.
-- Add DNS security worker.
-- Add takeover worker.
-- Add cloud exposure worker.
-- Add non-web service fingerprinting.
-- Expand nuclei profiles.
+- [x] Add scanner-family queue plumbing and terminal coordination.
+- [x] Add TLS scanner family for certificate expiry and hostname mismatch evidence/findings.
+- [x] Add DNS security scanner family for SPF/DMARC posture evidence/findings.
+- [x] Add takeover scanner family using bounded CNAME/service fingerprint checks, `subzy` availability, and conservative HTTP response validation against known takeover patterns.
+- [x] Add cloud exposure scanner family for S3/GCS/Azure Blob public exposure verification from discovered candidates.
+- [x] Add non-web service fingerprinting for selected open ports using safe banner/version/TLS probes and bounded `nmap -sV --version-light`.
+- [x] Persist scanner coverage summaries and target selections for every scanner family.
+- [x] Surface scanner/check family coverage and skipped reasons in scan detail UI.
+- [x] Expand nuclei profiles into clearer web baseline, endpoint high-signal, network-safe, TLS/DNS, takeover, cloud exposure, and exposure/misconfiguration sets.
+- [x] Tune first-pass scanner finding noise by suppressing info-only findings and persisting observations as phase evidence.
+- [x] Tune nuclei host and endpoint batch runtime caps so deep/full host batches can run up to 900 seconds and endpoint batches up to 600 seconds.
+- [x] Persist nuclei timeout batches as partial evidence and mark endpoint scan status as `timeout` instead of falsely completed.
+- [x] Surface nuclei timeout, liveness skip, suppressed info, scanned target, and finding counts in scan detail UI.
+- [x] Isolate endpoint nuclei batches to one selected URL per task so a timeout affects only one high-signal endpoint.
+- [x] Add endpoint completed/timeout/failed counters to nuclei phase summaries and scan detail UI.
+- [ ] Continue runtime tuning after more full scans against authorized targets.
 
 Acceptance:
-- Findings are categorized by scanner/check family.
-- Scanner coverage summary shows what checks ran and what was skipped.
-- Defaults remain safe.
+- [x] Findings are categorized by scanner/check family.
+- [x] Scanner coverage summary shows what checks ran and what was skipped.
+- [x] New scanner worker writes durable phase state and target selections.
+- [x] UI can explain why TLS/DNS/takeover/cloud/service checks did or did not run at phase-summary level.
+- [x] Defaults remain safe, bounded, and compatible with authorized ASM scanning.
+- [x] Nuclei runtime remains bounded while exposing host and endpoint timeout caps through environment configuration.
+
+Runtime validation:
+- [x] Built `worker-scanner` Docker image with `tlsx`, `subzy`, `dnspython`, and existing scanner tools.
+- [x] Built production frontend image after scan-detail UI changes.
+- [x] Restarted API, frontend, discovery, port, nuclei, and scanner workers.
+- [x] Smoke scan `b8108741-768b-49b2-bb8a-bf23f4f1bbfa` validated discovery-to-scanner queueing, TLS and DNS security summaries, service fingerprint summaries, and bounded `nmap -sV --version-light`.
+- [x] Fixed smoke-discovered takeover/cloud SQLAlchemy import and cloud JSON metadata bugs.
+- [x] Clean post-patch smoke scan `f25c2e69-c2da-468a-bc5e-64c455c484dc` completed successfully with TLS, DNS security, takeover, and cloud exposure scanner families all completed.
+- [x] Fresh post-nuclei-tuning full scan `27d9ab7d-936a-4d7d-8e10-b65d6ace067e` completed with 372 assets, 8 actionable findings, all scanner families completed, and endpoint timeout visibility working.
+- [ ] Run a fresh post-endpoint-isolation full scan to validate that endpoint timeouts are isolated per URL and phase counters stay accurate.
 
 ### Milestone 6: Risk and Finding Lifecycle V2
 

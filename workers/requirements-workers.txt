@@ -41,6 +41,7 @@ structlog==24.1.0
 python-dotenv==1.0.1
 tldextract==5.1.2
 redis[hiredis]==5.0.4
+dnspython==2.6.1
 
 # Risk engine (shared with backend)
 passlib[bcrypt]==1.7.4

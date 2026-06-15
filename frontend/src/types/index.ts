@@ -228,7 +228,7 @@ export interface WebEndpoint {
   endpoint_type: "root" | "api" | "auth" | "admin" | "upload" | "static" | "parameterized" | "graphql" | "swagger" | "health" | "debug" | "unknown";
   selected_for_scan: boolean;
   selected_reason?: string;
-  scan_status: "not_scanned" | "queued" | "running" | "completed" | "failed";
+  scan_status: "not_scanned" | "queued" | "running" | "completed" | "failed" | "timeout";
   last_scanned_at?: string;
   sources: string[];
   source_count: number;

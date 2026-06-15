@@ -483,6 +483,7 @@ export default function AssetDetailPage() {
                               endpoint.scan_status === "completed" ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20" :
                               endpoint.scan_status === "running" ? "bg-cyan-500/10 text-cyan-400 border-cyan-500/20" :
                               endpoint.scan_status === "queued" ? "bg-amber-500/10 text-amber-400 border-amber-500/20" :
+                              endpoint.scan_status === "timeout" ? "bg-orange-500/10 text-orange-400 border-orange-500/20" :
                               "bg-surface-700 text-muted-foreground border-surface-600"
                             }`}>
                               {String(endpoint.scan_status || "not_scanned").replace(/_/g, " ")}

@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 
 import structlog
 
-from app.services.scan_profiles import SAFE_EXCLUDED_TAGS
+from app.services.scan_profiles import PROFILE_TEMPLATE_DIRS, SAFE_EXCLUDED_TAGS
 from workers.base_worker import BaseWorker
 from workers.db import get_session
 from workers.queue_client import QueueClient
@@ -57,8 +57,8 @@ CATEGORY_MAP = {
 DEFAULT_SEVERITIES = ["critical", "high", "medium", "low"]
 MAX_RAW_FIELD_CHARS = 10000
 MAX_RESPONSE_RAW_CHARS = 5000
-MAX_BATCH_TIMEOUT = int(os.getenv("NUCLEI_MAX_BATCH_TIMEOUT", "600"))
-MAX_ENDPOINT_BATCH_TIMEOUT = int(os.getenv("NUCLEI_ENDPOINT_MAX_BATCH_TIMEOUT", "300"))
+MAX_BATCH_TIMEOUT = int(os.getenv("NUCLEI_MAX_BATCH_TIMEOUT", "900"))
+MAX_ENDPOINT_BATCH_TIMEOUT = int(os.getenv("NUCLEI_ENDPOINT_MAX_BATCH_TIMEOUT", "600"))
 
 NOISY_INFO_TEMPLATE_IDS = {
     "favicon-detect",
@@ -178,6 +178,7 @@ class NucleiWorker(BaseWorker):
                         "metadata": {
                             "batch_size": len(targets),
                             "automatic_scan": config.get("automatic_scan"),
+                            "nuclei_profiles": config.get("nuclei_profiles") or config.get("nuclei_profile"),
                             "template_dirs": config.get("template_dirs") or [],
                         },
                     }
@@ -218,6 +219,49 @@ class NucleiWorker(BaseWorker):
         with tempfile.TemporaryDirectory(prefix="asm-nuclei-") as tmpdir:
             tmpdir = Path(tmpdir)
 
+            original_targets = list(targets)
+            targets = await self._validate_endpoint_targets(targets, tmpdir, config)
+            skipped_targets = [
+                target for target in original_targets
+                if str(target).startswith(("http://", "https://")) and target not in targets
+            ]
+            skipped_inactive = len(skipped_targets)
+            if skipped_inactive:
+                async with get_session() as db:
+                    await self._mark_endpoint_targets(
+                        db,
+                        org_id=org_id,
+                        workspace_id=workspace_id,
+                        targets=skipped_targets,
+                        scan_status="failed",
+                    )
+                    await self._refresh_endpoint_status_summary(
+                        db,
+                        scan_id=scan_id,
+                        org_id=org_id,
+                        workspace_id=workspace_id,
+                    )
+                    await update_scan_phase(
+                        db,
+                        scan_id,
+                        "nuclei",
+                        "running",
+                        endpoint_liveness_skipped=skipped_inactive,
+                    )
+            if not targets:
+                async with get_session() as db:
+                    await update_scan_phase(
+                        db,
+                        scan_id,
+                        "nuclei",
+                        "skipped",
+                        targets_total=0,
+                        endpoint_liveness_skipped=skipped_inactive,
+                    )
+                    await self._mark_nuclei_task_complete(db, scan_id)
+                await self._queue_correlation(scan_id, org_id, workspace_id, targets_scanned=0, findings_found=0)
+                return
+
             # Write targets
             target_file = tmpdir / "targets.txt"
             target_file.write_text("\n".join(targets))
@@ -225,6 +269,18 @@ class NucleiWorker(BaseWorker):
             output_file = tmpdir / "nuclei_results.jsonl"
 
             # Run nuclei
+            nuclei_profile = config.get("scan_profile") or config.get("vuln_depth") or "default"
+            async with get_session() as db:
+                await update_scan_phase(
+                    db,
+                    scan_id,
+                    "nuclei",
+                    "running",
+                    active_profile=nuclei_profile,
+                    active_batch_targets=len(targets),
+                    active_batch_timeout=int(config.get("scan_timeout", 900)),
+                    active_endpoint_timeout_cap=MAX_ENDPOINT_BATCH_TIMEOUT,
+                )
             findings_raw, timed_out, effective_scan_timeout = await self._run_nuclei(
                 target_file=target_file,
                 output_file=output_file,
@@ -264,25 +320,27 @@ class NucleiWorker(BaseWorker):
                     persisted = await self._persist_findings(db, findings, scan_id)
                     findings_linked = len(persisted)
                     await self._update_scan_findings_count(db, scan_id, len(persisted))
-            else:
-                if timed_out:
-                    log.warning(
-                        "nuclei_timeout_no_findings",
+            elif not timed_out:
+                log.info("nuclei_no_findings", scan_id=scan_id, targets=len(targets))
+
+            if timed_out:
+                log.warning(
+                    "nuclei_timeout_partial",
+                    scan_id=scan_id,
+                    targets=len(targets),
+                    timeout=effective_scan_timeout,
+                    raw_findings=len(findings_raw),
+                    persisted_findings=findings_linked,
+                )
+                async with get_session() as db:
+                    await self._record_timeout_summary(
+                        db,
                         scan_id=scan_id,
-                        targets=len(targets),
-                        timeout=effective_scan_timeout,
+                        targets_count=len(targets),
+                        timeout_seconds=effective_scan_timeout,
+                        raw_findings=len(findings_raw),
+                        persisted_findings=findings_linked,
                     )
-                    async with get_session() as db:
-                        await update_scan_phase(
-                            db,
-                            scan_id,
-                            "nuclei",
-                            "running",
-                            warnings=1,
-                            last_warning="nuclei_timeout_no_findings",
-                        )
-                else:
-                    log.info("nuclei_no_findings", scan_id=scan_id, targets=len(targets))
 
             async with get_session() as db:
                 await self._mark_nuclei_task_complete(db, scan_id)
@@ -305,9 +363,67 @@ class NucleiWorker(BaseWorker):
                 org_id=org_id,
                 workspace_id=workspace_id,
                 targets=targets,
-                scan_status="completed",
+                scan_status="timeout" if timed_out else "completed",
                 last_scanned=True,
             )
+            await self._refresh_endpoint_status_summary(
+                db,
+                scan_id=scan_id,
+                org_id=org_id,
+                workspace_id=workspace_id,
+            )
+
+    async def _validate_endpoint_targets(self, targets: List[str], tmpdir: Path, config: Dict[str, Any]) -> List[str]:
+        """Filter endpoint URL targets through httpx before nuclei to reduce dead/noisy endpoint scans."""
+        if not config.get("nuclei_validate_endpoint_liveness", True):
+            return targets
+        url_targets = [target for target in targets if str(target).startswith(("http://", "https://"))]
+        host_targets = [target for target in targets if target not in url_targets]
+        if not url_targets:
+            return targets
+        httpx_path = shutil.which("httpx") or ("/go/bin/httpx" if Path("/go/bin/httpx").exists() else None)
+        if not httpx_path:
+            return targets
+
+        input_file = tmpdir / "nuclei_endpoint_liveness.txt"
+        output_file = tmpdir / "nuclei_endpoint_liveness.json"
+        input_file.write_text("\n".join(url_targets))
+        cmd = [
+            httpx_path,
+            "-l", str(input_file),
+            "-json",
+            "-o", str(output_file),
+            "-silent",
+            "-follow-redirects",
+            "-max-redirects", "3",
+            "-status-code",
+            "-timeout", str(int(config.get("crawl_httpx_timeout", 10))),
+            "-t", str(int(config.get("crawl_httpx_threads", 50))),
+            "-rl", str(int(config.get("crawl_httpx_rate_limit", 150))),
+            "-no-color",
+        ]
+        try:
+            proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            await asyncio.wait_for(proc.communicate(), timeout=int(config.get("nuclei_endpoint_liveness_timeout", 180)))
+        except Exception as exc:
+            log.warning("nuclei_endpoint_liveness_failed", error=str(exc))
+            return targets
+
+        alive = set()
+        if output_file.exists():
+            for line in output_file.read_text().splitlines():
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if row.get("failed"):
+                    continue
+                key = row.get("input") or row.get("url")
+                if key:
+                    alive.add(str(key).rstrip("/"))
+                if row.get("url"):
+                    alive.add(str(row.get("url")).rstrip("/"))
+        return host_targets + [target for target in url_targets if target.rstrip("/") in alive]
 
     def _tech_tags(self, techs: List[Any]) -> List[str]:
         tags = []
@@ -358,6 +474,81 @@ class NucleiWorker(BaseWorker):
             .values(**values)
         )
         await db.commit()
+
+    async def _refresh_endpoint_status_summary(
+        self,
+        db,
+        *,
+        scan_id: str,
+        org_id: str,
+        workspace_id: str,
+    ) -> None:
+        from sqlalchemy import func, select
+        from workers.db_models import ScanTargetSelection, WebEndpoint
+
+        status_rows = (await db.execute(
+            select(WebEndpoint.scan_status, func.count(func.distinct(WebEndpoint.url)))
+            .join(
+                ScanTargetSelection,
+                ScanTargetSelection.target == WebEndpoint.url,
+            )
+            .where(
+                ScanTargetSelection.scan_id == scan_id,
+                ScanTargetSelection.phase.in_(["crawl", "nuclei"]),
+                ScanTargetSelection.target_type == "url",
+                ScanTargetSelection.selected.is_(True),
+                WebEndpoint.org_id == org_id,
+                WebEndpoint.workspace_id == workspace_id,
+            )
+            .group_by(WebEndpoint.scan_status)
+        )).all()
+        counts = {str(status or "unknown"): int(count or 0) for status, count in status_rows}
+        endpoint_total = sum(counts.values())
+
+        await update_scan_phase(
+            db,
+            scan_id,
+            "nuclei",
+            "running",
+            endpoint_targets=endpoint_total,
+            endpoint_completed=counts.get("completed", 0),
+            endpoint_timeout=counts.get("timeout", 0),
+            endpoint_failed=counts.get("failed", 0),
+            endpoint_running=counts.get("running", 0),
+            endpoint_queued=counts.get("queued", 0),
+            endpoint_not_scanned=counts.get("not_scanned", 0),
+        )
+
+    async def _record_timeout_summary(
+        self,
+        db,
+        *,
+        scan_id: str,
+        targets_count: int,
+        timeout_seconds: int,
+        raw_findings: int,
+        persisted_findings: int,
+    ) -> None:
+        from sqlalchemy import select
+        from workers.db_models import Scan
+
+        result = await db.execute(select(Scan.phase_status).where(Scan.id == scan_id).limit(1))
+        phase_status = result.scalar_one_or_none() or {}
+        current = dict((phase_status or {}).get("nuclei") or {})
+
+        await update_scan_phase(
+            db,
+            scan_id,
+            "nuclei",
+            "running",
+            warnings=int(current.get("warnings") or 0) + 1,
+            timeout_batches=int(current.get("timeout_batches") or 0) + 1,
+            last_warning="nuclei_timeout_partial",
+            last_timeout_seconds=timeout_seconds,
+            last_timeout_targets=targets_count,
+            last_timeout_raw_findings=raw_findings,
+            last_timeout_persisted_findings=persisted_findings,
+        )
 
     async def _run_nuclei(
         self,
@@ -432,8 +623,8 @@ class NucleiWorker(BaseWorker):
         elif severities:
             cmd.extend(["-severity", ",".join(severities)])
 
-        # Map depth -> template directories. Central scan profiles can pass
-        # explicit template dirs; depth mapping remains for older messages.
+        # Map depth -> template directories. Central scan profiles now pass
+        # explicit nuclei_profiles; depth mapping remains for older messages.
         TEMPLATE_DIRS_BY_DEPTH = {
             "critical": [
                 "http/cves",
@@ -472,9 +663,15 @@ class NucleiWorker(BaseWorker):
             ],
         }
 
+        profile_dirs = self._template_dirs_for_profiles(config.get("nuclei_profiles") or config.get("nuclei_profile"))
         if templates:
             for tmpl in templates:
                 cmd.extend(["-t", tmpl])
+        elif profile_dirs:
+            for tmpl_dir in profile_dirs:
+                tmpl_path = Path(self.TEMPLATES_PATH) / str(tmpl_dir)
+                if tmpl_path.exists():
+                    cmd.extend(["-t", str(tmpl_path)])
         elif config.get("template_dirs"):
             for tmpl_dir in config.get("template_dirs", []):
                 tmpl_path = Path(self.TEMPLATES_PATH) / str(tmpl_dir)
@@ -528,6 +725,20 @@ class NucleiWorker(BaseWorker):
             return [], False, scan_timeout
 
         return self._parse_results_file(output_file), False, scan_timeout
+
+    def _template_dirs_for_profiles(self, profiles: Any) -> List[str]:
+        if not profiles:
+            return []
+        if isinstance(profiles, str):
+            profiles = [profiles]
+        dirs: List[str] = []
+        seen = set()
+        for profile in profiles:
+            for tmpl_dir in PROFILE_TEMPLATE_DIRS.get(str(profile), []):
+                if tmpl_dir not in seen:
+                    seen.add(tmpl_dir)
+                    dirs.append(tmpl_dir)
+        return dirs
 
     def _parse_results_file(self, output_file: Path) -> List[Dict]:
         """Parse nuclei JSON output, including partial files after timeout."""

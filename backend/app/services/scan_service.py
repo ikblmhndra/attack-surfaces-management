@@ -16,11 +16,13 @@ from app.services.outbox_service import create_queue_event, dispatch_pending_out
 
 log = structlog.get_logger()
 
+ENDPOINT_NUCLEI_TIMEOUT_CAP = 600
+
 DEFAULT_MODULES = {
-    "full":      ["discovery", "port", "crawl", "nuclei", "screenshot", "enrich"],
+    "full":      ["discovery", "port", "crawl", "nuclei", "scanner", "screenshot", "enrich"],
     "quick":     ["discovery", "crawl", "nuclei"],
     "discovery": ["discovery"],
-    "vuln":      ["nuclei"],
+    "vuln":      ["nuclei", "scanner"],
 }
 
 DEFAULT_SCAN_POLICY = {
@@ -29,8 +31,8 @@ DEFAULT_SCAN_POLICY = {
     "budgets": {
         "scan_timeout": 900,
         "nuclei_batch_size": 4,
-        "crawl_nuclei_batch_size": 3,
-        "crawl_nuclei_scan_timeout": 300,
+        "crawl_nuclei_batch_size": 1,
+        "crawl_nuclei_scan_timeout": ENDPOINT_NUCLEI_TIMEOUT_CAP,
         "max_endpoints": 2500,
         "max_hosts": 200,
     },
@@ -64,8 +66,8 @@ DEFAULT_SCAN_CONFIG = {
         "crawl": True,
         "fuzz": False,
         "nuclei_batch_size": 4,
-        "crawl_nuclei_batch_size": 3,
-        "crawl_nuclei_scan_timeout": 300,
+        "crawl_nuclei_batch_size": 1,
+        "crawl_nuclei_scan_timeout": ENDPOINT_NUCLEI_TIMEOUT_CAP,
         "scan_timeout": 900,
         "template_timeout": 8,
         "retries": 0,
@@ -79,6 +81,13 @@ DEFAULT_SCAN_CONFIG = {
         "crawl_max_total_urls": 2500,
         "fuzz_max_targets": 25,
         "enrichment_enabled": True,
+        "scanner_enabled": True,
+        "tls_max_targets": 200,
+        "dns_security_max_domains": 100,
+        "takeover_max_targets": 200,
+        "cloud_exposure_max_targets": 100,
+        "service_fingerprint_max_targets": 200,
+        "nuclei_validate_endpoint_liveness": True,
     },
     "quick": {
         "scan_profile": "safe",
@@ -99,6 +108,8 @@ DEFAULT_SCAN_CONFIG = {
         "crawl_max_targets": 100,
         "crawl_max_total_urls": 1000,
         "enrichment_enabled": False,
+        "scanner_enabled": False,
+        "nuclei_validate_endpoint_liveness": True,
     },
     "vuln": {
         "scan_profile": "deep_authorized",
@@ -111,6 +122,8 @@ DEFAULT_SCAN_CONFIG = {
         "automatic_scan": True,
         "use_tech_tags": True,
         "enrichment_enabled": False,
+        "scanner_enabled": True,
+        "nuclei_validate_endpoint_liveness": True,
     },
 }
 
@@ -127,18 +140,23 @@ CONFIG_LIMITS = {
     "crawl_max_total_urls": (100, 5000),
     "crawl_httpx_threads": (1, 75),
     "fuzz_max_targets": (1, 50),
+    "tls_max_targets": (1, 500),
+    "dns_security_max_domains": (1, 250),
+    "takeover_max_targets": (1, 500),
+    "cloud_exposure_max_targets": (1, 250),
+    "service_fingerprint_max_targets": (1, 500),
 }
 
 PROFILE_RUNTIME_CAPS = {
     "deep_authorized": {
         "scan_timeout": 900,
         "nuclei_batch_size": 4,
-        "crawl_nuclei_batch_size": 3,
-        "crawl_nuclei_scan_timeout": 300,
+        "crawl_nuclei_batch_size": 1,
+        "crawl_nuclei_scan_timeout": ENDPOINT_NUCLEI_TIMEOUT_CAP,
     },
     "endpoint": {
-        "scan_timeout": 300,
-        "nuclei_batch_size": 3,
+        "scan_timeout": ENDPOINT_NUCLEI_TIMEOUT_CAP,
+        "nuclei_batch_size": 1,
         "concurrency": 4,
         "bulk_size": 4,
     },
@@ -212,6 +230,7 @@ def _policy_to_config(policy: Dict[str, Any]) -> Dict[str, Any]:
         "fuzz_max_targets": crawl.get("fuzz_max_targets"),
         "automatic_scan": nuclei.get("automatic_scan"),
         "use_tech_tags": nuclei.get("use_tech_tags"),
+        "nuclei_profiles": nuclei.get("nuclei_profiles"),
         "template_timeout": nuclei.get("template_timeout"),
         "exclude_tags": nuclei.get("exclude_tags"),
         "crawl_httpx_threads": rate_limits.get("httpx_threads"),
@@ -280,17 +299,20 @@ class ScanService:
             "endpoint",
             base_config,
             {
-                "scan_timeout": min(int(base_config.get("crawl_nuclei_scan_timeout", 300)), 300),
+                "scan_timeout": min(
+                    int(base_config.get("crawl_nuclei_scan_timeout", ENDPOINT_NUCLEI_TIMEOUT_CAP)),
+                    ENDPOINT_NUCLEI_TIMEOUT_CAP,
+                ),
                 "template_timeout": min(int(base_config.get("template_timeout", 6)), 6),
                 "concurrency": min(int(base_config.get("concurrency", 4)), 4),
                 "bulk_size": min(int(base_config.get("bulk_size", 4)), 4),
-                "nuclei_batch_size": 3,
+                "nuclei_batch_size": 1,
                 "severities": ["critical", "high", "medium"],
             },
         )
 
         host_batch_size = max(1, min(int(base_config.get("nuclei_batch_size", 4)), 4))
-        endpoint_batch_size = max(1, min(int(endpoint_config.get("nuclei_batch_size", 3)), 3))
+        endpoint_batch_size = max(1, min(int(endpoint_config.get("nuclei_batch_size", 1)), 1))
         host_batches = _chunks(host_targets, host_batch_size)
         endpoint_batches = _chunks(endpoint_targets, endpoint_batch_size)
         total_batches = len(host_batches) + len(endpoint_batches)
@@ -401,6 +423,8 @@ class ScanService:
         effective_config = _apply_runtime_caps(_clamp_config(apply_scan_profile(effective_config, scan_type)))
         if not effective_config.get("enrichment_enabled", True):
             scan_modules = [module for module in scan_modules if module != "enrich"]
+        if not effective_config.get("scanner_enabled", True):
+            scan_modules = [module for module in scan_modules if module != "scanner"]
 
         scan = Scan(
             org_id=org_id,

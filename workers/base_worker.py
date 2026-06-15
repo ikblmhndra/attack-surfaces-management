@@ -77,6 +77,7 @@ class BaseWorker(ABC):
         "scan.crawl":          ("asm.scan", aio_pika.ExchangeType.TOPIC),
         "scan.port":           ("asm.scan", aio_pika.ExchangeType.TOPIC),
         "scan.nuclei":         ("asm.scan", aio_pika.ExchangeType.TOPIC),
+        "scan.scanner":        ("asm.scan", aio_pika.ExchangeType.TOPIC),
         "scan.screenshot":     ("asm.scan", aio_pika.ExchangeType.TOPIC),
         "correlation.process": ("asm.correlation", aio_pika.ExchangeType.FANOUT),
         "risk.compute":        ("asm.risk", aio_pika.ExchangeType.DIRECT),

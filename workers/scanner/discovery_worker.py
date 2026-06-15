@@ -1776,6 +1776,7 @@ class DiscoveryWorker(BaseWorker):
         port_batches_queued = 0
         nuclei_batches_queued = 0
         crawl_batches_queued = 0
+        scanner_batches_queued = 0
         screenshot_queued = False
         candidates = build_target_candidates(
             subdomains=subdomains,
@@ -1892,6 +1893,49 @@ class DiscoveryWorker(BaseWorker):
                     )
                     nuclei_queued = True
 
+        if "scanner" in modules and config.get("scanner_enabled", True):
+            crawl_scan_targets = [
+                item.get("url") or item.get("host")
+                for item in (candidates.get("crawl_targets") or [])
+                if isinstance(item, dict) and (item.get("url") or item.get("host"))
+            ]
+            scanner_targets = dedupe_preserve_order(
+                (candidates.get("web_standard_targets") or [])
+                + (candidates.get("web_limited_targets") or [])
+                + crawl_scan_targets
+                + (subdomains or [])
+            )
+            scanner_families = ["tls", "dns", "takeover", "cloud"]
+            async with get_session() as db:
+                for family in scanner_families:
+                    await update_scan_phase(
+                        db,
+                        scan_id,
+                        {
+                            "tls": "tls",
+                            "dns": "dns_security",
+                            "takeover": "takeover",
+                            "cloud": "cloud_exposure",
+                        }[family],
+                        "queued",
+                        targets_total=len(scanner_targets),
+                    )
+            for family in scanner_families:
+                await coord.add_scanner_expected(scan_id)
+                scanner_batches_queued += 1
+                await queue.publish(
+                    routing_key="scan.scanner",
+                    message={
+                        "scan_id": scan_id,
+                        "org_id": org_id,
+                        "workspace_id": workspace_id,
+                        "family": family,
+                        "targets": scanner_targets,
+                        "config": config,
+                    },
+                    priority=4,
+                )
+
         screenshot_targets = candidates["screenshot_targets"] or subdomains
 
         # Screenshot task
@@ -1915,13 +1959,13 @@ class DiscoveryWorker(BaseWorker):
 
         await self._update_total_tasks(
             scan_id,
-            total_tasks=1 + port_batches_queued + crawl_batches_queued + nuclei_batches_queued + int(screenshot_queued),
+            total_tasks=1 + port_batches_queued + crawl_batches_queued + nuclei_batches_queued + scanner_batches_queued + int(screenshot_queued),
         )
 
         await queue.close()
         await coord.close()
 
-        return bool(port_batches_queued or crawl_batches_queued or nuclei_batches_queued or screenshot_queued)
+        return bool(port_batches_queued or crawl_batches_queued or nuclei_batches_queued or scanner_batches_queued or screenshot_queued)
 
     def _target_selection_rows(self, candidates: Dict[str, Any]) -> List[Dict[str, Any]]:
         profile = candidates.get("profile") or ""

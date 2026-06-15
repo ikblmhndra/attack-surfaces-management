@@ -107,6 +107,7 @@ class PortWorker(BaseWorker):
                 ip_ids = await self._persist_ip_assets(db, org_id, workspace_id, ips)
                 if results:
                     await self._persist_results(db, org_id, workspace_id, scan_id, results, ip_ids)
+                    await self._publish_service_scanner_if_enabled(db, scan_id, org_id, workspace_id, results, config)
                 await self._publish_enrichment_if_enabled(db, scan_id, org_id, workspace_id, ips, config)
 
         async with get_session() as db:
@@ -529,6 +530,66 @@ class PortWorker(BaseWorker):
         await self._add_scan_task(db, scan_id)
         await update_scan_phase(db, scan_id, "enrich", "queued", targets_total=len(assets))
         log.info("enrichment_queued", scan_id=scan_id, assets=len(assets))
+
+    async def _publish_service_scanner_if_enabled(
+        self,
+        db,
+        scan_id: str,
+        org_id: str,
+        workspace_id: str,
+        results: Dict[str, List[Dict]],
+        config: Dict[str, Any],
+    ) -> None:
+        modules = config.get("modules") or []
+        if "scanner" not in modules or not config.get("scanner_enabled", True):
+            return
+
+        services: List[Dict[str, Any]] = []
+        for ip, ports in results.items():
+            for item in ports:
+                port = int(item.get("port") or 0)
+                if not port:
+                    continue
+                services.append({
+                    "ip": ip,
+                    "port": port,
+                    "protocol": item.get("protocol", "tcp"),
+                    "service": item.get("service"),
+                    "service_version": item.get("service_version"),
+                    "product": item.get("product"),
+                    "banner": item.get("banner"),
+                    "tls_info": item.get("tls_info"),
+                    "http_probe": item.get("http_probe"),
+                })
+
+        if not services:
+            return
+
+        queue = QueueClient()
+        await queue.connect()
+        try:
+            await queue.publish(
+                routing_key="scan.scanner",
+                message={
+                    "scan_id": scan_id,
+                    "org_id": org_id,
+                    "workspace_id": workspace_id,
+                    "family": "service",
+                    "services": services[: int(config.get("service_fingerprint_max_targets", 200))],
+                    "config": config,
+                },
+                priority=4,
+            )
+        finally:
+            await queue.close()
+
+        from workers.task_coordinator import TaskCoordinator
+        coord = TaskCoordinator()
+        await coord.add_scanner_expected(scan_id)
+        await coord.close()
+        await self._add_scan_task(db, scan_id)
+        await update_scan_phase(db, scan_id, "service_fingerprint", "queued", targets_total=len(services))
+        log.info("service_scanner_queued", scan_id=scan_id, services=len(services))
 
     async def _add_scan_task(self, db, scan_id: str) -> None:
         from sqlalchemy import update

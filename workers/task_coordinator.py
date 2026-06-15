@@ -28,12 +28,14 @@ local crawl_done = redis.call('GET', KEYS[6]) or 0
 local screenshot_done = redis.call('GET', KEYS[7]) or 0
 local enrich_expected = redis.call('GET', KEYS[8]) or 0
 local enrich_done = redis.call('GET', KEYS[9]) or 0
-local terminal_marked = redis.call('GET', KEYS[10])
+local scanner_expected = redis.call('GET', KEYS[10]) or 0
+local scanner_done = redis.call('GET', KEYS[11]) or 0
+local terminal_marked = redis.call('GET', KEYS[12])
 if terminal_marked == '1' then
     return 0
 end
-if tonumber(nuclei_done) >= tonumber(nuclei_expected) and tonumber(port_done) >= tonumber(port_expected) and tonumber(crawl_done) >= tonumber(crawl_expected) and tonumber(enrich_done) >= tonumber(enrich_expected) and tonumber(screenshot_done) == 1 then
-    redis.call('SETEX', KEYS[10], 300, '1')
+if tonumber(nuclei_done) >= tonumber(nuclei_expected) and tonumber(port_done) >= tonumber(port_expected) and tonumber(crawl_done) >= tonumber(crawl_expected) and tonumber(enrich_done) >= tonumber(enrich_expected) and tonumber(scanner_done) >= tonumber(scanner_expected) and tonumber(screenshot_done) == 1 then
+    redis.call('SETEX', KEYS[12], 300, '1')
     return 1
 end
 return 0
@@ -53,6 +55,8 @@ class TaskCoordinator:
       scan:{scan_id}:crawl_done        — crawl batches completed
       scan:{scan_id}:enrich_expected   — total enrichment batches published
       scan:{scan_id}:enrich_done       — enrichment batches completed
+      scan:{scan_id}:scanner_expected  — total scanner-family batches published
+      scan:{scan_id}:scanner_done      — scanner-family batches completed
       scan:{scan_id}:screenshot_done   — 0/1 flag
       scan:{scan_id}:terminal_marked   — 0/1 flag (atomic guard)
     """
@@ -117,6 +121,8 @@ class TaskCoordinator:
             "crawl_done": f"scan:{scan_id}:crawl_done",
             "enrich_expected": f"scan:{scan_id}:enrich_expected",
             "enrich_done": f"scan:{scan_id}:enrich_done",
+            "scanner_expected": f"scan:{scan_id}:scanner_expected",
+            "scanner_done": f"scan:{scan_id}:scanner_done",
             "screenshot_done": f"scan:{scan_id}:screenshot_done",
         }
         values = await r.mget(list(keys.values()))
@@ -169,6 +175,20 @@ class TaskCoordinator:
         await r.expire(key, REDIS_KEY_TTL)
         return val
 
+    async def add_scanner_expected(self, scan_id: str, count: int = 1) -> int:
+        r = await self._get_redis()
+        key = f"scan:{scan_id}:scanner_expected"
+        val = await r.incrby(key, count)
+        await r.expire(key, REDIS_KEY_TTL)
+        return val
+
+    async def incr_scanner_done(self, scan_id: str) -> int:
+        r = await self._get_redis()
+        key = f"scan:{scan_id}:scanner_done"
+        val = await r.incr(key)
+        await r.expire(key, REDIS_KEY_TTL)
+        return val
+
     async def mark_terminal_if_all_done(self, scan_id: str) -> bool:
         """Atomically check AND claim the terminal slot. Returns True if caller should send terminal correlation."""
         script = await self._load_script()
@@ -184,6 +204,8 @@ class TaskCoordinator:
                 f"scan:{scan_id}:screenshot_done",
                 f"scan:{scan_id}:enrich_expected",
                 f"scan:{scan_id}:enrich_done",
+                f"scan:{scan_id}:scanner_expected",
+                f"scan:{scan_id}:scanner_done",
                 f"scan:{scan_id}:terminal_marked",
             ],
         )
@@ -200,12 +222,15 @@ class TaskCoordinator:
         crawl_done = int(await r.get(f"scan:{scan_id}:crawl_done") or 0)
         enrich_expected = int(await r.get(f"scan:{scan_id}:enrich_expected") or 0)
         enrich_done = int(await r.get(f"scan:{scan_id}:enrich_done") or 0)
+        scanner_expected = int(await r.get(f"scan:{scan_id}:scanner_expected") or 0)
+        scanner_done = int(await r.get(f"scan:{scan_id}:scanner_done") or 0)
         screenshot = int(await r.get(f"scan:{scan_id}:screenshot_done") or 0)
         return (
             done >= expected
             and port_done >= port_expected
             and crawl_done >= crawl_expected
             and enrich_done >= enrich_expected
+            and scanner_done >= scanner_expected
             and screenshot == 1
         )
 
@@ -220,6 +245,8 @@ class TaskCoordinator:
             f"scan:{scan_id}:crawl_done",
             f"scan:{scan_id}:enrich_expected",
             f"scan:{scan_id}:enrich_done",
+            f"scan:{scan_id}:scanner_expected",
+            f"scan:{scan_id}:scanner_done",
             f"scan:{scan_id}:nuclei_targets_scanned",
             f"scan:{scan_id}:nuclei_findings_found",
             f"scan:{scan_id}:screenshot_done",

@@ -48,6 +48,7 @@ MAX_ENDPOINT_PATH_LENGTH = 1500
 MAX_ENDPOINT_SOURCE_LENGTH = 50
 MAX_ENDPOINT_CONTENT_TYPE_LENGTH = 255
 MAX_ENDPOINT_TITLE_LENGTH = 500
+ENDPOINT_NUCLEI_TIMEOUT_CAP = 600
 
 
 def _tool_path(name: str) -> Optional[str]:
@@ -714,19 +715,19 @@ class WebCrawlWorker(BaseWorker):
         coord = TaskCoordinator()
         queue = QueueClient()
         await queue.connect()
-        batch_size = max(1, min(int(config.get("crawl_nuclei_batch_size", 25)), 3))
+        batch_size = max(1, min(int(config.get("crawl_nuclei_batch_size", 25)), 1))
         nuclei_config = child_profile_config(
             "endpoint",
             config,
             {
                 "scan_timeout": min(
-                    int(config.get("crawl_nuclei_scan_timeout", min(int(config.get("scan_timeout", 900)), 600))),
-                    300,
+                    int(config.get("crawl_nuclei_scan_timeout", min(int(config.get("scan_timeout", 900)), ENDPOINT_NUCLEI_TIMEOUT_CAP))),
+                    ENDPOINT_NUCLEI_TIMEOUT_CAP,
                 ),
                 "template_timeout": min(int(config.get("template_timeout", 6)), 6),
                 "concurrency": min(int(config.get("concurrency", 4)), 4),
                 "bulk_size": min(int(config.get("bulk_size", 4)), 4),
-                "nuclei_batch_size": 3,
+                "nuclei_batch_size": 1,
                 "severities": ["critical", "high", "medium"],
             },
         )

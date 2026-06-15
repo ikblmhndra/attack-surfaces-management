@@ -9,6 +9,45 @@ from app.services.asset_validation import should_scan_validated_asset, validatio
 SAFE_EXCLUDED_TAGS = ["dos", "bruteforce", "intrusive", "destructive", "unsafe"]
 
 PROFILE_TEMPLATE_DIRS = {
+    "web_baseline": [
+        "http/cves",
+        "http/vulnerabilities",
+        "http/exposures",
+        "http/misconfiguration",
+        "http/default-logins",
+        "http/exposed-panels",
+    ],
+    "endpoint_high_signal": [
+        "http/cves",
+        "http/vulnerabilities",
+        "http/exposures",
+        "http/misconfiguration",
+        "http/default-logins",
+        "http/takeovers",
+        "http/exposed-panels",
+    ],
+    "exposure_misconfig": [
+        "http/exposures",
+        "http/misconfiguration",
+        "http/default-logins",
+        "http/exposed-panels",
+    ],
+    "network_safe": [
+        "network/cves",
+        "network/vulnerabilities",
+        "network/exposures",
+    ],
+    "tls_dns": [
+        "dns",
+        "ssl",
+    ],
+    "takeover": [
+        "http/takeovers",
+    ],
+    "cloud_exposure": [
+        "cloud",
+        "http/exposures",
+    ],
     "safe": [
         "http/cves",
         "http/exposures",
@@ -61,6 +100,7 @@ PROFILE_TEMPLATE_DIRS = {
 SCAN_PROFILES: Dict[str, Dict[str, Any]] = {
     "safe": {
         "scan_profile": "safe",
+        "nuclei_profiles": ["web_baseline", "tls_dns", "takeover"],
         "vuln_depth": "critical",
         "automatic_scan": False,
         "use_tech_tags": False,
@@ -74,6 +114,7 @@ SCAN_PROFILES: Dict[str, Dict[str, Any]] = {
     },
     "default": {
         "scan_profile": "default",
+        "nuclei_profiles": ["web_baseline", "tls_dns", "takeover"],
         "vuln_depth": "default",
         "automatic_scan": True,
         "use_tech_tags": True,
@@ -86,11 +127,12 @@ SCAN_PROFILES: Dict[str, Dict[str, Any]] = {
         "bulk_size": 8,
         "nuclei_batch_size": 10,
         "crawl_nuclei_max_targets": 30,
-        "crawl_nuclei_batch_size": 6,
-        "crawl_nuclei_scan_timeout": 300,
+        "crawl_nuclei_batch_size": 1,
+        "crawl_nuclei_scan_timeout": 600,
     },
     "deep_authorized": {
         "scan_profile": "deep_authorized",
+        "nuclei_profiles": ["web_baseline", "network_safe", "tls_dns", "takeover", "cloud_exposure"],
         "vuln_depth": "full",
         "automatic_scan": True,
         "use_tech_tags": True,
@@ -103,11 +145,12 @@ SCAN_PROFILES: Dict[str, Dict[str, Any]] = {
         "bulk_size": 6,
         "nuclei_batch_size": 4,
         "crawl_nuclei_max_targets": 25,
-        "crawl_nuclei_batch_size": 3,
-        "crawl_nuclei_scan_timeout": 300,
+        "crawl_nuclei_batch_size": 1,
+        "crawl_nuclei_scan_timeout": 600,
     },
     "endpoint": {
         "scan_profile": "endpoint",
+        "nuclei_profiles": ["endpoint_high_signal"],
         "vuln_depth": "endpoint",
         "automatic_scan": False,
         "use_tech_tags": True,
@@ -118,10 +161,11 @@ SCAN_PROFILES: Dict[str, Dict[str, Any]] = {
         "template_timeout": 6,
         "concurrency": 4,
         "bulk_size": 4,
-        "nuclei_batch_size": 5,
+        "nuclei_batch_size": 1,
     },
     "limited": {
         "scan_profile": "limited",
+        "nuclei_profiles": ["exposure_misconfig", "takeover"],
         "vuln_depth": "default",
         "automatic_scan": False,
         "use_tech_tags": False,
@@ -209,7 +253,7 @@ def child_profile_config(name: str, base: Optional[Dict[str, Any]] = None, overr
     base = dict(base or {})
     inherited = {
         key: value for key, value in base.items()
-        if key not in {"scan_profile", "vuln_depth", "template_dirs", "automatic_scan", "severities"}
+        if key not in {"scan_profile", "vuln_depth", "nuclei_profiles", "template_dirs", "automatic_scan", "severities"}
     }
     inherited.update(overrides or {})
     return profile_config(name, inherited)

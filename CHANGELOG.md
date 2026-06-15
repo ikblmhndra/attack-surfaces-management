@@ -4,6 +4,47 @@ All notable changes to this project are documented below, sorted newest-first.
 
 ---
 
+## 2026-06-07 — Endpoint Nuclei Isolation
+
+### Changed: Isolated high-signal endpoint nuclei batches
+- **Files**: `workers/crawler/web_crawl_worker.py`, `workers/scanner/nuclei_worker.py`, `backend/app/services/scan_service.py`, `backend/app/services/scan_profiles.py`, `frontend/src/components/modals/ScanModal.tsx`, `frontend/src/app/dashboard/scans/[id]/page.tsx`
+- Endpoint nuclei batches now run one selected URL per batch so slow or timing-out endpoints do not block unrelated high-signal endpoints.
+- Full-scan and nuclei-assets endpoint configs now use endpoint batch size `1` while keeping the endpoint timeout cap at 600 seconds.
+- Nuclei phase summaries now include endpoint status counters for completed, timeout, failed, running, queued, and not-scanned endpoint targets.
+- Scan detail UI now displays endpoint completed/timeout/failed counters inside the nuclei phase summary.
+
+---
+
+## 2026-06-06 — Nuclei Runtime Tuning
+
+### Changed: Bounded but longer nuclei batches
+- **Files**: `workers/scanner/nuclei_worker.py`, `workers/crawler/web_crawl_worker.py`, `backend/app/services/scan_service.py`, `backend/app/services/scan_profiles.py`, `frontend/src/components/modals/ScanModal.tsx`, `frontend/src/app/dashboard/scans/[id]/page.tsx`, `frontend/src/app/dashboard/assets/[id]/page.tsx`, `frontend/src/types/index.ts`, `docker-compose.yml`, `.env.example`, `PLAN_ASM_CORE_V2.md`
+- Raised default host nuclei batch timeout cap to 900 seconds so deep/full profile runtime matches the configured `scan_timeout`.
+- Raised endpoint nuclei batch runtime from 300 to 600 seconds while keeping smaller endpoint batches and liveness validation.
+- Endpoint nuclei batches that time out now persist partial timeout evidence and mark affected endpoints as `timeout` instead of `completed`.
+- Scan detail UI now shows nuclei summary fields for targets scanned, findings, inactive endpoint skips, suppressed info findings, and timeout batches.
+- Exposed `NUCLEI_MAX_BATCH_TIMEOUT` and `NUCLEI_ENDPOINT_MAX_BATCH_TIMEOUT` through `.env.example` and `worker-nuclei` Compose environment.
+
+---
+
+## 2026-06-06 — Scanner Coverage Expansion Milestone 5 Start
+
+### Added: Non-destructive scanner family plumbing
+- **Files**: `workers/scanner/coverage_worker.py`, `workers/scanner/scanner_common.py`, `workers/task_coordinator.py`, `workers/queue_client.py`, `workers/base_worker.py`, `workers/scanner/discovery_worker.py`, `workers/scanner/port_worker.py`, `docker-compose.yml`, `workers/Dockerfile`, `workers/requirements-workers.txt`, `backend/app/services/scan_service.py`, `backend/app/api/v1/endpoints/organizations.py`, `frontend/src/app/dashboard/scans/[id]/page.tsx`, `frontend/src/components/modals/ScanModal.tsx`
+- Added `scan.scanner` queue support and a `worker-scanner` service for TLS, DNS security, takeover, cloud exposure, and service fingerprint scanner families.
+- Task coordination now waits for scanner-family batches before terminal correlation, preventing scans from completing before Milestone 5 checks finish.
+- Full scans now include the scanner module by default; scanner checks remain non-destructive and info-only observations are stored as phase evidence instead of findings.
+- Added `tlsx`, `subzy`, and `dnspython` to the worker image/tooling plan.
+- Port scan results now queue service fingerprint coverage for selected open ports; discovery queues TLS, DNS, takeover, and cloud exposure coverage.
+- Endpoint nuclei batches now validate URL liveness with `httpx` before running nuclei and mark inactive endpoints as failed instead of leaving them running.
+- Nuclei profiles are now explicit (`web_baseline`, `endpoint_high_signal`, `network_safe`, `tls_dns`, `takeover`, `cloud_exposure`, `exposure_misconfig`) and mapped from central scan profiles to improve medium/high signal coverage without enabling unsafe tags.
+- Cloud exposure probes now normalize internal discovered bucket values such as `aws_s3:<bucket>` into non-destructive public-read probe URLs.
+- Scan detail UI now summarizes scanner-family coverage phases.
+- Docker smoke scan `b8108741-768b-49b2-bb8a-bf23f4f1bbfa` validated discovery-to-scanner queueing, TLS/DNS/service summaries, bounded `nmap -sV --version-light`, and surfaced missing SQLAlchemy import/JSON metadata issues in takeover/cloud coverage that were patched.
+- Clean post-patch smoke scan `f25c2e69-c2da-468a-bc5e-64c455c484dc` completed successfully with TLS, DNS security, takeover, and cloud exposure scanner families all marked completed.
+
+---
+
 ## 2026-06-06 — Asset Endpoint Pagination
 
 ### Added: Paginated asset endpoint tab

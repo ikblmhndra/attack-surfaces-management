@@ -57,8 +57,8 @@ export function ScanModal({ orgId, onClose }: ScanModalProps) {
           max_endpoints: 50,
           config: {
             nuclei_batch_size: 4,
-            crawl_nuclei_batch_size: 3,
-            crawl_nuclei_scan_timeout: 300,
+            crawl_nuclei_batch_size: 1,
+            crawl_nuclei_scan_timeout: 600,
             scan_timeout: 900,
             template_timeout: 8,
             retries: 0,
@@ -77,8 +77,8 @@ export function ScanModal({ orgId, onClose }: ScanModalProps) {
           crawl,
           fuzz,
           nuclei_batch_size: scanType === "full" ? 4 : 8,
-          crawl_nuclei_batch_size: scanType === "full" ? 3 : 5,
-          crawl_nuclei_scan_timeout: 300,
+          crawl_nuclei_batch_size: scanType === "full" ? 1 : 5,
+          crawl_nuclei_scan_timeout: scanType === "full" ? 600 : 300,
           scan_timeout: scanType === "full" ? 900 : 300,
           template_timeout: 8,
           retries: 0,
@@ -289,7 +289,7 @@ export function ScanModal({ orgId, onClose }: ScanModalProps) {
                       Pipeline
                     </span>
                     <span className="text-[11px] text-muted-foreground">
-                      {scanType === "full" ? "6 stages" :
+                      {scanType === "full" ? "7 stages" :
                        scanType === "quick" ? "2 stages" :
                        scanType === "discovery" ? "1 stage" :
                        scanType === "nuclei_assets" ? "1 stage" : "1 stage"}
@@ -307,6 +307,9 @@ export function ScanModal({ orgId, onClose }: ScanModalProps) {
                     )}
                     {(scanType === "full" || scanType === "quick" || scanType === "vuln" || scanType === "nuclei_assets") && (
                       <span className="text-[11px] px-2 py-1 rounded-md bg-red-500/10 text-red-400">Vuln Scan</span>
+                    )}
+                    {scanType === "full" && (
+                      <span className="text-[11px] px-2 py-1 rounded-md bg-orange-500/10 text-orange-400">Scanner Coverage</span>
                     )}
                     {scanType === "full" && (
                       <span className="text-[11px] px-2 py-1 rounded-md bg-emerald-500/10 text-emerald-400">Screenshot</span>
