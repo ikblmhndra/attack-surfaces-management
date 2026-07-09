@@ -6,6 +6,7 @@ Also handles TLS expiry pre-checks, enrichment refreshes, and cleanup tasks.
 import asyncio
 import os
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import List, Optional
 
 import structlog
@@ -551,8 +552,15 @@ class ScanScheduler:
         return result.scalar_one_or_none() is not None
 
     async def _health_check(self) -> None:
-        """Log scheduler health metrics."""
+        """Log scheduler health metrics and touch the heartbeat file the
+        Dockerfile HEALTHCHECK relies on (this process doesn't subclass
+        BaseWorker, so it needs its own heartbeat — see base_worker.py)."""
         jobs = self.scheduler.get_jobs()
+        if self.queue.is_connected:
+            try:
+                Path(os.getenv("WORKER_HEARTBEAT_PATH", "/tmp/worker_heartbeat")).touch()
+            except Exception:
+                pass
         log.info(
             "scheduler_health",
             active_jobs=len(jobs),

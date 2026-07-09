@@ -11,6 +11,7 @@ import signal
 import time
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import aio_pika
@@ -115,6 +116,7 @@ class BaseWorker(ABC):
 
         ACTIVE_WORKERS.labels(worker_type=self.worker_type).inc()
 
+        heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         try:
             await self._connect()
             await self.setup()
@@ -129,10 +131,24 @@ class BaseWorker(ABC):
             log.error("worker_fatal_error", worker=self.worker_type, error=str(e), exc_info=True)
             raise
         finally:
+            heartbeat_task.cancel()
             await self.teardown()
             await self._disconnect()
             ACTIVE_WORKERS.labels(worker_type=self.worker_type).dec()
             log.info("worker_stopped", worker=self.worker_type)
+
+    async def _heartbeat_loop(self, interval: float = 20.0) -> None:
+        """Touch a heartbeat file while the RabbitMQ connection is alive, so
+        the Dockerfile HEALTHCHECK can detect a hung event loop or dropped
+        connection instead of always reporting healthy."""
+        heartbeat_path = os.getenv("WORKER_HEARTBEAT_PATH", "/tmp/worker_heartbeat")
+        while True:
+            try:
+                if self.is_connected:
+                    Path(heartbeat_path).touch()
+            except Exception:
+                pass
+            await asyncio.sleep(interval)
 
     # ── Connection management ─────────────────────────────────
 

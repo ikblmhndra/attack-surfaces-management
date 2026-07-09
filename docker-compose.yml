@@ -140,6 +140,10 @@ services:
       <<: *common-env
       WORKER_TYPE: discovery
       WORKER_CONCURRENCY: ${DISCOVERY_CONCURRENCY:-3}
+      SHODAN_API_KEY: ${SHODAN_API_KEY:-}
+      CENSYS_PAT: ${CENSYS_PAT:-}
+      VIRUSTOTAL_API_KEY: ${VIRUSTOTAL_API_KEY:-}
+      OTX_API_KEY: ${OTX_API_KEY:-}
     cap_add:
       - NET_RAW
 
@@ -192,7 +196,7 @@ services:
       - ./workers:/app/workers
       - ./backend/app:/app/app:ro
       - worker-tmp:/tmp/asm-scans
-      - nuclei-templates:/opt/nuclei-templates
+      - nuclei-templates:/root/nuclei-templates
     cap_add:
       - NET_RAW
 

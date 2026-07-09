@@ -246,7 +246,7 @@ export default function LoginPage() {
 
           {!mfaRequired && (
             <p className="text-center text-sm text-muted-foreground mt-6">
-              Don't have an account?{" "}
+              Don&apos;t have an account?{" "}
               <a href="/auth/register" className="text-brand-400 hover:text-brand-300 font-medium">
                 Create workspace
               </a>

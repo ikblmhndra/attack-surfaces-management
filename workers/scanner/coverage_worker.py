@@ -214,16 +214,117 @@ class ScannerCoverageWorker(BaseWorker):
                     proof=observation,
                     remediation="Deploy a certificate whose SAN list covers this hostname.",
                 ))
+
+        # Python's ssl module (above) only ever reports on the certificate itself
+        # (expiry/hostname) — it can't tell us which TLS versions/ciphers a host
+        # accepts. tlsx fills that gap: risk_engine.py already scores weak_cipher/
+        # old_tls_version findings under TLS_SECURITY, but nothing ever produced them.
+        tlsx_results, tlsx_ran = await self._tlsx_enrich(hosts, config)
+        for host, record in tlsx_results.items():
+            for version in record.get("version_enum") or []:
+                if version in ("ssl30", "tls10"):
+                    findings.append(make_finding(
+                        org_id=org_id,
+                        workspace_id=workspace_id,
+                        scanner="tls_scanner",
+                        check_id=f"tls_old_version_{version}",
+                        target=f"https://{host}",
+                        title=f"Deprecated TLS protocol version accepted ({version})",
+                        severity="high",
+                        category="old_tls_version",
+                        description="The host accepts a deprecated, insecure TLS/SSL protocol version.",
+                        evidence=f"{host} accepted a connection using {version}.",
+                        proof=record,
+                        remediation="Disable SSLv3/TLS 1.0 on the server and require TLS 1.2 or higher.",
+                    ))
+                elif version == "tls11":
+                    findings.append(make_finding(
+                        org_id=org_id,
+                        workspace_id=workspace_id,
+                        scanner="tls_scanner",
+                        check_id="tls_old_version_tls11",
+                        target=f"https://{host}",
+                        title="Deprecated TLS 1.1 accepted",
+                        severity="medium",
+                        category="old_tls_version",
+                        description="The host accepts TLS 1.1, deprecated by RFC 8996.",
+                        evidence=f"{host} accepted a connection using tls11.",
+                        proof=record,
+                        remediation="Disable TLS 1.1 on the server and require TLS 1.2 or higher.",
+                    ))
+            weak_versions = [
+                entry.get("version") for entry in (record.get("cipher_enum") or [])
+                if entry.get("ciphers")
+            ]
+            if weak_versions:
+                findings.append(make_finding(
+                    org_id=org_id,
+                    workspace_id=workspace_id,
+                    scanner="tls_scanner",
+                    check_id="tls_weak_cipher",
+                    target=f"https://{host}",
+                    title="Weak TLS cipher suite accepted",
+                    severity="medium",
+                    category="weak_cipher",
+                    description="The host negotiates a weak/insecure cipher suite for one or more TLS versions.",
+                    evidence=f"{host} accepted a weak cipher for: {', '.join(weak_versions)}.",
+                    proof=record,
+                    remediation="Restrict the server's cipher suite configuration to modern, strong ciphers only.",
+                ))
+
         selected = [{"target": host, "target_type": "host", "metadata": {"scanner": "tls"}} for host in hosts]
         summary = {
             "scanner_family": "tls",
             "observed": len(observations),
             "findings_candidates": len(findings),
             "tool": "python_ssl",
-            "tlsx_available": bool(_tool_path("tlsx")),
+            "tlsx_ran": tlsx_ran,
+            "tlsx_checked": len(tlsx_results),
             "info_observations": observations[:50],
         }
         return findings, summary, selected
+
+    async def _tlsx_enrich(self, hosts: List[str], config: Dict[str, Any]) -> tuple[Dict[str, Dict[str, Any]], bool]:
+        """Batch-run tlsx over all hosts for TLS-version/cipher enumeration that
+        Python's ssl module can't do. Returns (host -> tlsx record, whether it ran)."""
+        tlsx = _tool_path("tlsx")
+        if not tlsx or not hosts:
+            return {}, False
+
+        results: Dict[str, Dict[str, Any]] = {}
+        with tempfile.TemporaryDirectory(prefix="asm-tlsx-") as tmp:
+            tmpdir = Path(tmp)
+            input_file = tmpdir / "hosts.txt"
+            output_file = tmpdir / "tlsx_output.jsonl"
+            input_file.write_text("\n".join(hosts))
+            cmd = [
+                tlsx, "-l", str(input_file),
+                "-tv", "-cipher", "-ve", "-ce", "-ct", "weak",
+                "-ex", "-ss", "-mm", "-un",
+                "-json", "-silent", "-o", str(output_file),
+            ]
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(proc.wait(), timeout=int(config.get("tlsx_timeout", 120)))
+            except Exception as exc:
+                log.warning("tlsx_error", error=str(exc)[:300])
+                return {}, False
+
+            if output_file.exists():
+                for line in output_file.read_text(errors="ignore").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    host = record.get("host")
+                    if host:
+                        results[host] = record
+        return results, True
 
     def _tls_observe(self, host: str) -> Dict[str, Any]:
         try:
@@ -351,34 +452,123 @@ class ScannerCoverageWorker(BaseWorker):
         candidates = await self._takeover_candidates(org_id, workspace_id, targets, int(config.get("takeover_max_targets", 200)))
         findings: List[Dict[str, Any]] = []
         observations: List[Dict[str, Any]] = []
-        timeout = aiohttp.ClientTimeout(total=int(config.get("takeover_http_timeout", 10)))
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+
+        subzy_results, subzy_ran = await self._subzy_scan(candidates, config)
+        if subzy_ran:
             for candidate in candidates:
-                obs = await self._takeover_probe(session, candidate)
+                host = candidate["host"]
+                result = subzy_results.get(host)
+                obs = {**candidate, **(result or {"checked": False})}
                 observations.append(obs)
-                if obs.get("vulnerable"):
+                if result and result.get("vulnerable"):
                     findings.append(make_finding(
                         org_id=org_id,
                         workspace_id=workspace_id,
                         scanner="takeover_scanner",
-                        check_id=f"takeover_{obs.get('provider', 'unknown')}",
-                        target=f"https://{candidate['host']}",
+                        check_id=f"takeover_{(result.get('engine') or 'unknown').lower()}",
+                        target=f"https://{host}",
                         title="Potential subdomain takeover",
                         severity="high",
                         category="subdomain_takeover",
                         description="The subdomain points to a third-party service that appears unclaimed.",
-                        evidence=obs.get("evidence", ""),
-                        proof=obs,
+                        evidence=f"subzy matched {host} (CNAME {candidate.get('cname')}) against the {result.get('engine')} fingerprint.",
+                        proof=result,
                         remediation="Remove the dangling DNS record or claim/configure the referenced third-party service.",
                     ))
+        else:
+            # subzy binary unavailable — fall back to the lighter marker-matching probe
+            timeout = aiohttp.ClientTimeout(total=int(config.get("takeover_http_timeout", 10)))
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                for candidate in candidates:
+                    obs = await self._takeover_probe(session, candidate)
+                    observations.append(obs)
+                    if obs.get("vulnerable"):
+                        findings.append(make_finding(
+                            org_id=org_id,
+                            workspace_id=workspace_id,
+                            scanner="takeover_scanner",
+                            check_id=f"takeover_{obs.get('provider', 'unknown')}",
+                            target=f"https://{candidate['host']}",
+                            title="Potential subdomain takeover",
+                            severity="high",
+                            category="subdomain_takeover",
+                            description="The subdomain points to a third-party service that appears unclaimed.",
+                            evidence=obs.get("evidence", ""),
+                            proof=obs,
+                            remediation="Remove the dangling DNS record or claim/configure the referenced third-party service.",
+                        ))
+
+        if subzy_ran:
+            tool_used = "subzy"
+        elif not candidates:
+            # Nothing to distinguish tools on — no CNAME matched a known provider
+            tool_used = "no_candidates"
+        else:
+            tool_used = "http_marker_match"
+
         selected = [{"target": c["host"], "target_type": "host", "metadata": {"cname": c.get("cname")}} for c in candidates]
         summary = {
             "scanner_family": "takeover",
             "observed": len(observations),
-            "subzy_available": bool(_tool_path("subzy")),
+            "tool": tool_used,
             "info_observations": observations[:50],
         }
         return findings, summary, selected
+
+    async def _subzy_scan(self, candidates: List[Dict[str, str]], config: Dict[str, Any]) -> tuple[Dict[str, Dict[str, Any]], bool]:
+        """Batch-run subzy against CNAME-narrowed candidates instead of a hardcoded
+        marker-string dict — subzy tracks ~75+ actively-maintained provider
+        fingerprints. Returns (host -> subzy record, whether it ran).
+
+        Note: this subzy build's JSON `"vulnerable"` boolean field is unreliable
+        (observed `false` even when `"status"` says `"vulnerable"` and the CLI
+        console output flags it VULNERABLE) — `status` is the field actually
+        trusted here.
+        """
+        subzy = _tool_path("subzy")
+        if not subzy or not candidates:
+            return {}, False
+
+        results: Dict[str, Dict[str, Any]] = {}
+        with tempfile.TemporaryDirectory(prefix="asm-subzy-") as tmp:
+            tmpdir = Path(tmp)
+            targets_file = tmpdir / "targets.txt"
+            output_file = tmpdir / "subzy_output.json"
+            targets_file.write_text("\n".join(c["host"] for c in candidates))
+            cmd = [
+                subzy, "run",
+                "--targets", str(targets_file),
+                "--output", str(output_file),
+                "--https",
+                "--hide_fails",
+                "--timeout", str(int(config.get("takeover_http_timeout", 10))),
+                "--concurrency", str(int(config.get("subzy_concurrency", 10))),
+            ]
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(proc.wait(), timeout=int(config.get("subzy_timeout", 120)))
+            except Exception as exc:
+                log.warning("subzy_error", error=str(exc)[:300])
+                return {}, False
+
+            if output_file.exists():
+                try:
+                    records = json.loads(output_file.read_text(errors="ignore") or "[]")
+                except json.JSONDecodeError:
+                    records = []
+                for record in records:
+                    host = record.get("subdomain")
+                    if not host:
+                        continue
+                    results[host] = {
+                        "vulnerable": record.get("status") == "vulnerable",
+                        "engine": record.get("engine"),
+                        "cname": record.get("cname"),
+                        "documentation": record.get("documentation"),
+                    }
+        return results, True
 
     async def _takeover_candidates(self, org_id: str, workspace_id: str, targets: List[Any], limit: int) -> List[Dict[str, str]]:
         hosts = set(self._dedupe_hosts(targets))

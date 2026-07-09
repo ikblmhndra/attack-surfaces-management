@@ -4,6 +4,202 @@ All notable changes to this project are documented below, sorted newest-first.
 
 ---
 
+## 2026-07-09 — Milestone 5: Frontend Hardening
+
+### Fixed: Frontend dependencies could not be installed from a clean clone
+- **Files**: `frontend/package.json`, `frontend/package-lock.json` (newly committed — had never been
+  in git history for this repo)
+- A truly clean `npm install` (empty `node_modules`, no lockfile) crashed with `TypeError: Invalid
+  Version` inside npm's arborist dependency resolver, reproduced identically on npm 9.2.0 and a
+  freshly-installed npm 10.9.8 — not a local npm-version quirk. Root cause: two incompatible major
+  versions of `glob` (v7 via `rimraf`, v10.x nested under the old `eslint-config-next@14.2.3` →
+  `@next/eslint-plugin-next`) coexisted with nothing pinning either, and today's registry state
+  tripped a hard crash comparing them. Fixed by bumping `eslint-config-next` to `14.2.35` (matching
+  the `next` patch below) — install now completes cleanly. Committed the resulting
+  `package-lock.json` so this can't recur silently; Docker builds were only surviving before this by
+  reusing whatever uncommitted local lockfile happened to exist on a given machine.
+
+### Fixed: Next.js and axios pinned at versions with disclosed CVEs
+- **File**: `frontend/package.json`
+- `next` was exact-pinned at `14.2.3` (no `^`/`~`), which has a long list of disclosed advisories
+  including authorization bypass, SSRF via middleware, cache poisoning, and XSS — `npm audit` flagged
+  it critical. `axios` (handles every authenticated request in this app) was pinned at `1.7.2`, with
+  25+ disclosed advisories (SSRF, prototype pollution, credential leakage) — flagged high. Bumped to
+  `next@14.2.35` and `axios@1.18.1` (patches within the same major/minor, not `npm audit fix --force`'s
+  breaking-change path). Verified: critical severity is gone entirely and axios has zero remaining
+  findings. 5 vulnerabilities remain (1 moderate, 4 high) — all require a `next` 14→15 major version
+  bump to fully resolve, which is a bigger, separate migration effort intentionally left out of this
+  pass rather than forced blind.
+
+### Fixed: `tsc --noEmit` and `npm run lint` didn't actually work
+- **Files**: `frontend/.eslintrc.json` (new), `frontend/src/app/auth/login/page.tsx`
+- `npx tsc --noEmit` failed with 20 `TS2688` errors before reaching this repo's own code — turned out
+  to be corrupt `@types/d3-*` install artifacts (empty directories) from the same broken-install root
+  cause above; resolved itself once the install was fixed. `npm run lint` dropped into an interactive
+  "configure ESLint?" wizard — there was no committed ESLint config at all despite `eslint-config-next`
+  being a devDependency and `make lint` documenting this command. Added `.eslintrc.json` extending
+  `next/core-web-vitals` (the Next.js standard default). Running it for the first time surfaced one
+  real error (unescaped apostrophe in `auth/login/page.tsx`, fixed) and several accepted warnings
+  (missing `next/image` usage, a couple of `useEffect` exhaustive-deps gaps) left as-is — fixing those
+  would mean broader behavioral changes outside this pass's scope. Zero test files exist anywhere in
+  the frontend (`*.test.*`/`*.spec.*`) — noted, not addressed here.
+
+### Fixed: Frontend called two backend endpoints that didn't exist
+- **Files**: `backend/app/api/v1/endpoints/notifications.py`, `backend/app/api/v1/endpoints/admin.py`
+- `DELETE /notifications/rules/{id}` (`lib/api.ts::notificationsAPI.deleteRule`) is wired to a real,
+  live "Delete" button on `dashboard/notifications/page.tsx` with no `.catch()` — a user would confirm
+  the delete, get no error, and the rule would silently stay. `PUT /admin/users/{id}`
+  (`adminAPI.updateUser`) was declared but unreachable from any page (not yet user-facing, but the
+  contract was already committed to). Added both endpoints (mirroring the existing
+  `keys.py::delete_key` workspace-scoped-lookup-then-404 pattern), plus `PUT /notifications/rules/{id}`
+  to close the same gap for the already-declared `updateRule`. Verified live: create → PUT (200) →
+  DELETE (204) → DELETE again (404, not a silent no-op); admin role update rejects invalid roles (400)
+  and applies valid ones (200).
+
+### Changed: Relabeled the "Threat Intelligence" page
+- **Files**: `frontend/src/app/dashboard/intel/page.tsx`, `frontend/src/components/layout/Sidebar.tsx`
+- The page presented a full threat-intel UI (search, a "Malicious Only" filter, a Malicious/Benign
+  status column) backed by an enrichment pipeline that is no-key ASN/RDAP/network-baseline data only
+  (documented in `CLAUDE.md`) — the malicious-only filter could structurally never match anything
+  real. Per user decision: relabeled to "Network Intelligence" (page title, sidebar label, empty-state
+  copy), removed the "Malicious Only" filter and the Malicious/Benign status column entirely rather
+  than leave a claim the data can't back up. `GET /intel` and its data model are unchanged — this was
+  a labeling/UX fix only.
+
+### Verification
+`rm -rf node_modules && npm install` completes cleanly from scratch (the core proof, not a workaround).
+`npx tsc --noEmit` and `npm run lint` both complete non-interactively with 0 errors. `docker compose
+build frontend` succeeds using the committed lockfile; rebuilt `api` picked up the new endpoints.
+`docker compose exec api pytest tests/unit -v` — 101 passed, 1 skipped (pre-existing, unrelated), no
+regressions. All key dashboard pages (`/dashboard/intel`, `/dashboard/notifications`,
+`/dashboard/reports`, `/auth/login`) return 200 through nginx.
+
+---
+
+## 2026-07-09 — Milestone 4: Scanning Tool Gaps Closed
+
+Assessed every scanning tool the platform installs against what actually runs at runtime. Recurring
+pattern found: a purpose-built tool gets installed, a weaker hand-rolled check ships instead, and the
+tool is only referenced to populate a decorative `"<tool>_available"` status field that never gates
+behavior.
+
+### Added: Real tlsx integration for weak_cipher / old_tls_version
+- **File**: `workers/scanner/coverage_worker.py` (`_scan_tls`, new `_tlsx_enrich`)
+- `risk_engine.py::FINDING_CATEGORY_MAP` already had `weak_cipher`/`old_tls_version` keys mapped to
+  `TLS_SECURITY`, but nothing ever populated them — `_scan_tls` only ever called Python's stdlib
+  `ssl` module, never the installed `tlsx` binary (its `"tlsx_available"` field was decorative).
+  Confirmed the gap is real by running `tlsx` directly against `sirupa.pasarjaya.co.id`: it still
+  accepts TLS 1.1. Kept the existing Python-`ssl`-based expired/expiring/hostname-mismatch checks as
+  they are; added a batched `tlsx -l <hosts> -tv -cipher -ve -ce -ct weak -ex -ss -mm -un -json`
+  call for version/cipher enumeration, feeding the two previously-orphaned categories.
+
+### Added: Real subzy integration for subdomain takeover
+- **File**: `workers/scanner/coverage_worker.py` (`_scan_takeover`, new `_subzy_scan`)
+- Same shape of gap: `_takeover_probe` did a hardcoded CNAME-prefix + substring match against a
+  static ~15-entry `TAKEOVER_PROVIDERS` dict; `subzy` (76 actively-maintained fingerprints) was
+  installed but unused. Kept the CNAME-based candidate narrowing (`_takeover_candidates`) as a cheap
+  pre-filter, replaced the probe with a batched `subzy run --targets ... --vuln --hide_fails` call.
+  Falls back to the old marker-match probe if the `subzy` binary is ever unavailable.
+- **Gotcha found**: this subzy build's JSON output has a broken `"vulnerable"` boolean — observed
+  `false` even when `"status": "vulnerable"` and the CLI console output flags it VULNERABLE. Code
+  trusts `status`, not `vulnerable`. Also observed subzy flag a live, legitimate production host as
+  a false-positive takeover candidate in ad-hoc testing outside the CNAME pre-filter — the two-stage
+  (CNAME-narrow, then subzy-confirm) design is a deliberate mitigation, not just an optimization.
+
+### Fixed: Subfinder never used its own premium-source support
+- **Files**: `workers/scanner/discovery_worker.py` (new `ensure_subfinder_provider_config`, called
+  from `DiscoveryWorker.setup()`), `docker-compose.yml` (`worker-discovery` environment)
+- `_run_subfinder` already looked for a provider-config YAML and passed `-pc` — the file was just
+  never generated, so subfinder always ran keyless/free-tier only despite `SHODAN_API_KEY`,
+  `CENSYS_PAT`, `VIRUSTOTAL_API_KEY`, `OTX_API_KEY` sitting configured in `.env`. Also found these
+  keys were never even passed into any container's environment in `docker-compose.yml` — fixed that
+  too. `DiscoveryWorker.setup()` now writes `/etc/subfinder/provider-config.yaml` from whichever of
+  those four env vars are set (verified: all four populated correctly, log confirms
+  `subfinder_provider_config_written sources=['shodan','censys','virustotal','alienvault']`).
+  `ABUSEIPDB_API_KEY` has no subfinder source (it's an IP-reputation key) — left alone, consistent
+  with the no-third-party-enrichment decision already in `CLAUDE.md`.
+
+### Fixed: nuclei-templates volume pointed at the wrong path
+- **Files**: `docker-compose.yml`, `workers/scanner/nuclei_worker.py` (new `setup()` override)
+- The `nuclei-templates` named volume mounted at `/opt/nuclei-templates`, but nuclei's real template
+  path (`NUCLEI_TEMPLATES_PATH`) is `/root/nuclei-templates` — completely disconnected, so templates
+  only ever refreshed at image build time. Fixed the volume path and added a `-update-templates` run
+  in `NucleiWorker.setup()` so a container restart refreshes templates without a full rebuild.
+  Verified: the volume now contains real template content at the correct path, and the startup log
+  confirms `nuclei_templates_refreshed`.
+
+### Removed: nikto and masscan (installed, zero usage)
+- **File**: `workers/Dockerfile`
+- `nikto` was git-cloned with its own perl dependency chain but had no consuming worker service
+  (`nikto_worker.py` was never wired to a queue). `masscan` had zero code references anywhere.
+  Removed both; confirmed gone from the rebuilt image.
+
+### Fixed: Zero version pinning on every Go-based scanning tool
+- **File**: `workers/Dockerfile`
+- `subfinder`, `httpx`, `nuclei`, `naabu`, `dnsx`, `tlsx`, `katana`, `gau`, `ffuf`, `subzy`,
+  `assetfinder` were all `go install pkg@latest`, and `amass` was `@master` — every image rebuild
+  could silently change scan behavior with no record of which tool version produced a given finding.
+  Pinned to current tagged releases (subfinder v2.14.0, httpx v1.10.0, nuclei v3.11.0, naabu v2.6.1,
+  dnsx v1.2.3, tlsx v1.2.2, katana v1.6.1, gau v2.2.4, ffuf v2.1.0, subzy v1.2.1, assetfinder v0.1.1,
+  amass v4.2.0). Amass stays on the `v4` module path already in use rather than jumping to the new
+  `v5` major (bigger, separate decision) — `use_amass` is never set `True` anywhere in the codebase
+  today, so this only removes the supply-chain risk without changing whether/how it's enabled.
+  Verified all pinned versions installed correctly in the rebuilt image.
+
+### Fixed: Worker healthcheck was a no-op
+- **Files**: `workers/base_worker.py` (heartbeat task in `run()`), `workers/Dockerfile`,
+  `workers/scheduler/scheduler.py` (`_health_check`)
+- `HEALTHCHECK` was `python -c "import sys; sys.exit(0)"` — always healthy regardless of actual
+  state. `BaseWorker.run()` now touches `/tmp/worker_heartbeat` every ~20s while its RabbitMQ
+  connection is alive; `HEALTHCHECK` now fails if that file goes stale (`find ... -mmin -1`).
+  `scheduler` doesn't subclass `BaseWorker` (its own `ScanScheduler`/APScheduler loop), so it needed
+  the same heartbeat touch added separately to its existing `_health_check()` — caught this because
+  after rebuilding, every `BaseWorker` service came up `(healthy)` but `scheduler` came up
+  `(unhealthy)` until this was added. All 12 worker-family containers confirmed genuinely healthy
+  after the fix.
+
+### Found (during rebuild): scheduler's healthcheck went unhealthy after the fix above
+- **File**: `workers/scheduler/scheduler.py` (`_health_check`)
+- `ScanScheduler` doesn't subclass `BaseWorker` (its own APScheduler-driven loop), so the new
+  heartbeat never ran there — every `BaseWorker` service came up `(healthy)` after rebuild but
+  `scheduler` came up `(unhealthy)`, since it shares the same Dockerfile/HEALTHCHECK. Added the same
+  heartbeat touch to `scheduler`'s existing `_health_check()` (already runs every 60s and already
+  logged `queue_connected`). Confirmed healthy after rebuild.
+
+### Found (during verification): takeover summary mislabeled the "0 candidates" case
+- **File**: `workers/scanner/coverage_worker.py` (`_scan_takeover`)
+- The live verification scan had zero takeover candidates (no CNAME matched a known provider), so
+  `_subzy_scan` correctly returned `subzy_ran=False` — but `_scan_takeover` then reported
+  `tool: "http_marker_match"`, implying the fallback path ran, when really neither path had anything
+  to check. Added a third `"no_candidates"` label so the summary distinguishes "subzy unavailable,
+  fell back" from "nothing to scan" — a real diagnostic-accuracy bug caught by actually running the
+  fix against live data instead of stopping at "the code doesn't error."
+
+### Verification — confirmed end-to-end against a real fresh scan on `pasarjaya.co.id`
+Rebuilt all worker images (Go tool compilation cached across services after the first build; static
+checks — pinned versions present, nikto/masscan gone, provider-config populated with all 4 configured
+keys, nuclei templates on the correctly-pathed volume, every worker-family container including
+`scheduler` reporting real heartbeat-backed health — all passed before the live scan). Then ran a full
+scan (`29b04b2d-f122-4be7-9c4c-f513097463f9`, ~59 min) and confirmed real, previously-invisible
+findings appeared:
+- **11 new `old_tls_version` findings across 8 hosts** — including 2 `high`-severity TLS 1.0
+  acceptances (`e-office.pasarjaya.co.id`, `ams.pasarjaya.co.id`) and 9 `medium` TLS 1.1 acceptances
+  (`sirupa`, `e-tax`, `bod`, `admin-sirupa`, `api-sirupa`, `cdn-sirupa`, `e-learning` subdomains,
+  plus e-office/ams also on 1.1). Zero of these existed before this milestone — Python's `ssl` module
+  alone never checked for them.
+- `risk_scores.tls_security_score` for this org: **100 → 0** — previously "perfect" only because
+  nothing was ever measured; now honestly reflects that 8 of its hosts run deprecated TLS.
+  `overall_score` stayed at 69/C this run (already capped there by Milestone 1's high-severity
+  aggregate guard from unrelated findings), but `tls_security_score` no longer silently masks this
+  category the next time other categories improve.
+- Subdomain count: **377 → 497** (+120) on a re-scan of the same organization, consistent with
+  subfinder now querying Shodan/Censys/VirusTotal/OTX instead of free sources only (not a fully
+  isolated A/B test, but directionally consistent with the fix).
+- `takeover` phase: 0 candidates this run (no CNAME matched a known provider) — correctly labeled
+  `tool: "no_candidates"` after the fix above, rather than falsely implying a fallback ran.
+
+---
+
 ## 2026-07-09 — Milestone 3: Queue Routing Drift Fixed, Daily Reports Removed
 
 ### Fixed: `backend/app/core/queue_client.py` missing `scan.scanner`

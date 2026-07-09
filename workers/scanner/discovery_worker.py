@@ -68,6 +68,42 @@ def tool_path(name: str) -> Optional[str]:
     return str(go_path) if go_path.exists() else None
 
 
+# subfinder passive-source name -> env var already documented in .env.example.
+# These keys previously sat unused: subfinder's own -pc flag support existed in
+# _run_subfinder() below, but nothing ever generated the provider-config file.
+SUBFINDER_SOURCE_ENV_MAP = {
+    "shodan": "SHODAN_API_KEY",
+    "censys": "CENSYS_PAT",
+    "virustotal": "VIRUSTOTAL_API_KEY",
+    "alienvault": "OTX_API_KEY",  # subfinder's source name for AlienVault OTX
+}
+
+
+def ensure_subfinder_provider_config(path: str = "/etc/subfinder/provider-config.yaml") -> None:
+    """Populate subfinder's provider-config from whichever premium-source API keys
+    are set in the environment, so passive discovery isn't limited to free/keyless
+    sources. No-op if the file already exists or no keys are configured."""
+    config_path = Path(path)
+    if config_path.exists():
+        return
+
+    lines = []
+    configured_sources = []
+    for source, env_var in SUBFINDER_SOURCE_ENV_MAP.items():
+        value = os.getenv(env_var)
+        if value:
+            escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+            lines.append(f'{source}:\n  - "{escaped}"')
+            configured_sources.append(source)
+
+    if not lines:
+        return
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("\n".join(lines) + "\n")
+    log.info("subfinder_provider_config_written", sources=configured_sources)
+
+
 def normalize_technology(raw: Any) -> Optional[Dict[str, Optional[str]]]:
     if not isinstance(raw, str):
         return None
@@ -154,6 +190,9 @@ class DiscoveryWorker(BaseWorker):
 
     QUEUE = "scan.discovery"
     CONCURRENCY = int(os.getenv("WORKER_CONCURRENCY", "3"))
+
+    async def setup(self) -> None:
+        ensure_subfinder_provider_config()
 
     async def process(self, message: Dict[str, Any]) -> None:
         scan_id = message["scan_id"]

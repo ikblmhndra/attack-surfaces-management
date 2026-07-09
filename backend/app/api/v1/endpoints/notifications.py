@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from app.api.v1.dependencies.auth import get_current_user, get_workspace_id, get_db, RequireRole
 from app.db.models.models import User, Notification, NotificationRule
 from sqlalchemy import select, update
@@ -12,6 +12,14 @@ router = APIRouter()
 class NotificationRuleCreate(BaseModel):
     name: str; event_types: List[str]; channels: List[str]
     min_severity: str = "high"; config: dict = {}
+
+class NotificationRuleUpdate(BaseModel):
+    name: Optional[str] = None
+    event_types: Optional[List[str]] = None
+    channels: Optional[List[str]] = None
+    min_severity: Optional[str] = None
+    config: Optional[dict] = None
+    is_active: Optional[bool] = None
 
 @router.get("")
 async def list_notifications(is_read: Optional[bool] = Query(None), page: int = Query(1),
@@ -43,6 +51,29 @@ async def create_rule(request: NotificationRuleCreate, workspace_id: UUID = Depe
     current_user: User = Depends(RequireRole(["owner","admin"])), db: AsyncSession = Depends(get_db)):
     rule = NotificationRule(workspace_id=workspace_id, **request.model_dump())
     db.add(rule); await db.commit(); return {"id": str(rule.id)}
+
+@router.put("/rules/{rule_id}")
+async def update_rule(rule_id: UUID, request: NotificationRuleUpdate,
+    workspace_id: UUID = Depends(get_workspace_id),
+    current_user: User = Depends(RequireRole(["owner","admin"])), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(NotificationRule).where(NotificationRule.id == rule_id, NotificationRule.workspace_id == workspace_id))
+    rule = result.scalar_one_or_none()
+    if not rule:
+        raise HTTPException(404, "Notification rule not found")
+    for key, value in request.model_dump(exclude_unset=True).items():
+        setattr(rule, key, value)
+    await db.commit()
+    return {"id": str(rule.id)}
+
+@router.delete("/rules/{rule_id}", status_code=204)
+async def delete_rule(rule_id: UUID, workspace_id: UUID = Depends(get_workspace_id),
+    current_user: User = Depends(RequireRole(["owner","admin"])), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(NotificationRule).where(NotificationRule.id == rule_id, NotificationRule.workspace_id == workspace_id))
+    rule = result.scalar_one_or_none()
+    if not rule:
+        raise HTTPException(404, "Notification rule not found")
+    await db.delete(rule)
+    await db.commit()
 
 @router.patch("/{notification_id}/read")
 async def mark_notification_read(notification_id: UUID,

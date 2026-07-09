@@ -7,3 +7,5 @@ opencode.json
 PLAN.md
 /.claude
 /CLAUDE.md
+/frontend/node_modules
+/frontend/.next

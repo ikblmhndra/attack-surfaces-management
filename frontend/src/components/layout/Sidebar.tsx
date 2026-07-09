@@ -23,7 +23,7 @@ const NAV_ITEMS = [
   { label: "Screenshots", href: "/dashboard/screenshots", icon: Eye },
   { label: "DNS Intel", href: "/dashboard/dns", icon: Network },
   { label: "TLS/SSL", href: "/dashboard/tls", icon: Lock },
-  { label: "Threat Intel", href: "/dashboard/intel", icon: Shield },
+  { label: "Network Intel", href: "/dashboard/intel", icon: Shield },
   { label: "Reports", href: "/dashboard/reports", icon: FileText },
 ];
 

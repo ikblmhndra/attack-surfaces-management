@@ -151,6 +151,21 @@ class NucleiWorker(BaseWorker):
     TEMPLATES_PATH = os.getenv("NUCLEI_TEMPLATES_PATH", "/root/nuclei-templates")
     RATE_LIMIT = int(os.getenv("NUCLEI_RATE_LIMIT", "150"))
 
+    async def setup(self) -> None:
+        """Refresh nuclei templates once at startup. TEMPLATES_PATH now sits on a
+        persistent volume (see docker-compose.yml), so this keeps templates current
+        across container restarts instead of only at image build time."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "nuclei", "-update-templates", "-silent",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=120)
+            log.info("nuclei_templates_refreshed", path=self.TEMPLATES_PATH)
+        except Exception as e:
+            log.warning("nuclei_templates_refresh_failed", error=str(e))
+
     async def process(self, message: Dict[str, Any]) -> None:
         scan_id = message["scan_id"]
         org_id = message["org_id"]

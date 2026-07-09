@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import {
-  Shield, RefreshCw, Search, AlertTriangle, ExternalLink,
+  Shield, RefreshCw, Search, ExternalLink,
   ChevronLeft, ChevronRight, Filter
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
@@ -12,11 +12,13 @@ import { apiClient } from "@/lib/api";
 import { useWorkspaceStore } from "@/store/workspace";
 import { cn } from "@/lib/utils";
 
+// Renamed from "Threat Intelligence": the enrichment pipeline behind /intel is
+// no-key ASN/RDAP/network-baseline data only (see CLAUDE.md) — there's no live
+// malware/reputation feed, so this page no longer claims to be one.
 export default function IntelPage() {
   const { activeOrg } = useWorkspaceStore();
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(1);
-  const [maliciousOnly, setMaliciousOnly] = useState(false);
   const PAGE_SIZE = 20;
 
   const params = new URLSearchParams({
@@ -24,10 +26,9 @@ export default function IntelPage() {
     page_size: String(PAGE_SIZE),
   });
   if (activeOrg?.id) params.set("org_id", activeOrg.id);
-  if (maliciousOnly) params.set("is_malicious", "true");
 
   const { data, isLoading, refetch } = useQuery({
-    queryKey: ["threat-intel", params.toString()],
+    queryKey: ["network-intel", params.toString()],
     queryFn: () => apiClient.get(`/intel?${params}`).then(r => r.data),
     enabled: !!activeOrg?.id,
     refetchInterval: 60_000,
@@ -39,9 +40,9 @@ export default function IntelPage() {
     <div className="p-6 space-y-5">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-xl font-semibold text-foreground">Threat Intelligence</h1>
+          <h1 className="text-xl font-semibold text-foreground">Network Intelligence</h1>
           <p className="text-sm text-muted-foreground">
-            {data?.total ?? 0} indicators · {activeOrg?.name || "All organizations"}
+            {data?.total ?? 0} network records · {activeOrg?.name || "All organizations"}
           </p>
         </div>
         <button onClick={() => refetch()} className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg bg-surface-700 hover:bg-surface-600 border border-surface-600 text-foreground">
@@ -53,7 +54,7 @@ export default function IntelPage() {
         <div className="glass-card flex items-center justify-center h-64">
           <div className="text-center text-muted-foreground">
             <Shield className="w-12 h-12 mx-auto mb-3 opacity-30" />
-            <p className="text-sm">Select an organization to view threat intelligence</p>
+            <p className="text-sm">Select an organization to view network intelligence</p>
           </div>
         </div>
       ) : (
@@ -64,22 +65,10 @@ export default function IntelPage() {
               <input
                 value={search}
                 onChange={e => { setSearch(e.target.value); setPage(1); }}
-                placeholder="Search indicators..."
+                placeholder="Search records..."
                 className="w-full pl-9 pr-4 py-2 bg-surface-800 border border-border rounded-lg text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-brand-500"
               />
             </div>
-            <button
-              onClick={() => setMaliciousOnly(!maliciousOnly)}
-              className={cn(
-                "flex items-center gap-1.5 px-3 py-2 text-xs rounded-lg border transition-colors",
-                maliciousOnly
-                  ? "bg-red-500/20 border-red-500/30 text-red-400"
-                  : "bg-surface-800 border-surface-600 text-muted-foreground"
-              )}
-            >
-              <AlertTriangle className="w-3.5 h-3.5" />
-              Malicious Only
-            </button>
           </div>
 
           <div className="glass-card overflow-hidden">
@@ -94,7 +83,6 @@ export default function IntelPage() {
                     <tr>
                       <th>Source</th>
                       <th>Risk Score</th>
-                      <th>Status</th>
                       <th>Tags</th>
                       <th>Categories</th>
                       <th>Enriched</th>
@@ -116,17 +104,6 @@ export default function IntelPage() {
                               {item.risk_score}
                             </span>
                           ) : <span className="text-xs text-muted-foreground">—</span>}
-                        </td>
-                        <td>
-                          <span className={cn(
-                            "inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium border",
-                            item.is_malicious
-                              ? "bg-red-500/10 text-red-400 border-red-500/20"
-                              : "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
-                          )}>
-                            <span className={cn("w-1.5 h-1.5 rounded-full", item.is_malicious ? "bg-red-400" : "bg-emerald-400")} />
-                            {item.is_malicious ? "Malicious" : "Benign"}
-                          </span>
                         </td>
                         <td>
                           <div className="flex flex-wrap gap-1 max-w-[180px]">
@@ -158,8 +135,8 @@ export default function IntelPage() {
             ) : (
               <div className="flex flex-col items-center justify-center h-48 text-muted-foreground">
                 <Shield className="w-8 h-8 mb-2 opacity-50" />
-                <p className="text-sm">No threat intelligence data</p>
-                <p className="text-xs mt-1">Intel is enriched from external sources during scans</p>
+                <p className="text-sm">No network intelligence data</p>
+                <p className="text-xs mt-1">Enriched from no-key ASN/RDAP/network-ownership lookups during scans</p>
               </div>
             )}
           </div>
