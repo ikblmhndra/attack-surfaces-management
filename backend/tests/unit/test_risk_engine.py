@@ -289,6 +289,39 @@ class TestRiskScoringEngine:
         for cat_data in result.score_breakdown.values():
             assert cat_data["score"] >= 0
 
+    def test_scattered_highs_across_categories_capped_below_a(self):
+        """
+        Regression test for the false-negative grade found on a real scan: zero criticals,
+        but several HIGH-severity exposures (exposed DB/remote-admin ports, an unpatched CVE)
+        spread across categories, plus a couple of unrelated mediums. Per-category weighting
+        alone let this average out to a 90/A — the high_penalty aggregate cap must catch it.
+        """
+        findings = [
+            self._make_finding("high", "exposed_service"),   # network_security
+            self._make_finding("high", "exposed_service"),
+            self._make_finding("high", "exposed_service"),
+            self._make_finding("high", "exposed_service"),
+            self._make_finding("high", "exposed_service"),
+            self._make_finding("high", "known_cve"),          # patch_hygiene
+            self._make_finding("medium", "missing_dmarc"),    # dns_health
+            self._make_finding("medium", "debug_endpoint"),   # info_leakage
+        ]
+        result = self.engine.compute("org-1", findings, now=self.now)
+        assert result.overall_score < 90
+        assert result.grade != "A"
+
+    def test_single_high_finding_cannot_reach_grade_a(self):
+        findings = [self._make_finding("high", "known_cve")]
+        result = self.engine.compute("org-1", findings, now=self.now)
+        assert result.overall_score <= 84
+        assert result.grade != "A"
+
+    def test_mediums_only_unaffected_by_high_penalty_cap(self):
+        """The new HIGH aggregate cap shouldn't fire when there are no HIGH findings at all."""
+        findings = [self._make_finding("medium", "missing_dmarc")]
+        result = self.engine.compute("org-1", findings, now=self.now)
+        assert result.grade == "A"
+
     def test_different_categories_score_independently(self):
         """Finding in DNS category shouldn't affect network security score."""
         dns_finding = [self._make_finding("critical", "missing_spf")]

@@ -193,6 +193,21 @@ async def publish_scanner_completion(scan_id: str, org_id: str, workspace_id: st
     coord = TaskCoordinator()
     await coord.incr_scanner_done(scan_id)
 
+    counts = await coord.get_counts(scan_id)
+    expected = max(counts.get("scanner_expected", 0), 0)
+    done = max(counts.get("scanner_done", 0), 0)
+    scanner_status = "completed" if expected and done >= expected else "running"
+    async with get_session() as db:
+        await update_scan_phase(
+            db,
+            scan_id,
+            "scanner",
+            scanner_status,
+            expected_batches=expected,
+            completed_batches=done,
+            remaining_batches=max(expected - done, 0),
+        )
+
     await queue.publish(
         routing_key="correlation.process",
         message={"scan_id": scan_id, "org_id": org_id, "workspace_id": workspace_id},

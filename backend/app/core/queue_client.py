@@ -16,13 +16,13 @@ ROUTING_CONFIG = {
     "scan.crawl":          {"exchange": "asm.scan",         "type": aio_pika.ExchangeType.TOPIC},
     "scan.port":           {"exchange": "asm.scan",         "type": aio_pika.ExchangeType.TOPIC},
     "scan.nuclei":         {"exchange": "asm.scan",         "type": aio_pika.ExchangeType.TOPIC},
+    "scan.scanner":        {"exchange": "asm.scan",         "type": aio_pika.ExchangeType.TOPIC},
     "scan.screenshot":     {"exchange": "asm.scan",         "type": aio_pika.ExchangeType.TOPIC},
     "correlation.process": {"exchange": "asm.correlation",  "type": aio_pika.ExchangeType.FANOUT},
     "risk.compute":        {"exchange": "asm.risk",         "type": aio_pika.ExchangeType.DIRECT},
     "notify.send":         {"exchange": "asm.notify",       "type": aio_pika.ExchangeType.TOPIC},
     "enrich.assets":       {"exchange": "asm.enrich",       "type": aio_pika.ExchangeType.DIRECT},
     "asset.validate":      {"exchange": "asm.asset",        "type": aio_pika.ExchangeType.DIRECT},
-    "report.daily":        {"exchange": "asm.report",       "type": aio_pika.ExchangeType.DIRECT},
 }
 
 QUEUE_CONFIG = {

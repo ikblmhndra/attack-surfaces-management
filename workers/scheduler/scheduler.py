@@ -10,7 +10,6 @@ from typing import List, Optional
 
 import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy import select, update
 
@@ -145,14 +144,6 @@ class ScanScheduler:
             trigger=IntervalTrigger(hours=VALIDATION_REFRESH_HOURS),
             id="asset_validation_refresh",
             name="Refresh asset ownership and scope validation",
-        )
-
-        # ── Daily report generation ───────────────────────────
-        self.scheduler.add_job(
-            self._generate_daily_summaries,
-            trigger=CronTrigger(hour=8, minute=0, timezone="UTC"),
-            id="daily_reports",
-            name="Generate daily security summaries",
         )
 
         log.info("scheduler_jobs_registered", count=len(self.scheduler.get_jobs()))
@@ -425,31 +416,6 @@ class ScanScheduler:
             queued += 1
 
         log.info("asset_validation_refresh_queued", count=queued)
-
-    async def _generate_daily_summaries(self) -> None:
-        """Queue daily summary report generation for all workspaces."""
-        from workers.db_models import Workspace
-
-        log.info("generating_daily_summaries")
-
-        async with get_session() as db:
-            result = await db.execute(
-                select(Workspace).where(Workspace.is_active == True)
-            )
-            workspaces = result.scalars().all()
-
-        for ws in workspaces:
-            await self.queue.publish(
-                routing_key="report.daily",
-                message={
-                    "workspace_id": str(ws.id),
-                    "report_date": datetime.now(timezone.utc).date().isoformat(),
-                    "report_type": "daily_summary",
-                },
-                priority=1,
-            )
-
-        log.info("daily_reports_queued", workspaces=len(workspaces))
 
     # ── Helpers ───────────────────────────────────────────────
 

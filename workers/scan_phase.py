@@ -8,6 +8,8 @@ import uuid
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy import func
 
+TERMINAL_PHASE_STATUSES = {"completed", "failed", "skipped"}
+
 
 async def update_scan_phase(db, scan_id: str, phase: str, status: str, **fields: Any) -> None:
     from sqlalchemy import select
@@ -21,6 +23,15 @@ async def update_scan_phase(db, scan_id: str, phase: str, status: str, **fields:
     now = datetime.now(timezone.utc).isoformat()
     phases = dict(scan.phase_status or {})
     current = dict(phases.get(phase) or {})
+
+    # Fanned-out phases (nuclei batches, scanner sub-families) compute "completed" by
+    # reading a shared counter and writing back — with concurrent workers, a batch that
+    # read the counter before the last increment can finish writing "running" *after*
+    # the batch that legitimately completed the phase. Once a phase reaches a terminal
+    # status, don't let a late/racy non-terminal update regress it.
+    if current.get("status") in TERMINAL_PHASE_STATUSES and status not in TERMINAL_PHASE_STATUSES:
+        return
+
     current.update({key: value for key, value in fields.items() if value is not None})
     current["status"] = status
     if status == "running" and not current.get("started_at"):

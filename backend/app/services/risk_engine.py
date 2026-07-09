@@ -325,6 +325,12 @@ class RiskScoringEngine:
             for penalty in cat_score.penalties
             if penalty["severity"].lower() == Severity.CRITICAL.value
         )
+        high_penalty = sum(
+            penalty["penalty"]
+            for cat_score in category_scores.values()
+            for penalty in cat_score.penalties
+            if penalty["severity"].lower() == Severity.HIGH.value
+        )
 
         # Apply bonus for assets with no findings (healthy org)
         if total_assets > 0 and len(active_findings) == 0:
@@ -332,10 +338,17 @@ class RiskScoringEngine:
             weighted_total = min(100, weighted_total + bonus)
 
         overall_score = max(0, min(100, round(weighted_total)))
+        # Per-category weighting alone lets a handful of real HIGH-severity exposures
+        # spread across otherwise-clean categories average out near 100 — cap the grade
+        # so that doesn't happen, same idea as the CRITICAL cap below but softer.
         if critical_penalty >= 75:
             overall_score = min(overall_score, 60)
         elif critical_penalty >= 20:
             overall_score = min(overall_score, 79)
+        elif high_penalty >= 45:
+            overall_score = min(overall_score, 69)
+        elif high_penalty >= 15:
+            overall_score = min(overall_score, 84)
         grade = score_to_grade(overall_score)
 
         # Build score factors (human-readable impact statements)

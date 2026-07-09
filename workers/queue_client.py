@@ -25,7 +25,6 @@ ROUTING_CONFIG = {
     "notify.send":         {"exchange": "asm.notify",       "type": aio_pika.ExchangeType.TOPIC},
     "enrich.assets":       {"exchange": "asm.enrich",       "type": aio_pika.ExchangeType.DIRECT},
     "asset.validate":      {"exchange": "asm.asset",        "type": aio_pika.ExchangeType.DIRECT},
-    "report.daily":        {"exchange": "asm.report",       "type": aio_pika.ExchangeType.DIRECT},
 }
 
 QUEUE_CONFIG = {

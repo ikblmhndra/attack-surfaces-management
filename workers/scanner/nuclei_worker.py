@@ -920,6 +920,8 @@ class NucleiWorker(BaseWorker):
             return "known_cve"
         if any(k in template_lower for k in ["panel", "admin", "login", "dashboard"]):
             return "exposed_admin_panel"
+        if any(k in template_lower for k in ["debug", "ignition", "stacktrace", "stack-trace", "trace"]):
+            return "debug_endpoint"
         if any(k in template_lower for k in ["git", "env", "config", "backup"]):
             return "exposed_git"
         if any(k in template_lower for k in ["header", "hsts", "csp", "xss"]):
@@ -933,7 +935,9 @@ class NucleiWorker(BaseWorker):
         if any(k in template_lower for k in ["takeover", "subdomain"]):
             return "subdomain_takeover"
 
-        return "exposed_service"  # Default
+        # Unmatched templates default to the lowest-weighted category (misconfiguration)
+        # instead of falsely asserting a specific claim like "exposed_service"/network risk.
+        return "cors_misconfiguration"
 
     async def _persist_findings(
         self,

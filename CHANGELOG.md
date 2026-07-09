@@ -4,6 +4,124 @@ All notable changes to this project are documented below, sorted newest-first.
 
 ---
 
+## 2026-07-09 — Milestone 3: Queue Routing Drift Fixed, Daily Reports Removed
+
+### Fixed: `backend/app/core/queue_client.py` missing `scan.scanner`
+- **File**: `backend/app/core/queue_client.py`
+- Added the missing `scan.scanner` entry to `ROUTING_CONFIG`, matching `workers/queue_client.py`
+  and `workers/base_worker.py::EXCHANGE_MAP` exactly. Previously, publishing to `scan.scanner` from
+  backend/API code would `KeyError`.
+
+### Removed: Scheduled daily report generation (product decision — reporting stays manual-only)
+- **Files**: `workers/scheduler/scheduler.py`, `workers/queue_client.py`, `backend/app/core/queue_client.py`
+- `scheduler.py::_generate_daily_summaries` was a real, active cron job (08:00 UTC daily) publishing
+  a `report.daily` message per active workspace, but no worker anywhere consumed that queue — every
+  message was silently dropped. Rather than build a consumer, the user decided report generation
+  should stay manual-only (`POST /api/v1/reports/generate`, already built and working). Removed the
+  `daily_reports` job registration and the `_generate_daily_summaries` method entirely, and dropped
+  the now-unused `report.daily` entry from both `ROUTING_CONFIG` copies (the unused `CronTrigger`
+  import was also removed from `scheduler.py`).
+- Verified: `scheduler` restarted cleanly, job count dropped from 8 → 7, `daily_reports` no longer
+  appears in `scheduler_health`'s `next_runs`. Both routing-config copies confirmed identical
+  (11 matching keys, `scan.scanner` present, `report.daily` gone) via direct import inside the `api`
+  and `worker-scanner` containers.
+
+---
+
+## 2026-07-09 — Milestone 2: Nuclei/Scanner Phase Status Stuck After Completion
+
+### Fixed: Racy phase-status write let "completed" get overwritten back to "running"
+- **File**: `workers/scan_phase.py` (`update_scan_phase`)
+- Turned out `nuclei_worker.py` already had logic to compute `"completed"` from the shared Redis
+  counters (`nuclei_done >= nuclei_expected`) — the original diagnosis that it was simply missing
+  was wrong. The real bug: with concurrent batch workers, a batch that read the counter *before*
+  the last increment can still finish writing `"running"` to `phase_status` *after* the batch that
+  legitimately completed the phase — a read-modify-write race with no compare-and-swap. Added a
+  monotonic guard: once a phase's persisted status is terminal (`completed`/`failed`/`skipped`), a
+  later non-terminal write for the same phase is now a no-op. This protects every phase that goes
+  through this shared helper, not just nuclei.
+
+### Fixed: `scanner` umbrella phase had no completion logic at all
+- **File**: `workers/scanner/scanner_common.py` (`publish_scanner_completion`)
+- Unlike nuclei, this one really was missing entirely — it incremented the `scanner_done` Redis
+  counter but never touched `phase_status`, so the `scanner` phase stayed `queued` forever even
+  after all 5 sub-families (tls/dns_security/takeover/cloud_exposure/service_fingerprint) finished.
+  Added the same "compute status from counts, call `update_scan_phase`" pattern nuclei already used
+  — now protected from the same race by the guard above.
+
+### Verified against a real fresh scan (not simulated)
+- Re-ran a full scan on `pasarjaya.co.id` (scan `e935923b-4403-42c0-8072-3074498f47ec`, ~78 min,
+  32 nuclei batches + 5 scanner sub-families) through the actual fixed worker code. Result:
+  `phase_status.nuclei.status` and `phase_status.scanner.status` both `"completed"`; `scan_phase_runs`
+  confirms `nuclei` at 32/32 and `scanner` at 5/5 `expected_tasks`/`completed_tasks`. No manual DB
+  state manipulation this time — this ran end-to-end through the real pipeline.
+
+---
+
+## 2026-07-09 — Milestone 1: Risk Scoring False-Negative Fixed
+
+### Fixed: Exposed DB/remote-admin ports under-rated as medium
+- **File**: `workers/scanner/coverage_worker.py` (`RISKY_PORTS`)
+- SMB, MSSQL, Oracle, NFS, MySQL, RDP, PostgreSQL, and Kibana were hardcoded `medium` despite being
+  the same class of risk as VNC/Redis/Elasticsearch/MongoDB, which were already `high`. Bumped all
+  eight to `high`. FTP stays `low`, Docker API stays `critical` — both already correctly calibrated.
+
+### Fixed: Nuclei findings falling into the wrong risk category
+- **File**: `workers/scanner/nuclei_worker.py` (`_map_category`)
+- Templates that didn't match any prefix/tag/keyword rule defaulted to `"exposed_service"`
+  (→ Network Security, 15% weight) — asserting a network-exposure claim that's often wrong. A
+  Laravel `_ignition`-class debug finding fell through to this default instead of landing in
+  Info Leakage, diluting Network Security alongside real port exposures. Added a `debug`/`ignition`/
+  `stacktrace`/`trace` keyword branch → `debug_endpoint` (Info Leakage), and changed the blind
+  default to `"cors_misconfiguration"` (Misconfiguration, the lowest-weighted category at 5%) —
+  a much safer "we don't know" home than falsely claiming network risk.
+
+### Added: Aggregate HIGH-severity score cap
+- **Files**: `backend/app/services/risk_engine.py`, `backend/tests/unit/test_risk_engine.py`
+- The only existing safety net capped the grade when `CRITICAL`-severity penalty totals were large;
+  there was no equivalent for `HIGH`. Structurally, categories with zero findings contribute their
+  full weight as if perfect, so a handful of real HIGH-severity exposures spread across categories
+  could still average out near 100. Added a parallel `high_penalty` aggregate with two cap tiers
+  (`>= 45` → capped at 69, `>= 15` → capped at 84), same pattern as the existing critical cap.
+  Added 3 regression tests, including one that reproduces the real scenario below.
+
+### Verified against real scan data (not just unit tests)
+- Scan `1f1de107-4b96-40d5-8f3e-d5f9ceacba42` (`pasarjaya.co.id`) had scored **90/Grade A** despite
+  MySQL exposed on 4 IPs, RDP exposed, and a Laravel debug endpoint. Restarted `worker-scanner`/
+  `worker-nuclei`/`worker-risk` with the fix, confirmed the fixed severity/category logic directly
+  against the real template IDs and ports involved, updated the existing findings to match what a
+  fresh scan would now persist, and re-triggered `risk.compute` through the real `RiskWorker` code
+  path (not a reimplementation). Result: **69/Grade C**, `network_security_score` 52→25,
+  `info_leakage_score` 100→92, `high_count` 1→6. `docker compose exec api pytest
+  tests/unit/test_risk_engine.py -v` — 42/42 passed.
+
+---
+
+## 2026-07-09 — ASM Output Assessment (scan 1f1de107, pasarjaya.co.id)
+
+### Found: Risk score is a false-negative — Grade A despite internet-exposed DB/RDP/debug (not fixed)
+- **Files**: `workers/scanner/coverage_worker.py`, `backend/app/services/risk_engine.py`
+- A full scan surfaced genuinely poor exposures — MySQL (3306) exposed on 4 public IPs, RDP (3389)
+  exposed, and a Laravel `_ignition` debug endpoint (CVE-2021-3129 class, unauthenticated RCE) — yet
+  the org scored **90 / Grade A**. Root cause: `coverage_worker.py` hardcodes exposed MySQL and RDP
+  as `medium` (`RISKY_PORTS`, lines ~57-58), the Laravel debug finding lands as `medium` too, and the
+  risk engine's per-category weighted aggregation (`exposed_service → NETWORK_SECURITY`, 15% weight;
+  MEDIUM penalty 8) dilutes a handful of mediums across categories so the overall stays near 100.
+  Internet-exposed database and RDP should be High (RDP is a top ransomware vector); `_ignition`
+  debug should be High/Critical. As-is, the ASM under-rates its own findings — the headline grade
+  would tell a user they're fine when they are not. Logged for a follow-up scoring/severity pass.
+
+### Found: Phase status stuck after scan completes (cosmetic, not fixed)
+- **Files**: `workers/scan_phase.py`, `workers/scanner/nuclei_worker.py`, `workers/scanner/coverage_worker.py`
+- Scan `1f1de107` finalized correctly (status `completed`, correlation + risk ran, all queues drained
+  to 0, no DLQ) but `phase_status.nuclei` stayed `running` (its `ScanPhaseRun` shows 35/35 completed
+  with a `completed_at` set — only the `status` field never flipped) and the `scanner` umbrella phase
+  stayed `queued` (its sub-families tls/dns_security/takeover/cloud_exposure/service_fingerprint all
+  completed, but the umbrella row was never updated). Purely a state-label bug — the scan detail UI
+  would show a completed scan with phases that look stuck. No functional stall.
+
+---
+
 ## 2026-07-09 — Reporting: Fixed Download Button Sending No Auth Header
 
 ### Fixed: Download button returned "Authentication required" in the browser
