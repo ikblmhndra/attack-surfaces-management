@@ -1,16 +1,15 @@
-import json
-from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Dict, Optional
 from uuid import UUID
 
 import structlog
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.dependencies.auth import get_current_user, get_workspace_id, get_db, RequireRole
-from app.db.models.models import Asset, Finding, Organization, Report, Scan, User
+from app.db.models.models import Organization, Report, User
+from app.services import report_service
 
 log = structlog.get_logger()
 router = APIRouter()
@@ -20,7 +19,10 @@ require_analyst = RequireRole(["owner", "admin", "analyst"])
 class ReportGenerateRequest(BaseModel):
     org_id: str
     report_type: str = "executive"
-    format: str = "json"
+    format: str = "pdf"
+    date_range_days: int = 30
+    include_charts: bool = True
+    include_evidence: bool = True
 
 @router.post("/generate", status_code=202)
 async def generate_report(
@@ -50,7 +52,17 @@ async def generate_report(
     await db.commit()
     await db.refresh(report)
 
-    bg.add_task(_generate_report_data, str(report.id), request.org_id, str(workspace_id), request.report_type, request.format)
+    bg.add_task(
+        report_service.generate_report,
+        str(report.id),
+        request.org_id,
+        str(workspace_id),
+        request.report_type,
+        request.format,
+        request.date_range_days,
+        request.include_charts,
+        request.include_evidence,
+    )
 
     return {
         "report_id": str(report.id),
@@ -83,6 +95,7 @@ async def list_reports(
             "title": r.title,
             "status": r.status,
             "stats": r.stats,
+            "download_url": f"/api/v1/reports/{r.id}/download" if r.status == "completed" else None,
             "generated_at": r.generated_at.isoformat() if r.generated_at else None,
             "created_at": r.created_at.isoformat(),
         } for r in reports],
@@ -112,6 +125,7 @@ async def get_report(
         "summary": report.summary,
         "data": report.data,
         "stats": report.stats,
+        "download_url": f"/api/v1/reports/{report.id}/download" if report.status == "completed" else None,
         "generated_at": report.generated_at.isoformat() if report.generated_at else None,
         "error_message": report.error_message,
         "created_at": report.created_at.isoformat(),
@@ -125,7 +139,8 @@ async def download_report(
     db: AsyncSession = Depends(get_db),
 ):
     from fastapi.responses import StreamingResponse, JSONResponse
-    import csv, io
+    import csv
+    import io
 
     result = await db.execute(
         select(Report).where(Report.id == report_id, Report.workspace_id == workspace_id)
@@ -136,9 +151,36 @@ async def download_report(
     if report.status != "completed":
         raise HTTPException(400, "Report is not yet generated")
 
-    data = report.data or {}
+    data: Dict[str, Any] = report.data or {}
+    filename_slug = str(report.id)[:8]
+
+    if report.format == "pdf":
+        if not report.file_path:
+            raise HTTPException(500, "Report PDF is missing its stored file")
+        from app.core.config import settings
+        from app.core.minio_client import get_minio
+        import asyncio
+
+        bucket, key = settings.MINIO_BUCKET_REPORTS, str(report.file_path)
+
+        def _fetch() -> bytes:
+            obj = get_minio().get_object(bucket, key)
+            try:
+                return obj.read()
+            finally:
+                obj.close()
+                obj.release_conn()
+
+        loop = asyncio.get_running_loop()
+        pdf_bytes = await loop.run_in_executor(None, _fetch)
+        return StreamingResponse(
+            iter([pdf_bytes]),
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename=report_{filename_slug}.pdf"},
+        )
+
     if report.format == "json":
-        return JSONResponse(content=data, media_type="application/json", headers={"Content-Disposition": f"attachment; filename=report_{report_id[:8]}.json"})
+        return JSONResponse(content=data, media_type="application/json", headers={"Content-Disposition": f"attachment; filename=report_{filename_slug}.json"})
 
     if report.format == "csv":
         output = io.StringIO()
@@ -148,126 +190,6 @@ async def download_report(
             for f in data["findings"]:
                 writer.writerow([f.get("title"), f.get("severity"), f.get("category"), f.get("status"), ";".join(f.get("cve_ids", [])), f.get("cvss_score"), f.get("affected_url"), f.get("first_seen"), f.get("last_seen")])
         output.seek(0)
-        return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers={"Content-Disposition": f"attachment; filename=report_{report_id[:8]}.csv"})
+        return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers={"Content-Disposition": f"attachment; filename=report_{filename_slug}.csv"})
 
     return report.data
-
-
-async def _generate_report_data(report_id: str, org_id: str, workspace_id: str, report_type: str, format: str):
-    """Generate report data in background task."""
-    from app.core.database import AsyncSessionLocal as session_factory
-
-    async with session_factory() as db:
-        report = await db.get(Report, report_id)
-        if not report:
-            return
-
-        try:
-            report.status = "generating"
-            await db.commit()
-
-            now = datetime.now(timezone.utc)
-
-            # Gather data
-            total_assets = (await db.execute(
-                select(func.count(Asset.id)).where(Asset.org_id == org_id, Asset.deleted_at.is_(None))
-            )).scalar_one()
-
-            total_findings = (await db.execute(
-                select(func.count(Finding.id)).where(Finding.org_id == org_id, Finding.deleted_at.is_(None), Finding.status == "open")
-            )).scalar_one()
-
-            critical = (await db.execute(
-                select(func.count(Finding.id)).where(Finding.org_id == org_id, Finding.severity == "critical", Finding.status == "open", Finding.deleted_at.is_(None))
-            )).scalar_one()
-
-            high = (await db.execute(
-                select(func.count(Finding.id)).where(Finding.org_id == org_id, Finding.severity == "high", Finding.status == "open", Finding.deleted_at.is_(None))
-            )).scalar_one()
-
-            by_category = (await db.execute(
-                select(Finding.category, func.count(Finding.id))
-                .where(Finding.org_id == org_id, Finding.status == "open", Finding.deleted_at.is_(None))
-                .group_by(Finding.category)
-                .order_by(func.count(Finding.id).desc())
-                .limit(10)
-            )).all()
-
-            # Findings detail
-            findings_rows = (await db.execute(
-                select(Finding)
-                .where(Finding.org_id == org_id, Finding.status == "open", Finding.deleted_at.is_(None))
-                .order_by(Finding.last_seen.desc())
-                .limit(500)
-            )).scalars().all()
-
-            # Recent scans
-            recent_scans = (await db.execute(
-                select(Scan)
-                .where(Scan.org_id == org_id)
-                .order_by(Scan.created_at.desc())
-                .limit(10)
-            )).scalars().all()
-
-            asset_types = (await db.execute(
-                select(Asset.asset_type, func.count(Asset.id))
-                .where(Asset.org_id == org_id, Asset.deleted_at.is_(None))
-                .group_by(Asset.asset_type)
-            )).all()
-
-            report_data = {
-                "report_type": report_type,
-                "generated_at": now.isoformat(),
-                "organization_id": org_id,
-                "summary": {
-                    "total_assets": total_assets,
-                    "total_findings": total_findings,
-                    "critical": critical,
-                    "high": high,
-                    "medium": (await db.execute(select(func.count(Finding.id)).where(Finding.org_id == org_id, Finding.severity == "medium", Finding.status == "open", Finding.deleted_at.is_(None)))).scalar_one(),
-                    "low": (await db.execute(select(func.count(Finding.id)).where(Finding.org_id == org_id, Finding.severity == "low", Finding.status == "open", Finding.deleted_at.is_(None)))).scalar_one(),
-                },
-                "asset_types": {at: count for at, count in asset_types},
-                "findings_by_category": {cat: count for cat, count in by_category},
-                "findings": [{
-                    "title": f.title,
-                    "severity": f.severity,
-                    "category": f.category,
-                    "status": f.status,
-                    "cve_ids": f.cve_ids or [],
-                    "cvss_score": f.cvss_score,
-                    "affected_url": f.affected_url,
-                    "first_seen": f.first_seen.isoformat() if f.first_seen else None,
-                    "last_seen": f.last_seen.isoformat() if f.last_seen else None,
-                } for f in findings_rows],
-                "recent_scans": [{
-                    "scan_type": s.scan_type,
-                    "status": s.status,
-                    "progress_pct": s.progress_pct,
-                    "assets_found": s.assets_found,
-                    "findings_found": s.findings_found,
-                    "created_at": s.created_at.isoformat(),
-                    "completed_at": s.completed_at.isoformat() if s.completed_at else None,
-                } for s in recent_scans],
-            }
-
-            summary_text = (
-                f"Security assessment for organization {org_id[:8]}... "
-                f"Found {total_assets} assets and {total_findings} open findings "
-                f"({critical} critical, {high} high)."
-            )
-
-            report.data = report_data
-            report.summary = summary_text
-            report.stats = report_data["summary"]
-            report.status = "completed"
-            report.generated_at = now
-
-            await db.commit()
-            log.info("report_generated", report_id=report_id, org_id=org_id)
-
-        except Exception as e:
-            report.status = "failed"
-            report.error_message = str(e)
-            await db.commit()
-            log.error("report_generation_failed", report_id=report_id, error=str(e))

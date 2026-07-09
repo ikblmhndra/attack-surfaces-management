@@ -4,6 +4,96 @@ All notable changes to this project are documented below, sorted newest-first.
 
 ---
 
+## 2026-07-09 — Reporting: Fixed Download Button Sending No Auth Header
+
+### Fixed: Download button returned "Authentication required" in the browser
+- **Files**: `frontend/src/app/dashboard/reports/page.tsx`
+- The `download_url` fix earlier today made `<a href={report.download_url}>` point at a real
+  endpoint, but a plain anchor click is a bare browser navigation — it never carries the
+  `Authorization` header the API requires (`get_current_user` only accepts `Authorization: Bearer`
+  or `X-API-Key`, no cookie/session fallback), so every click 401'd with `{"detail": "Authentication
+  required"}`. Should have been caught in the earlier change by testing the real click-through
+  instead of `curl` with a manually-attached token. Replaced the anchor with a button that calls the
+  already-existing `reportsAPI.download()` (goes through the axios instance, which does attach the
+  token via `frontend/src/lib/api.ts`'s request interceptor), turns the blob response into an object
+  URL, and triggers the save via a temporary anchor with `download` set.
+
+---
+
+## 2026-07-09 — Reporting: Fixed Download + PDF Export
+
+### Fixed: Dead download button on the Reports page
+- **Files**: `backend/app/api/v1/endpoints/reports.py`
+- `GET /reports` and `GET /reports/{id}` never returned `download_url`, so the frontend's
+  `<a href={report.download_url}>` always fell back to `#`. Now both responses include
+  `download_url` (null until the report reaches `completed`).
+
+### Fixed: report_type and generation options were silently ignored
+- **Files**: `backend/app/api/v1/endpoints/reports.py`, `backend/app/services/report_service.py` (new)
+- `ReportGenerateRequest` only accepted `org_id`/`report_type`/`format`; the frontend's
+  `date_range_days`, `include_charts`, `include_evidence` were dropped by Pydantic and
+  `report_type` never changed the generated content. Moved report generation out of the endpoint
+  file into a new `report_service.py` (matches this repo's services convention) and implemented:
+  `executive` (summary + risk grade only) vs. `technical`/`compliance`/`custom` (full finding list +
+  recent scans — the latter two alias to `technical`, no fake compliance-framework mapping or
+  section-picker UI exists yet, see `CLAUDE.md`), `date_range_days` filtering on findings/scans,
+  and `include_evidence` stripping of raw evidence fields.
+
+### Added: PDF report export
+- **Files**: `backend/app/services/report_service.py`, `backend/app/templates/report_pdf.html` (new),
+  `backend/app/api/v1/endpoints/reports.py`, `backend/Dockerfile`, `backend/requirements.txt`
+- `reportlab`/`weasyprint`/`jinja2` were installed but never used despite `Report.format` supporting
+  `"pdf"`. Report generation now renders a Jinja2 HTML template through WeasyPrint (CSS-only bar
+  charts, no new charting dependency) and uploads the PDF to the MinIO `reports` bucket; the
+  download endpoint streams it back. `format` now defaults to `"pdf"` instead of `"json"`.
+- `backend/Dockerfile` needed `libpango`/`libcairo`/`libgdk-pixbuf`/`fontconfig`/`fonts-dejavu-core`
+  added — WeasyPrint has no PDF backend without them on `python:3.12-slim`.
+- Hit and fixed a real WeasyPrint/pydyf incompatibility during testing: weasyprint 62.3 declares
+  `pydyf>=0.10.0` with no upper bound, so pip resolves `pydyf==0.12.1`, which breaks
+  `Stream.transform()` (`AttributeError: 'super' object has no attribute 'transform'`) on every PDF
+  render. Pinned `pydyf==0.11.0` in `requirements.txt` until weasyprint is upgraded past this.
+- Verified end-to-end against a live stack: registered a user, seeded assets/findings/a risk score,
+  generated Executive and Technical PDFs, confirmed Executive omits the findings/scans sections,
+  confirmed Technical's finding table respects `include_evidence`, confirmed CSV/JSON downloads and
+  workspace-scoped 404s still work.
+
+### Found: pre-existing issues noticed while testing (not fixed, out of scope)
+- `backend/tests/unit/test_scan_pipeline_state.py` fails to collect in the `api` container
+  (`ImportError: cannot import name 'scan_state' from 'workers'`) — the `workers/` package isn't
+  mounted into the `api` container, only `backend/app` is, so this test can't import it there.
+- `ruff`/`mypy` referenced by `make lint`/`make type-check` aren't in `requirements.txt` and aren't
+  installed in the `api` image.
+- Ambient mypy noise across the backend from SQLAlchemy declarative `Column`-typed attributes with
+  no `sqlalchemy.ext.mypy.plugin` configured (e.g. `app/core/database.py`'s `AsyncSessionLocal()`
+  being `Optional` at the type level, or reassigning a `Result` variable to its `.scalar_one_or_none()`
+  value) — pre-existing, not introduced by this change.
+
+---
+
+## 2026-07-09 — CLAUDE.md Onboarding Doc + Architecture Audit
+
+### Added: CLAUDE.md for Claude Code
+- **Files**: `CLAUDE.md`
+- New onboarding doc covering common commands (build/test/lint/migrate), pipeline/worker
+  architecture, risk scoring, config conventions, and known README/docs drift.
+
+### Found: Queue routing tables can drift (not yet fixed)
+- **Files**: `backend/app/core/queue_client.py`, `workers/queue_client.py`, `workers/base_worker.py`
+- `backend/app/core/queue_client.py::ROUTING_CONFIG` is missing the `scan.scanner` entry present in
+  `workers/queue_client.py::ROUTING_CONFIG` and `workers/base_worker.py::EXCHANGE_MAP`. Publishing to
+  `scan.scanner` from backend/API code would currently `KeyError`. Logged as a gotcha in `CLAUDE.md`;
+  no code change made yet.
+
+### Found: `report.daily` queue has no consumer (not yet fixed)
+- **Files**: `workers/scheduler/scheduler.py`
+- `scheduler.py::_generate_daily_summaries` publishes a `report.daily` message per workspace on a
+  schedule, but no worker declares `QUEUE = "report.daily"` and it's absent from `EXCHANGE_MAP` — the
+  messages are silently dropped (no queue bound to the `asm.report` exchange). On-demand reports via
+  `POST /api/v1/reports/generate` are unaffected (separate `BackgroundTasks` path). Logged as a
+  gotcha in `CLAUDE.md`; no code change made yet.
+
+---
+
 ## 2026-06-07 — Endpoint Nuclei Isolation
 
 ### Changed: Isolated high-signal endpoint nuclei batches

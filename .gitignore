@@ -5,4 +5,5 @@
 infrastructure/nginx/ssl/*
 opencode.json
 PLAN.md
-
+/.claude
+/CLAUDE.md

@@ -50,6 +50,28 @@ export default function ReportsPage() {
     enabled: !!activeOrg?.id,
   });
 
+  const [downloadingId, setDownloadingId] = useState<string | null>(null);
+
+  const handleDownload = async (report: any) => {
+    setDownloadingId(report.id);
+    try {
+      const res = await reportsAPI.download(report.id);
+      const blob = new Blob([res.data]);
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `report_${report.id.slice(0, 8)}.${report.format || "pdf"}`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+    } catch {
+      toast.error("Failed to download report");
+    } finally {
+      setDownloadingId(null);
+    }
+  };
+
   return (
     <div className="p-6 space-y-6">
       <div className="flex items-center justify-between">
@@ -164,12 +186,17 @@ export default function ReportsPage() {
                         </p>
                       </div>
                       {report.status === "completed" ? (
-                        <a
-                          href={report.download_url || "#"}
-                          className="p-2 rounded hover:bg-surface-700 text-muted-foreground hover:text-foreground"
+                        <button
+                          onClick={() => handleDownload(report)}
+                          disabled={downloadingId === report.id}
+                          className="p-2 rounded hover:bg-surface-700 text-muted-foreground hover:text-foreground disabled:opacity-50"
                         >
-                          <Download className="w-4 h-4" />
-                        </a>
+                          {downloadingId === report.id ? (
+                            <RefreshCw className="w-4 h-4 animate-spin" />
+                          ) : (
+                            <Download className="w-4 h-4" />
+                          )}
+                        </button>
                       ) : report.status === "generating" ? (
                         <RefreshCw className="w-4 h-4 animate-spin text-muted-foreground" />
                       ) : (
