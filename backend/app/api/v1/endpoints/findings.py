@@ -18,6 +18,7 @@ from app.api.v1.dependencies.auth import (
 from app.core.redis_client import cache
 from app.db.models.models import Asset, Finding, Organization, ScanFinding, User
 from app.services.audit_service import audit_log
+from app.services.exploit_intel import get_exploit_intel
 
 log = structlog.get_logger()
 router = APIRouter()
@@ -163,8 +164,11 @@ async def list_findings(
     query = query.offset((page - 1) * page_size).limit(page_size)
     findings = (await db.execute(query)).scalars().all()
 
+    all_cve_ids = sorted({cve for f in findings for cve in (f.cve_ids or [])})
+    intel_by_cve = await get_exploit_intel(db, all_cve_ids)
+
     return {
-        "items": [_finding_to_dict(f) for f in findings],
+        "items": [_finding_to_dict(f, intel_by_cve=intel_by_cve) for f in findings],
         "total": total,
         "page": page,
         "page_size": page_size,
@@ -204,7 +208,8 @@ async def get_finding(
         ).order_by(ScanFinding.created_at.desc()).limit(10)
     )).scalars().all()
 
-    result = _finding_to_dict(finding, include_evidence=True)
+    intel_by_cve = await get_exploit_intel(db, finding.cve_ids or [])
+    result = _finding_to_dict(finding, include_evidence=True, intel_by_cve=intel_by_cve)
     result["asset"] = {
         "id": str(asset.id),
         "type": asset.asset_type,
@@ -558,7 +563,9 @@ async def export_findings(
     findings = (await db.execute(query.order_by(Finding.last_seen.desc()).limit(10000))).scalars().all()
 
     if format == "json":
-        return [_finding_to_dict(f) for f in findings]
+        all_cve_ids = sorted({cve for f in findings for cve in (f.cve_ids or [])})
+        intel_by_cve = await get_exploit_intel(db, all_cve_ids)
+        return [_finding_to_dict(f, intel_by_cve=intel_by_cve) for f in findings]
 
     output = io.StringIO()
     writer = csv.writer(output)
@@ -589,7 +596,26 @@ async def _get_finding_or_404(
     return finding
 
 
-def _finding_to_dict(finding: Finding, include_evidence: bool = False) -> dict:
+def _finding_exploit_summary(finding: Finding, intel_by_cve: Optional[dict]) -> dict:
+    """Worst-case EPSS/KEV summary across a finding's CVEs — same "max wins"
+    reasoning as exploit_intel.compute_exploit_boost, for display."""
+    if not intel_by_cve or not finding.cve_ids:
+        return {"epss_score": None, "epss_percentile": None, "is_kev": False, "kev_known_ransomware": False}
+    best = {"epss_score": None, "epss_percentile": None, "is_kev": False, "kev_known_ransomware": False}
+    for cve_id in finding.cve_ids:
+        intel = intel_by_cve.get(cve_id)
+        if not intel:
+            continue
+        if intel.is_kev:
+            best["is_kev"] = True
+            best["kev_known_ransomware"] = best["kev_known_ransomware"] or intel.kev_known_ransomware
+        if intel.epss_score is not None and (best["epss_score"] is None or intel.epss_score > best["epss_score"]):
+            best["epss_score"] = intel.epss_score
+            best["epss_percentile"] = intel.epss_percentile
+    return best
+
+
+def _finding_to_dict(finding: Finding, include_evidence: bool = False, intel_by_cve: Optional[dict] = None) -> dict:
     d = {
         "id": str(finding.id),
         "org_id": str(finding.org_id),
@@ -608,6 +634,8 @@ def _finding_to_dict(finding: Finding, include_evidence: bool = False) -> dict:
         "cvss_score": finding.cvss_score,
         "cvss_vector": finding.cvss_vector,
         "cwe_ids": finding.cwe_ids or [],
+        "confidence": (finding.proof or {}).get("confidence", "unknown"),
+        **_finding_exploit_summary(finding, intel_by_cve),
         "affected_url": finding.affected_url,
         "remediation": finding.remediation,
         "references": finding.references or [],

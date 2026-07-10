@@ -26,6 +26,7 @@ CLEANUP_INTERVAL_HOURS = 6
 ENRICHMENT_REFRESH_HOURS = 48
 VALIDATION_REFRESH_HOURS = int(os.getenv("VALIDATION_REFRESH_HOURS", "24"))
 QUICK_SCAN_INTERVAL_HOURS = 6
+EXPLOIT_INTEL_REFRESH_HOURS = int(os.getenv("EXPLOIT_INTEL_REFRESH_HOURS", "24"))
 ACTIVE_SCAN_STATUSES = ("queued", "pending", "running")
 
 
@@ -39,6 +40,7 @@ class ScanScheduler:
     - Asset cleanup:       Every 6 hours (mark stale assets)
     - Score recompute:     Every 4 hours (ensure freshness)
     - Enrichment refresh:  Every 48 hours (re-enrich IPs/domains)
+    - Exploit intel:       Every 24 hours (EPSS + CISA KEV)
     """
 
     def __init__(self):
@@ -145,6 +147,18 @@ class ScanScheduler:
             trigger=IntervalTrigger(hours=VALIDATION_REFRESH_HOURS),
             id="asset_validation_refresh",
             name="Refresh asset ownership and scope validation",
+        )
+
+        # ── Exploit intelligence refresh (EPSS + CISA KEV) ────
+        self.scheduler.add_job(
+            self._refresh_exploit_intel,
+            trigger=IntervalTrigger(hours=EXPLOIT_INTEL_REFRESH_HOURS),
+            id="exploit_intel_refresh",
+            name="Refresh EPSS/CISA KEV exploit intelligence",
+            # exploit_intel starts empty on a fresh deploy/migration — run
+            # shortly after startup instead of waiting a full interval so
+            # scoring/API reads aren't silently unpopulated for up to a day.
+            next_run_time=datetime.now(timezone.utc) + timedelta(minutes=1),
         )
 
         log.info("scheduler_jobs_registered", count=len(self.scheduler.get_jobs()))
@@ -417,6 +431,21 @@ class ScanScheduler:
             queued += 1
 
         log.info("asset_validation_refresh_queued", count=queued)
+
+    async def _refresh_exploit_intel(self) -> None:
+        """Fetch EPSS + CISA KEV (keyless, public) and upsert into
+        exploit_intel. Best-effort — a transient fetch failure just means
+        risk scoring keeps using whatever data is already there until the
+        next scheduled attempt, not a hard failure of the scheduler process."""
+        from app.services.exploit_intel import refresh_exploit_intel
+
+        log.info("exploit_intel_refresh_started")
+        try:
+            async with get_session() as db:
+                result = await refresh_exploit_intel(db)
+            log.info("exploit_intel_refresh_completed", **result)
+        except Exception as exc:
+            log.warning("exploit_intel_refresh_failed", error=str(exc)[:300])
 
     # ── Helpers ───────────────────────────────────────────────
 

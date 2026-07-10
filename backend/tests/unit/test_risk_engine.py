@@ -117,6 +117,20 @@ class TestSeverityPenalty:
         p = compute_severity_penalty("unknown_sev", confidence=1.0, decay=1.0)
         assert p == pytest.approx(1.0)  # defaults to INFO penalty
 
+    def test_exploit_boost_scales_penalty_up(self):
+        """Milestone 8: EPSS/KEV exploit intelligence escalates a penalty —
+        opposite direction from confidence, which only ever de-escalates."""
+        baseline = compute_severity_penalty("high", confidence=1.0, decay=1.0, exploit_boost=1.0)
+        boosted = compute_severity_penalty("high", confidence=1.0, decay=1.0, exploit_boost=1.5)
+        assert boosted == pytest.approx(baseline * 1.5)
+
+    def test_exploit_boost_never_reduces_penalty(self):
+        """A boost below 1.0 must not be honored — absence of exploit-intel
+        data is not evidence a finding is safe to deprioritize."""
+        baseline = compute_severity_penalty("high", confidence=1.0, decay=1.0, exploit_boost=1.0)
+        with_low_boost = compute_severity_penalty("high", confidence=1.0, decay=1.0, exploit_boost=0.3)
+        assert with_low_boost == pytest.approx(baseline)
+
 
 # ── Scoring engine ────────────────────────────────────────────
 
@@ -128,7 +142,7 @@ class TestRiskScoringEngine:
         self.now = datetime.now(timezone.utc)
 
     def _make_finding(self, severity="high", category="open_port", status="open",
-                      confidence=1.0, days_ago=0):
+                      confidence=1.0, exploit_boost=1.0, days_ago=0):
         last_seen = self.now - timedelta(days=days_ago)
         return FindingInput(
             id="test-id",
@@ -136,6 +150,7 @@ class TestRiskScoringEngine:
             severity=severity,
             status=status,
             confidence=confidence,
+            exploit_boost=exploit_boost,
             last_seen=last_seen,
         )
 
@@ -199,6 +214,44 @@ class TestRiskScoringEngine:
         assert ScoreCategory.DNS_HEALTH.value in result.score_breakdown
         dns_score = result.score_breakdown[ScoreCategory.DNS_HEALTH.value]["score"]
         assert dns_score < 100
+
+    def test_low_confidence_finding_shifts_category_score_less_than_high_confidence(self):
+        """Milestone 7: confidence must actually move a *category* score through
+        the full compute() pipeline, not just the raw penalty function
+        (test_confidence_scales_penalty above only covers compute_severity_penalty
+        in isolation) — this is what nuclei_worker.py's CVE-confidence signal is
+        for: a low-confidence CVE match should hurt the score less."""
+        high_confidence = [self._make_finding("high", "known_cve", confidence=1.0)]
+        low_confidence = [self._make_finding("high", "known_cve", confidence=0.5)]
+
+        high_conf_result = self.engine.compute("org-1", high_confidence, now=self.now)
+        low_conf_result = self.engine.compute("org-1", low_confidence, now=self.now)
+
+        patch_hygiene = ScoreCategory.PATCH_HYGIENE.value
+        high_conf_score = high_conf_result.score_breakdown[patch_hygiene]["score"]
+        low_conf_score = low_conf_result.score_breakdown[patch_hygiene]["score"]
+        assert low_conf_score > high_conf_score
+        assert low_conf_result.overall_score > high_conf_result.overall_score
+
+    def test_exploit_boost_shifts_category_score_through_full_pipeline(self):
+        """Milestone 8: a KEV-boosted CVE finding must hurt its category score
+        more than the identical finding with no exploit-intel signal — proven
+        through the full compute() pipeline, not just compute_severity_penalty
+        in isolation. Uses "critical" severity deliberately avoided here (a
+        critical finding triggers risk_engine's own aggregate-severity ceiling
+        cap on overall_score, which would mask the boost's effect on the
+        blended total — confirmed by manual testing against real EPSS/KEV
+        data, see CHANGELOG.md). "high" has no such cap collision."""
+        no_boost = [self._make_finding("high", "known_cve", exploit_boost=1.0)]
+        kev_boosted = [self._make_finding("high", "known_cve", exploit_boost=1.75)]
+
+        no_boost_result = self.engine.compute("org-1", no_boost, now=self.now)
+        kev_result = self.engine.compute("org-1", kev_boosted, now=self.now)
+
+        patch_hygiene = ScoreCategory.PATCH_HYGIENE.value
+        no_boost_score = no_boost_result.score_breakdown[patch_hygiene]["score"]
+        kev_score = kev_result.score_breakdown[patch_hygiene]["score"]
+        assert kev_score < no_boost_score
 
     def test_overall_score_bounded_0_100(self):
         findings = [self._make_finding("critical") for _ in range(50)]

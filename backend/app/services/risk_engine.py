@@ -107,6 +107,7 @@ FINDING_CATEGORY_MAP: Dict[str, ScoreCategory] = {
     "stack_trace": ScoreCategory.INFO_LEAKAGE,
     "source_disclosure": ScoreCategory.INFO_LEAKAGE,
     "exposed_backup": ScoreCategory.INFO_LEAKAGE,
+    "credential_exposure": ScoreCategory.INFO_LEAKAGE,
     # Reputation
     "malware_detected": ScoreCategory.REPUTATION,
     "phishing_detected": ScoreCategory.REPUTATION,
@@ -130,6 +131,10 @@ class FindingInput:
     severity: str
     status: str
     confidence: float = 1.0
+    # Escalation-only multiplier from EPSS/CISA KEV exploit intelligence — a
+    # different axis from confidence (trustworthiness of the match vs.
+    # urgency of a *real* finding). Never below 1.0.
+    exploit_boost: float = 1.0
     first_seen: Optional[datetime] = None
     last_seen: Optional[datetime] = None
     is_false_positive: bool = False
@@ -207,7 +212,9 @@ def compute_decay_factor(last_seen: Optional[datetime], now: Optional[datetime] 
     return math.exp(-DECAY_LAMBDA * days_old)
 
 
-def compute_severity_penalty(severity: str, confidence: float, decay: float, cvss: Optional[float] = None) -> float:
+def compute_severity_penalty(
+    severity: str, confidence: float, decay: float, cvss: Optional[float] = None, exploit_boost: float = 1.0
+) -> float:
     """
     Compute penalty points for a single finding.
     Uses CVSS score if available for more precision.
@@ -224,7 +231,7 @@ def compute_severity_penalty(severity: str, confidence: float, decay: float, cvs
         cvss_penalty = (cvss / 10.0) * SEVERITY_PENALTIES[Severity.CRITICAL]
         base_penalty = (base_penalty + cvss_penalty) / 2
 
-    return base_penalty * confidence * decay
+    return base_penalty * confidence * decay * max(1.0, exploit_boost)
 
 
 class RiskScoringEngine:
@@ -420,6 +427,7 @@ class RiskScoringEngine:
                 f.confidence,
                 decay,
                 f.cvss_score,
+                f.exploit_boost,
             )
             total_penalty += penalty
             penalties.append({
@@ -428,6 +436,7 @@ class RiskScoringEngine:
                 "penalty": round(penalty, 2),
                 "decay": round(decay, 3),
                 "confidence": f.confidence,
+                "exploit_boost": f.exploit_boost,
             })
 
         # Cap total penalty
@@ -534,6 +543,7 @@ def compute_org_score(
             severity=f.get("severity", "info"),
             status=f.get("status", "open"),
             confidence=float(f.get("confidence", 1.0)),
+            exploit_boost=float(f.get("exploit_boost", 1.0)),
             first_seen=f.get("first_seen"),
             last_seen=f.get("last_seen"),
             is_false_positive=bool(f.get("is_false_positive", False)),

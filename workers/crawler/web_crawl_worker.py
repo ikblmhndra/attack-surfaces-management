@@ -11,20 +11,25 @@ import shutil
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
+import aiohttp
 import structlog
+import tldextract
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.services.scan_profiles import child_profile_config
 from workers.base_worker import BaseWorker
 from workers.db import get_session
+from workers.fuzz_wordlist import resolve_fuzz_wordlist
 from workers.queue_client import QueueClient
 from workers.scan_observability import record_target_selections
 from workers.scan_phase import update_scan_phase
 from workers.scan_state import mark_scan_running, should_process_scan
+from workers.scanner.scanner_common import persist_findings, make_finding
+from workers.secrets_scan import find_endpoints, find_secrets, find_subdomains
 from workers.task_coordinator import TaskCoordinator
 
 log = structlog.get_logger()
@@ -251,6 +256,15 @@ class WebCrawlWorker(BaseWorker):
                 endpoint["sources"] = sources
                 endpoint["source"] = "+".join(sources)
 
+            root_domains = self._root_domains_for_urls(root_urls)
+            js_result = await self._analyze_js_endpoints(validated, root_domains, org_id, workspace_id, config)
+            if js_result["extracted_endpoints"]:
+                js_validated = await self._validate_urls(js_result["extracted_endpoints"], tmpdir, config)
+                for endpoint in js_validated:
+                    endpoint["sources"] = ["js_extracted"]
+                    endpoint["source"] = "js_extracted"
+                validated.extend(js_validated)
+
         async with get_session() as db:
             if not await should_process_scan(db, scan_id):
                 log.info("crawl_results_skipped_inactive_scan", scan_id=scan_id)
@@ -263,6 +277,8 @@ class WebCrawlWorker(BaseWorker):
                 validated,
                 max_selected=int(config.get("crawl_nuclei_max_targets", 200)),
             )
+            if js_result["findings"]:
+                await persist_findings(db, scan_id, js_result["findings"])
             await record_target_selections(
                 db,
                 scan_id=scan_id,
@@ -278,6 +294,8 @@ class WebCrawlWorker(BaseWorker):
                 targets_total=len(targets),
                 endpoints=persisted,
                 selected_for_nuclei=len(selected_records),
+                js_files_analyzed=js_result["js_files_analyzed"],
+                js_extracted_candidate_subdomains=js_result["extracted_subdomains"],
                 **endpoint_summary,
             )
 
@@ -419,24 +437,7 @@ class WebCrawlWorker(BaseWorker):
         return discovered
 
     def _resolve_fuzz_wordlist(self, tmpdir: Path, config: Dict[str, Any]) -> str:
-        candidates = [
-            config.get("fuzz_wordlist", ""),
-            "/usr/share/wordlists/dirb/common.txt",
-            "/usr/share/seclists/Discovery/Web-Content/common.txt",
-        ]
-        for candidate in candidates:
-            if candidate and Path(candidate).exists():
-                return str(candidate)
-
-        fallback = tmpdir / "fuzz_words.txt"
-        fallback.write_text("\n".join([
-            "admin", "login", "dashboard", "api", "v1", "v2", "graphql",
-            "backup", ".git", ".env", "config", "wp-admin", "wp-content",
-            "uploads", "files", "assets", "static", "status", "health",
-            ".well-known", "sitemap.xml", "robots.txt", "swagger",
-            "api-docs", "openapi.json", "jenkins", ".aws", ".azure",
-        ]))
-        return str(fallback)
+        return resolve_fuzz_wordlist(tmpdir, config)
 
     async def _validate_urls(self, urls: List[str], tmpdir: Path, config: Dict[str, Any]) -> List[Dict[str, Any]]:
         if not urls:
@@ -559,6 +560,111 @@ class WebCrawlWorker(BaseWorker):
             if "ffuf" not in sources[normalized]:
                 sources[normalized].append("ffuf")
         return sources
+
+    def _root_domains_for_urls(self, urls: List[str]) -> Set[str]:
+        roots: Set[str] = set()
+        for url in urls:
+            host = urlsplit(url if "://" in url else f"//{url}").hostname or ""
+            if not host:
+                continue
+            ext = tldextract.extract(host)
+            root = f"{ext.domain}.{ext.suffix}" if ext.domain and ext.suffix else host
+            roots.add(root)
+        return roots
+
+    async def _analyze_js_endpoints(
+        self,
+        validated: List[Dict[str, Any]],
+        root_domains: Set[str],
+        org_id: str,
+        workspace_id: str,
+        config: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Fetch same-root .js files discovered by the crawl and extract hidden
+        endpoints/secrets/subdomains. Extracted endpoints flow through the same
+        _validate_urls -> _persist_endpoints -> _publish_selected_nuclei path as
+        every other crawler-discovered endpoint (tagged source="js_extracted").
+        Extracted subdomains are surfaced as an observability field only (crawl
+        phase_status), not auto-created as Assets — a string literal inside a
+        .js file hasn't gone through the scope/ownership validation gate every
+        other asset-creation path in this codebase goes through, unlike a
+        confirmed DNS resolution or a brand-derived bucket-name hit."""
+        empty = {
+            "findings": [],
+            "extracted_endpoints": [],
+            "extracted_subdomains": [],
+            "js_files_analyzed": 0,
+        }
+        if not config.get("js_analysis_enabled", False):
+            return empty
+
+        max_files = int(config.get("js_analysis_max_files", 50))
+        js_urls: List[str] = []
+        for entry in validated:
+            url = entry.get("url", "")
+            content_type = str(entry.get("content_type") or "").lower()
+            path = urlsplit(url).path.lower()
+            if not (path.endswith(".js") or "javascript" in content_type):
+                continue
+            host = urlsplit(url).hostname or ""
+            ext = tldextract.extract(host)
+            root = f"{ext.domain}.{ext.suffix}" if ext.domain and ext.suffix else host
+            if root_domains and root not in root_domains:
+                continue
+            js_urls.append(url)
+            if len(js_urls) >= max_files:
+                break
+
+        if not js_urls:
+            return empty
+
+        findings: List[Dict[str, Any]] = []
+        extracted_endpoints: List[str] = []
+        extracted_subdomains: Set[str] = set()
+        max_body_bytes = int(config.get("js_analysis_max_bytes", 512_000))
+        semaphore = asyncio.Semaphore(int(config.get("js_analysis_concurrency", 5)))
+        timeout = aiohttp.ClientTimeout(total=int(config.get("js_analysis_timeout", 8)))
+
+        async def analyze_one(session: aiohttp.ClientSession, url: str) -> None:
+            async with semaphore:
+                try:
+                    async with session.get(url, allow_redirects=True) as response:
+                        body = await response.content.read(max_body_bytes)
+                        text = body.decode(errors="ignore")
+                except Exception:
+                    return
+
+            for endpoint in find_endpoints(text, url):
+                extracted_endpoints.append(endpoint)
+            for root in root_domains:
+                extracted_subdomains.update(find_subdomains(text, root))
+            for secret in find_secrets(text):
+                findings.append(make_finding(
+                    org_id=org_id,
+                    workspace_id=workspace_id,
+                    scanner="js_analysis",
+                    check_id=f"credential_exposure_{secret['type']}",
+                    target=url,
+                    title=f"Credential exposure in JavaScript ({secret['type']})",
+                    severity="critical",
+                    category="credential_exposure",
+                    description="A secret-like value was found embedded in a crawled JavaScript file. "
+                                "The value is masked below and never stored in full.",
+                    evidence=f"{url} matched a {secret['type']} pattern (masked): {secret['masked']}",
+                    proof={"source_url": url, "secret_type": secret["type"], "secret_masked": secret["masked"], "secret_sha256": secret["sha256"]},
+                    remediation="Remove hardcoded credentials from client-side JavaScript and rotate "
+                                "the exposed value immediately.",
+                ))
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            await asyncio.gather(*(analyze_one(session, url) for url in js_urls))
+
+        return {
+            "findings": findings,
+            "extracted_endpoints": list(dict.fromkeys(extracted_endpoints))[:200],
+            "extracted_subdomains": sorted(extracted_subdomains)[:100],
+            "js_files_analyzed": len(js_urls),
+        }
 
     async def _persist_endpoints(
         self,
@@ -715,7 +821,15 @@ class WebCrawlWorker(BaseWorker):
         coord = TaskCoordinator()
         queue = QueueClient()
         await queue.connect()
-        batch_size = max(1, min(int(config.get("crawl_nuclei_batch_size", 25)), 1))
+        # Was hardcoded to 1 (one nuclei subprocess per URL) to isolate a slow
+        # endpoint from blocking the rest of a batch — but nuclei_worker.py's
+        # own per-template timeout (-timeout, capped at 6-8s) already isolates
+        # at that granularity, and a batch timeout still recovers whatever
+        # partial results were written before the kill (see
+        # nuclei_worker.py::_run_nuclei's TimeoutError handler). Batch size 1
+        # meant paying nuclei's template-load/init overhead once per URL
+        # instead of once per batch — the dominant cost of a full scan.
+        batch_size = max(1, min(int(config.get("crawl_nuclei_batch_size", 25)), 10))
         nuclei_config = child_profile_config(
             "endpoint",
             config,
@@ -727,8 +841,10 @@ class WebCrawlWorker(BaseWorker):
                 "template_timeout": min(int(config.get("template_timeout", 6)), 6),
                 "concurrency": min(int(config.get("concurrency", 4)), 4),
                 "bulk_size": min(int(config.get("bulk_size", 4)), 4),
-                "nuclei_batch_size": 1,
-                "severities": ["critical", "high", "medium"],
+                "nuclei_batch_size": batch_size,
+                # Don't hardcode severities here — let it inherit from the
+                # "endpoint" profile (scan_profiles.py), which now includes
+                # "info" (exposed-panel/exposure templates are ~info-tagged).
             },
         )
         for i in range(0, len(targets), batch_size):

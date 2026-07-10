@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import socket
 import ssl
@@ -21,13 +22,16 @@ from urllib.parse import urlsplit
 import aiohttp
 import structlog
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from workers.base_worker import BaseWorker
 from workers.db import get_session
-from workers.db_models import Asset, Port, Subdomain
+from workers.db_models import Asset, Organization, Port, Subdomain
+from workers.discovery.bucket_candidates import generate_bucket_candidates
 from workers.scan_observability import record_target_selections
 from workers.scan_phase import update_scan_phase
 from workers.scan_state import mark_scan_running
+from workers.secrets_scan import find_secrets
 from workers.scanner.scanner_common import (
     complete_phase_with_findings,
     host_from_target,
@@ -44,6 +48,7 @@ PHASE_BY_FAMILY = {
     "takeover": "takeover",
     "cloud": "cloud_exposure",
     "service": "service_fingerprint",
+    "git_secrets": "git_secrets",
 }
 
 RISKY_PORTS = {
@@ -119,6 +124,8 @@ class ScannerCoverageWorker(BaseWorker):
                 findings, summary, selected = await self._scan_takeover(org_id, workspace_id, targets, config)
             elif family == "cloud":
                 findings, summary, selected = await self._scan_cloud(org_id, workspace_id, targets, config)
+            elif family == "git_secrets":
+                findings, summary, selected = await self._scan_git_secrets(org_id, workspace_id, targets, config)
             else:
                 findings, summary, selected = await self._scan_services(org_id, workspace_id, message.get("services") or [], config)
 
@@ -614,6 +621,9 @@ class ScannerCoverageWorker(BaseWorker):
 
     async def _scan_cloud(self, org_id: str, workspace_id: str, targets: List[Any], config: Dict[str, Any]):
         cloud_targets = await self._cloud_targets(org_id, workspace_id, targets, int(config.get("cloud_exposure_max_targets", 100)))
+        discovered = await self._discover_cloud_buckets(org_id, workspace_id, config)
+        known_values = {item["value"] for item in cloud_targets}
+        cloud_targets.extend(item for item in discovered if item["value"] not in known_values)
         findings: List[Dict[str, Any]] = []
         observations: List[Dict[str, Any]] = []
         timeout = aiohttp.ClientTimeout(total=int(config.get("cloud_exposure_timeout", 10)))
@@ -673,6 +683,95 @@ class ScannerCoverageWorker(BaseWorker):
             for asset in assets
         ]
 
+    async def _discover_cloud_buckets(self, org_id: str, workspace_id: str, config: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Brand-based S3 bucket-name enumeration.
+
+        cloud/enum/aws-s3-bucket-enum.yaml (the nuclei template this was originally
+        meant to wire up via `-var wordlist=<file>`) is self-contained/batteringram
+        with no `payloads:` block — empirically verified (manual nuclei runs, including
+        a locally patched copy with `payloads:` added) that nuclei v3.11.0 never
+        actually loads/executes it regardless of -esc/-var/-dast. Implemented directly
+        here instead: generate candidate names from the org's own root domains/company
+        name (same reasoning as DNS bruteforce candidates — deterministically derived
+        from an already-in-scope entity, not from unrelated third-party content), probe
+        each, and only persist an Asset for names that come back with a real bucket
+        response (200 open, or 403 exists-but-protected) rather than a DNS/connection
+        failure — a non-hit is not a discovery.
+        """
+        async with get_session() as db:
+            org = (await db.execute(select(Organization).where(Organization.id == org_id))).scalar_one_or_none()
+        if not org:
+            return []
+
+        seeds = []
+        # root_domains is the intended seed source but is frequently empty in
+        # practice (orgs are commonly seeded via `domains`/`name` at creation
+        # time instead) — fall back through domains/name/company_name rather
+        # than silently enumerating nothing for the common case.
+        for domain in (org.root_domains or org.domains or []):
+            label = str(domain).split(".")[0]
+            if label:
+                seeds.append(label)
+        if org.company_name:
+            seeds.append(org.company_name)
+        elif org.name:
+            seeds.append(str(org.name).split(".")[0])
+
+        candidates = generate_bucket_candidates(
+            seeds, max_names=int(config.get("cloud_bucket_wordlist_max_names", 60))
+        )
+        if not candidates:
+            return []
+
+        timeout = aiohttp.ClientTimeout(total=int(config.get("cloud_exposure_timeout", 10)))
+        semaphore = asyncio.Semaphore(10)
+        confirmed: List[Dict[str, Any]] = []
+
+        async def probe(session: aiohttp.ClientSession, name: str) -> None:
+            url = f"https://{name}.s3.amazonaws.com"
+            async with semaphore:
+                try:
+                    async with session.head(url, allow_redirects=True) as response:
+                        if response.status in (200, 403):
+                            confirmed.append({"name": name, "status": response.status})
+                except Exception:
+                    return
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            await asyncio.gather(*(probe(session, name) for name in candidates))
+
+        if not confirmed:
+            return []
+
+        now = datetime.now(timezone.utc)
+        results: List[Dict[str, Any]] = []
+        async with get_session() as db:
+            for hit in confirmed:
+                value = f"aws_s3:{hit['name']}"
+                stmt = pg_insert(Asset.__table__).values(
+                    org_id=org_id,
+                    workspace_id=workspace_id,
+                    asset_type="cloud_bucket",
+                    value=value,
+                    discovery_method="bucket_name_enumeration",
+                    metadata={"discovery": {"sources": ["aws_s3"], "method": "brand_permutation", "probe_status": hit["status"]}},
+                    first_seen=now,
+                    last_seen=now,
+                ).on_conflict_do_update(
+                    constraint="uq_asset_org_type_value",
+                    set_={"last_seen": now},
+                ).returning(Asset.__table__.c.id)
+                row = (await db.execute(stmt)).fetchone()
+                if row:
+                    results.append({
+                        "asset_id": row[0],
+                        "value": value,
+                        "provider": "aws_s3",
+                        "exposure_status": None,
+                    })
+            await db.commit()
+        return results
+
     async def _cloud_probe(self, session: aiohttp.ClientSession, item: Dict[str, Any]) -> Dict[str, Any]:
         url = self._cloud_probe_url(item)
         try:
@@ -703,6 +802,103 @@ class ScannerCoverageWorker(BaseWorker):
         if provider in {"azure_blob", "azure"}:
             return f"https://{value}.blob.core.windows.net"
         return value
+
+    async def _scan_git_secrets(self, org_id: str, workspace_id: str, targets: List[Any], config: Dict[str, Any]):
+        """Confirm .git exposure directly (not the keyword-matched nuclei/nikto
+        guess) and scan any fetched content for secrets. Self-contained, not
+        reactive to nuclei/nikto findings — those run concurrently off the same
+        fan-out with no ordering guarantee, so reacting to "a finding already
+        exists" would race and frequently find nothing yet."""
+        hosts = self._dedupe_hosts(targets)[: int(config.get("git_secrets_max_targets", 200))]
+        findings: List[Dict[str, Any]] = []
+        observations: List[Dict[str, Any]] = []
+        timeout = aiohttp.ClientTimeout(total=int(config.get("git_secrets_timeout", 8)))
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for host in hosts:
+                obs = await self._git_secrets_probe(session, host)
+                observations.append(obs)
+                if not obs.get("confirmed"):
+                    continue
+                findings.append(make_finding(
+                    org_id=org_id,
+                    workspace_id=workspace_id,
+                    scanner="git_secrets_scanner",
+                    check_id="exposed_git_confirmed",
+                    target=f"https://{host}/.git/HEAD",
+                    title="Exposed .git directory (confirmed)",
+                    severity="high",
+                    category="exposed_git",
+                    description="/.git/HEAD is publicly accessible and returned a valid git ref/SHA, "
+                                "confirming an exposed repository rather than a keyword-matched guess.",
+                    evidence=obs.get("evidence", ""),
+                    proof={k: v for k, v in obs.items() if k != "secrets"},
+                    remediation="Remove the .git directory from the web root or block access to it at "
+                                "the web server/reverse-proxy level.",
+                ))
+                for secret in obs.get("secrets", []):
+                    findings.append(make_finding(
+                        org_id=org_id,
+                        workspace_id=workspace_id,
+                        scanner="git_secrets_scanner",
+                        check_id=f"credential_exposure_{secret['type']}",
+                        target=f"https://{host}/.git/HEAD",
+                        title=f"Credential exposure in exposed .git ({secret['type']})",
+                        severity="critical",
+                        category="credential_exposure",
+                        description="A secret-like value was found in the exposed .git/HEAD or "
+                                     ".git/config content. The value is masked below and never "
+                                     "stored in full — only a masked preview and a hash for correlation.",
+                        evidence=f"Matched a {secret['type']} pattern (masked): {secret['masked']}",
+                        proof={"host": host, "secret_type": secret["type"], "secret_masked": secret["masked"], "secret_sha256": secret["sha256"]},
+                        remediation="Rotate the exposed credential immediately and remove the .git "
+                                     "directory from the web root.",
+                    ))
+        selected = [{"target": h, "target_type": "host"} for h in hosts]
+        summary = {
+            "scanner_family": "git_secrets",
+            "observed": len(observations),
+            "tool": "http_probe",
+            "info_observations": [
+                {k: v for k, v in obs.items() if k != "secrets"} for obs in observations[:50]
+            ],
+        }
+        return findings, summary, selected
+
+    async def _git_secrets_probe(self, session: aiohttp.ClientSession, host: str) -> Dict[str, Any]:
+        head_url = f"https://{host}/.git/HEAD"
+        try:
+            async with session.get(head_url, allow_redirects=False) as response:
+                if response.status != 200:
+                    return {"host": host, "status": response.status, "confirmed": False}
+                body = (await response.text(errors="ignore"))[:2000]
+        except Exception as exc:
+            return {"host": host, "error": str(exc)[:300], "confirmed": False}
+
+        stripped = body.strip()
+        confirmed = bool(re.match(r"^ref:\s*refs/", stripped) or re.match(r"^[0-9a-f]{40}$", stripped))
+        if not confirmed:
+            return {"host": host, "status": 200, "confirmed": False, "sample": body[:200]}
+
+        secrets = find_secrets(body)
+        config_fetched = False
+        try:
+            async with session.get(f"https://{host}/.git/config", allow_redirects=False) as cfg_response:
+                if cfg_response.status == 200:
+                    config_body = (await cfg_response.text(errors="ignore"))[:20000]
+                    config_fetched = True
+                    secrets.extend(find_secrets(config_body))
+        except Exception:
+            pass
+
+        return {
+            "host": host,
+            "status": 200,
+            "confirmed": True,
+            "head_sample": body[:200],
+            "config_fetched": config_fetched,
+            "secrets": secrets,
+            "evidence": f"{host}/.git/HEAD returned a valid git ref/SHA, confirming an exposed repository.",
+        }
 
     async def _scan_services(self, org_id: str, workspace_id: str, services: List[Dict[str, Any]], config: Dict[str, Any]):
         services = services[: int(config.get("service_fingerprint_max_targets", 200))]

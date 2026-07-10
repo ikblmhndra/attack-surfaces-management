@@ -118,16 +118,33 @@ SCAN_PROFILES: Dict[str, Dict[str, Any]] = {
         "vuln_depth": "default",
         "automatic_scan": True,
         "use_tech_tags": True,
-        "severities": ["critical", "high", "medium", "low"],
+        # "info" is included deliberately: nuclei tags ~98% of its exposed-panels
+        # templates and ~half its exposures templates as severity "info" — those
+        # feed the platform's own highest-weighted risk category (exposure_mgmt,
+        # 18%) and info_leakage (8%). _is_low_value_info_finding() in
+        # nuclei_worker.py already filters pure tech-fingerprinting noise
+        # (favicon-detect, waf-detect, etc.) out of whatever "info" comes back.
+        "severities": ["critical", "high", "medium", "low", "info"],
         "template_dirs": PROFILE_TEMPLATE_DIRS["default"],
         "exclude_tags": SAFE_EXCLUDED_TAGS,
+        # port_worker.py's own fallback is "top-100" — "ports" was never set by
+        # any profile, so on-demand scans (the path real users trigger) got a
+        # much narrower port range than the scheduler's own scheduled scans
+        # (which already hardcode "top-1000"). Custom app ports (3000, 8080,
+        # 9000, etc.) live outside naabu's top-100 list.
+        "ports": "top-1000",
         "scan_timeout": 900,
         "template_timeout": 8,
         "concurrency": 8,
         "bulk_size": 8,
         "nuclei_batch_size": 10,
         "crawl_nuclei_max_targets": 30,
-        "crawl_nuclei_batch_size": 1,
+        # Was 1 (one nuclei subprocess per crawled URL) — see
+        # web_crawl_worker.py::_publish_selected_nuclei for why that's fixed
+        # to allow up to 10 now. This is the actual value read there
+        # (config.get("crawl_nuclei_batch_size", 25)); the code-level clamp
+        # alone doesn't help if the profile pins the value below it.
+        "crawl_nuclei_batch_size": 8,
         "crawl_nuclei_scan_timeout": 600,
     },
     "deep_authorized": {
@@ -136,17 +153,41 @@ SCAN_PROFILES: Dict[str, Dict[str, Any]] = {
         "vuln_depth": "full",
         "automatic_scan": True,
         "use_tech_tags": True,
-        "severities": ["critical", "high", "medium", "low"],
+        # See "default" profile above for why "info" is included here — this is
+        # the profile actually used by "full"/"vuln" scans (the primary
+        # user-facing path), so under-covering it defeats the point of the fix.
+        # nuclei_include_info_templates=True bypasses _apply_runtime_caps'
+        # info-stripping safety net in scan_service.py, which exists for this
+        # exact profile.
+        "severities": ["critical", "high", "medium", "low", "info"],
+        "nuclei_include_info_templates": True,
         "template_dirs": PROFILE_TEMPLATE_DIRS["deep_authorized"],
         "exclude_tags": SAFE_EXCLUDED_TAGS,
+        # See "default" profile above — same port-range gap, same fix.
+        "ports": "top-1000",
         "scan_timeout": 900,
         "template_timeout": 8,
         "concurrency": 6,
         "bulk_size": 6,
-        "nuclei_batch_size": 4,
+        "nuclei_batch_size": 8,
         "crawl_nuclei_max_targets": 25,
-        "crawl_nuclei_batch_size": 1,
+        # See "default" profile above — same fix, same reasoning.
+        "crawl_nuclei_batch_size": 8,
         "crawl_nuclei_scan_timeout": 600,
+        # Content/directory fuzzing (ffuf) is fully implemented (discovery_worker.py
+        # ::_fuzz_endpoints, web_crawl_worker.py::_run_ffuf) but was never enabled —
+        # every scan profile left it off. This is the authorized/deep scan profile,
+        # the one place it belongs; DEFAULT_SCAN_CONFIG/DEFAULT_SCAN_POLICY in
+        # scan_service.py must NOT re-clobber this back to False (see that file).
+        "fuzz": True,
+        "fuzz_max_targets": 25,
+        # JS analysis re-fetches JS files the crawler already discovered (no new
+        # targets, no extra crawl surface) to extract hidden endpoints/secrets/
+        # subdomains — same read-only-GET posture as everything else this
+        # profile already does, so it's on by default here rather than gated
+        # further.
+        "js_analysis_enabled": True,
+        "js_analysis_max_files": 50,
     },
     "endpoint": {
         "scan_profile": "endpoint",
@@ -154,7 +195,10 @@ SCAN_PROFILES: Dict[str, Dict[str, Any]] = {
         "vuln_depth": "endpoint",
         "automatic_scan": False,
         "use_tech_tags": True,
-        "severities": ["critical", "high", "medium"],
+        # Crawled endpoints are exactly where exposed-panel/exposure "info"
+        # templates hit (see "default" profile above) — this is the profile
+        # that runs against real discovered URLs, not just root hosts.
+        "severities": ["critical", "high", "medium", "info"],
         "template_dirs": PROFILE_TEMPLATE_DIRS["endpoint"],
         "exclude_tags": SAFE_EXCLUDED_TAGS,
         "scan_timeout": 600,

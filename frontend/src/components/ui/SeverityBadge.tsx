@@ -312,3 +312,78 @@ export function CVEBadge({ cveId, className }: { cveId: string; className?: stri
     </a>
   );
 }
+
+// ── KEV Badge (CISA Known Exploited Vulnerabilities) ────────────
+interface KEVBadgeProps {
+  knownRansomware?: boolean;
+  compact?: boolean;
+  className?: string;
+}
+
+export function KEVBadge({ knownRansomware, compact = false, className }: KEVBadgeProps) {
+  return (
+    <span
+      title={
+        knownRansomware
+          ? "CISA KEV: confirmed active exploitation, known ransomware use"
+          : "CISA KEV: confirmed active exploitation in the wild"
+      }
+      className={cn(
+        "inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-bold border",
+        "bg-red-600/15 text-red-400 border-red-600/40",
+        className,
+      )}
+    >
+      <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse flex-shrink-0" />
+      {compact ? "KEV" : knownRansomware ? "Actively Exploited · Ransomware" : "Actively Exploited"}
+    </span>
+  );
+}
+
+// ── EPSS Badge ───────────────────────────────────────────────────
+export function EPSSBadge({ score, className }: { score: number; className?: string }) {
+  const pct = Math.round(score * 100);
+  const high = score >= 0.5;
+  return (
+    <span
+      title={`EPSS: ${pct}% predicted probability of exploitation in the next 30 days (FIRST.org)`}
+      className={cn(
+        "inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-mono border",
+        high
+          ? "bg-orange-500/10 text-orange-400 border-orange-500/30"
+          : "bg-gray-500/10 text-gray-400 border-gray-500/20",
+        className,
+      )}
+    >
+      EPSS {pct}%
+    </span>
+  );
+}
+
+// ── Confidence Indicator ────────────────────────────────────────
+const CONFIDENCE_CONFIG: Record<string, { label: string; dot: string; text: string }> = {
+  high: {
+    label: "High confidence — the CVE template's expected product matches this asset's fingerprinted tech stack",
+    dot: "#10b981",
+    text: "text-emerald-400",
+  },
+  low: {
+    label: "Low confidence — the CVE template's expected product does not match this asset's fingerprinted tech stack (still reported, not dropped — worth a second look)",
+    dot: "#eab308",
+    text: "text-yellow-400",
+  },
+};
+
+export function ConfidenceIndicator({ confidence, className }: { confidence?: string; className?: string }) {
+  if (!confidence || confidence === "unknown") return null;
+  const cfg = CONFIDENCE_CONFIG[confidence];
+  if (!cfg) return null;
+  return (
+    <span title={cfg.label} className={cn("inline-flex items-center gap-1", className)}>
+      <span className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ backgroundColor: cfg.dot }} />
+      <span className={cn("text-[10px] uppercase tracking-wide font-semibold", cfg.text)}>
+        {confidence} conf.
+      </span>
+    </span>
+  );
+}

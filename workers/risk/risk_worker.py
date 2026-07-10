@@ -99,6 +99,7 @@ class RiskWorker(BaseWorker):
     async def _load_findings(self, db, org_id: str) -> list:
         """Load all non-excluded findings for scoring."""
         from workers.db_models import Finding
+        from app.services.exploit_intel import compute_exploit_boost, get_exploit_intel
 
         result = await db.execute(
             select(Finding).where(
@@ -111,13 +112,17 @@ class RiskWorker(BaseWorker):
         )
         findings = result.scalars().all()
 
+        all_cve_ids = sorted({cve for f in findings for cve in (f.cve_ids or [])})
+        intel_by_cve = await get_exploit_intel(db, all_cve_ids)
+
         return [
             {
                 "id": str(f.id),
                 "category": f.category or "unknown",
                 "severity": f.severity,
                 "status": f.status,
-                "confidence": 1.0,
+                "confidence": float((f.proof or {}).get("confidence_score", 1.0)),
+                "exploit_boost": compute_exploit_boost(intel_by_cve, f.cve_ids or []),
                 "first_seen": f.first_seen,
                 "last_seen": f.last_seen,
                 "is_false_positive": f.is_false_positive,

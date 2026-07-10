@@ -1,4 +1,11 @@
-from app.services.scan_service import _clamp_config, _deep_merge, _policy_to_config
+from app.services.scan_service import (
+    DEFAULT_SCAN_CONFIG,
+    DEFAULT_SCAN_POLICY,
+    _apply_runtime_caps,
+    _clamp_config,
+    _deep_merge,
+    _policy_to_config,
+)
 from app.services.scan_profiles import (
     SAFE_EXCLUDED_TAGS,
     apply_scan_profile,
@@ -6,6 +13,22 @@ from app.services.scan_profiles import (
     child_profile_config,
     resolve_scan_profile,
 )
+
+
+def _effective_config(scan_type: str, org_policy_override=None, request_config=None):
+    """Replicates create_and_queue()'s full merge chain end to end — the same
+    style of test that would have caught Milestone 6's batch-size bug on the
+    first pass, since it exercises every config layer (DEFAULT_SCAN_CONFIG,
+    DEFAULT_SCAN_POLICY via _policy_to_config, request-body overrides, then
+    apply_scan_profile/_apply_runtime_caps) instead of calling apply_scan_profile
+    directly in isolation."""
+    org_policy = _deep_merge(DEFAULT_SCAN_POLICY, org_policy_override or {})
+    effective_config = _clamp_config({
+        **DEFAULT_SCAN_CONFIG.get(scan_type, {}),
+        **_policy_to_config(org_policy),
+        **(request_config or {}),
+    })
+    return _apply_runtime_caps(_clamp_config(apply_scan_profile(effective_config, scan_type)))
 
 
 def test_policy_to_config_maps_nested_scan_policy():
@@ -162,3 +185,34 @@ def test_target_candidate_builder_reports_dns_only_validation():
     assert candidates["web_standard_targets"] == []
     assert candidates["summary"]["skipped_by_validation"] == {"liveness_dns_only": 1}
     assert candidates["validation_skipped_targets"][0]["reason"] == "liveness_dns_only"
+
+
+def test_full_scan_effective_config_enables_fuzz_and_js_analysis():
+    """Milestone 7: fuzz/js_analysis_enabled must survive the full merge chain
+    for a real "full" scan with no org-policy or request-body overrides — not
+    just resolve correctly when apply_scan_profile() is called in isolation."""
+    config = _effective_config("full")
+
+    assert config["fuzz"] is True
+    assert config["fuzz_max_targets"] == 25
+    assert config["js_analysis_enabled"] is True
+    assert config["nuclei_batch_size"] == 8
+    assert config["crawl_nuclei_batch_size"] == 8
+
+
+def test_quick_scan_effective_config_leaves_fuzz_disabled():
+    """The "safe" profile behind "quick" scans must not be affected by
+    deep_authorized's fuzz=True default — each profile's own value should win,
+    not a scan-type-agnostic clobber in either direction."""
+    config = _effective_config("quick")
+
+    assert config["fuzz"] is False
+
+
+def test_org_scan_policy_override_still_wins_over_profile_default():
+    """An explicit org-level scan_policy override must still be able to turn
+    fuzz off for deep_authorized — the fix removes the *hardcoded* False, not
+    the ability to override at all."""
+    config = _effective_config("full", org_policy_override={"crawl": {"fuzz": False}})
+
+    assert config["fuzz"] is False

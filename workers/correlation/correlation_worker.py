@@ -63,30 +63,42 @@ class CorrelationWorker(BaseWorker):
 
         log.info("correlation_started", scan_id=scan_id, org_id=org_id)
 
+        deduplicated = 0
+        relationships: List[Dict] = []
+
         async with get_session() as db:
             if not await should_process_scan(db, scan_id):
                 log.info("correlation_skipped_inactive_scan", scan_id=scan_id)
                 return
             await update_scan_phase(db, scan_id, "correlation", "running", is_terminal=is_terminal)
 
-            # ── Step 1: Asset Deduplication ───────────────────
-            deduplicated = await self._deduplicate_assets(db, org_id)
-
-            # ── Step 2: Build Relationships ───────────────────
-            relationships = await self._build_relationships(db, org_id)
-            await self._persist_relationships(db, relationships)
-
-            # ── Step 3: Update Org Statistics ─────────────────
-            await self._update_org_stats(db, org_id)
-
-            # ── Step 4: Index to OpenSearch ───────────────────
-            await self._index_to_opensearch(db, org_id, workspace_id)
-
-            # ── Step 5: Mark scan as complete ─────────────────
-            # Only the final terminal message (from screenshot worker)
-            # is allowed to complete the scan. Intermediate messages
-            # (from nuclei) do incremental work only.
+            # Dedupe/relationship-rebuild/org-stats/OpenSearch-index are full,
+            # org-wide recomputes, not incremental — every fan-out phase
+            # (nuclei per batch, crawl, port, enrich, scanner-family) publishes
+            # its own intermediate correlation.process message, so running
+            # this unconditionally meant repeating full-org work ~40-50x per
+            # scan. The primary findings list doesn't depend on any of it
+            # (nuclei/scanner workers write findings straight to Postgres,
+            # independent of correlation) — only the relationship graph, the
+            # /search OpenSearch index, and denormalized org stats do, and
+            # nothing was watching those update live mid-scan. Deferring all
+            # of it to the terminal message cuts ~40x redundant work per scan
+            # for a cost nobody could actually see.
             if is_terminal:
+                # ── Step 1: Asset Deduplication ───────────────
+                deduplicated = await self._deduplicate_assets(db, org_id)
+
+                # ── Step 2: Build Relationships ───────────────
+                relationships = await self._build_relationships(db, org_id)
+                await self._persist_relationships(db, relationships)
+
+                # ── Step 3: Update Org Statistics ─────────────
+                await self._update_org_stats(db, org_id)
+
+                # ── Step 4: Index to OpenSearch ───────────────
+                await self._index_to_opensearch(db, org_id, workspace_id)
+
+                # ── Step 5: Mark scan as complete ─────────────
                 await self._complete_scan(db, scan_id)
 
         if is_terminal:
@@ -124,9 +136,6 @@ class CorrelationWorker(BaseWorker):
                     "correlation",
                     "running",
                     is_terminal=False,
-                    deduplicated=deduplicated,
-                    relationships=len(relationships),
-                    indexed=True,
                 )
             log.info("correlation_intermediate", scan_id=scan_id)
 
@@ -243,23 +252,31 @@ class CorrelationWorker(BaseWorker):
         )
         findings = (await db.execute(finding_q)).scalars().all()
 
-        # Map finding CVEs to technologies (simple heuristic)
+        # Map finding CVEs to technologies (simple heuristic).
+        # Index tech_rows by asset_id once (O(T)) instead of scanning it per
+        # finding (O(F×T)) — this was a real cost at scale since this whole
+        # method used to re-run on every intermediate correlation trigger.
+        tech_by_asset_id: Dict[str, Any] = {}
+        for asset, tech in tech_rows:
+            tech_by_asset_id.setdefault(str(asset.id), (asset, tech))
+
         for finding in findings:
-            for asset, tech in tech_rows:
-                if str(asset.id) == str(finding.asset_id):
-                    # Implies: tech may be the reason for this finding
-                    # In production, use CPE matching
-                    relationships.append({
-                        "source_asset_id": str(asset.id),
-                        "target_asset_id": str(finding.asset_id),
-                        "relationship_type": "has_finding",
-                        "confidence": 0.8,
-                        "metadata": {
-                            "finding_id": str(finding.id),
-                            "severity": finding.severity,
-                        },
-                    })
-                    break  # One per finding-asset pair
+            match = tech_by_asset_id.get(str(finding.asset_id))
+            if not match:
+                continue
+            asset, tech = match
+            # Implies: tech may be the reason for this finding
+            # In production, use CPE matching
+            relationships.append({
+                "source_asset_id": str(asset.id),
+                "target_asset_id": str(finding.asset_id),
+                "relationship_type": "has_finding",
+                "confidence": 0.8,
+                "metadata": {
+                    "finding_id": str(finding.id),
+                    "severity": finding.severity,
+                },
+            })
 
         return relationships
 

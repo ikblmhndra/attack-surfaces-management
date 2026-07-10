@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import shutil
 import tempfile
 from datetime import datetime, timezone
@@ -21,6 +22,7 @@ from workers.queue_client import QueueClient
 from workers.scan_observability import record_target_selections
 from workers.scan_phase import update_scan_phase
 from workers.scan_state import mark_scan_running
+from workers.scanner.scanner_common import host_from_target
 
 log = structlog.get_logger()
 
@@ -33,6 +35,15 @@ SEVERITY_MAP = {
     "info": "info",
     "unknown": "info",
 }
+
+# Some community/custom nuclei templates name themselves after the CVE they
+# check for (e.g. template-id "CVE-2025-55184") without ever populating the
+# structured info.classification.cve-id field _map_category()'s keyword match
+# already effectively "sees" — but the finding's own cve_ids array (which
+# feeds risk_engine confidence scoring and EPSS/KEV exploit-intel lookups)
+# doesn't, silently starving those features of data. Fallback pattern-match
+# against the template ID whenever nuclei's own metadata came back empty.
+CVE_ID_PATTERN = re.compile(r"CVE-\d{4}-\d{4,}", re.IGNORECASE)
 
 # Nuclei category → platform category
 CATEGORY_MAP = {
@@ -53,8 +64,12 @@ CATEGORY_MAP = {
     "workflows": "info",
 }
 
-# Template severity allow-list (don't run info templates by default)
-DEFAULT_SEVERITIES = ["critical", "high", "medium", "low"]
+# Fallback severity allow-list used only when a scan config bypasses the
+# scan_profiles.py profiles entirely. "info" is included because nuclei tags
+# most of its exposed-panels/exposures templates "info" severity, and
+# _is_low_value_info_finding() below already filters pure fingerprinting noise
+# out of whatever info-severity findings come back.
+DEFAULT_SEVERITIES = ["critical", "high", "medium", "low", "info"]
 MAX_RAW_FIELD_CHARS = 10000
 MAX_RESPONSE_RAW_CHARS = 5000
 MAX_BATCH_TIMEOUT = int(os.getenv("NUCLEI_MAX_BATCH_TIMEOUT", "900"))
@@ -308,7 +323,7 @@ class NucleiWorker(BaseWorker):
             if findings_raw:
                 log.info("nuclei_raw_findings", count=len(findings_raw), scan_id=scan_id)
 
-                findings = [self._parse_finding(f, org_id, workspace_id, scan_id) for f in findings_raw]
+                findings = [self._parse_finding(f, org_id, workspace_id, scan_id, tech_map) for f in findings_raw]
                 findings = [f for f in findings if f is not None]
                 suppressed_count = 0
                 if not config.get("nuclei_persist_info_findings", False):
@@ -453,6 +468,47 @@ class NucleiWorker(BaseWorker):
             if tag:
                 tags.append(tag)
         return tags
+
+    def _cve_confidence(
+        self,
+        cve_ids: List[str],
+        tags: List[Any],
+        matched: str,
+        tech_map: Dict[str, Any],
+    ) -> tuple:
+        """Cross-check a CVE-tagged finding's expected product against the asset's
+        own fingerprinted tech stack (populated from tech_map — the same tech
+        tags used for -tags filtering above, sourced from httpx tech-detect).
+        Only ever *deprioritizes*, never drops: no data on either side (no CVE,
+        template doesn't name a product, or fingerprinting didn't run for this
+        asset) all resolve to ("unknown", 1.0) — a missing signal isn't evidence
+        of a false positive, so it must not silently zero the finding's weight.
+        """
+        if not cve_ids:
+            return "unknown", 1.0, [], []
+
+        expected_tags = self._tech_tags(tags)
+        if not expected_tags or not tech_map:
+            return "unknown", 1.0, expected_tags, []
+
+        asset_techs = tech_map.get(matched)
+        if asset_techs is None:
+            matched_host = host_from_target(matched) if matched else ""
+            for url, techs in tech_map.items():
+                if matched_host and host_from_target(url) == matched_host:
+                    asset_techs = techs
+                    break
+
+        if not asset_techs:
+            return "unknown", 1.0, expected_tags, []
+
+        asset_tags = self._tech_tags(asset_techs)
+        if not asset_tags:
+            return "unknown", 1.0, expected_tags, []
+
+        if set(expected_tags) & set(asset_tags):
+            return "high", 1.0, expected_tags, asset_tags
+        return "low", 0.5, expected_tags, asset_tags
 
     async def _mark_endpoint_targets(
         self,
@@ -780,6 +836,7 @@ class NucleiWorker(BaseWorker):
         org_id: str,
         workspace_id: str,
         scan_id: str,
+        tech_map: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict]:
         """Parse a nuclei JSON result into platform finding format."""
         if not isinstance(raw, dict):
@@ -798,6 +855,14 @@ class NucleiWorker(BaseWorker):
                 cve_ids = [cve_id]
             elif isinstance(cve_id, list):
                 cve_ids = cve_id
+            if not cve_ids:
+                # Fallback: some templates name themselves after the CVE
+                # without populating classification.cve-id (see CVE_ID_PATTERN).
+                match = CVE_ID_PATTERN.search(template_id) or CVE_ID_PATTERN.search(
+                    template_info.get("name", "")
+                )
+                if match:
+                    cve_ids = [match.group(0).upper()]
 
             # CVSS
             cvss_score = classifications.get("cvss-score")
@@ -812,6 +877,10 @@ class NucleiWorker(BaseWorker):
             fingerprint = hashlib.sha256(
                 f"{org_id}:{template_id}:{matched}".encode()
             ).hexdigest()
+
+            confidence_label, confidence_score, matched_product_tags, asset_tech_tags = self._cve_confidence(
+                cve_ids, tags, matched, tech_map or {}
+            )
 
             # Evidence
             request_raw = self._clean_text(raw.get("request", ""), limit=MAX_RAW_FIELD_CHARS)
@@ -854,6 +923,10 @@ class NucleiWorker(BaseWorker):
                     "timestamp": raw.get("timestamp", ""),
                     "template_id": template_id,
                     "tags": tags,
+                    "confidence": confidence_label,
+                    "confidence_score": confidence_score,
+                    "matched_product_tags": matched_product_tags,
+                    "asset_tech_tags": asset_tech_tags,
                 }),
                 "remediation": self._clean_text(template_info.get("remediation", ""), limit=5000),
                 "references": [self._clean_text(ref, limit=1000) for ref in references[:20]],
@@ -963,6 +1036,7 @@ class NucleiWorker(BaseWorker):
         """Upsert findings, return list of persisted finding IDs."""
         from sqlalchemy.dialects.postgresql import insert as pg_insert
         from workers.db_models import Asset, Finding, ScanFinding
+        from workers.scanner.scanner_common import status_preserving_conflict_updates
 
         persisted_ids = []
         now = datetime.now(timezone.utc)
@@ -1005,7 +1079,7 @@ class NucleiWorker(BaseWorker):
             stmt = pg_insert(Finding.__table__).values(**values, first_seen=now)
             stmt = stmt.on_conflict_do_update(
                 index_elements=["fingerprint", "org_id"],
-                set_={"last_seen": now, "status": "open"},
+                set_=status_preserving_conflict_updates(now),
             ).returning(Finding.__table__.c.id, Finding.__table__.c.first_seen)
 
             result = await db.execute(stmt)

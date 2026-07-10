@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import urlsplit
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import and_, case, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from workers.db import get_session
@@ -44,6 +44,30 @@ def host_from_target(target: str) -> str:
 
 def finding_fingerprint(org_id: str, scanner: str, check_id: str, target: str) -> str:
     return hashlib.sha256(f"{org_id}:{scanner}:{check_id}:{target}".encode()).hexdigest()
+
+
+def status_preserving_conflict_updates(now: datetime) -> Dict[str, Any]:
+    """SET-clause fragments for a Finding upsert on rediscovery.
+
+    A rediscovered finding must not clobber an analyst's false-positive call or an
+    active risk-acceptance — every finding-persistence path used to hardcode
+    `status: "open"` on every upsert, silently undoing triage on the very next scan
+    that re-matched the same fingerprint. A `resolved` finding (or one whose risk
+    acceptance has lapsed) reappearing is a real regression and should reopen.
+    """
+    t = Finding.__table__.c
+    accepted_active = and_(
+        t.status == "accepted",
+        t.is_risk_accepted.is_(True),
+        or_(t.risk_accepted_until.is_(None), t.risk_accepted_until > now),
+    )
+    preserved = or_(t.status == "false_positive", accepted_active)
+    return {
+        "last_seen": now,
+        "status": case((preserved, t.status), else_="open"),
+        "is_risk_accepted": case((preserved, t.is_risk_accepted), else_=False),
+        "resolved_at": case((preserved, t.resolved_at), else_=None),
+    }
 
 
 def make_finding(
@@ -138,8 +162,7 @@ async def persist_findings(db, scan_id: str, findings: Iterable[Dict[str, Any]])
         stmt = stmt.on_conflict_do_update(
             index_elements=["fingerprint", "org_id"],
             set_={
-                "last_seen": now,
-                "status": "open",
+                **status_preserving_conflict_updates(now),
                 "severity": values["severity"],
                 "proof": values["proof"],
                 "evidence": values["evidence"],

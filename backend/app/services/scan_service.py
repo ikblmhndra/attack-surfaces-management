@@ -30,8 +30,11 @@ DEFAULT_SCAN_POLICY = {
     "modules": DEFAULT_MODULES["full"],
     "budgets": {
         "scan_timeout": 900,
-        "nuclei_batch_size": 4,
-        "crawl_nuclei_batch_size": 1,
+        # These feed into apply_scan_profile() as "incoming" overrides, which win
+        # over SCAN_PROFILES/PROFILE_RUNTIME_CAPS defaults (profile.update(incoming)) —
+        # they must be kept in sync with those, not left at the old batch-size-1 values.
+        "nuclei_batch_size": 8,
+        "crawl_nuclei_batch_size": 8,
         "crawl_nuclei_scan_timeout": ENDPOINT_NUCLEI_TIMEOUT_CAP,
         "max_endpoints": 2500,
         "max_hosts": 200,
@@ -39,8 +42,12 @@ DEFAULT_SCAN_POLICY = {
     "crawl": {
         "depth": 2,
         "use_gau": True,
-        "fuzz": False,
-        "fuzz_max_targets": 25,
+        # Deliberately no "fuzz"/"fuzz_max_targets" key here: this dict is scan-type-
+        # agnostic (merged in before the profile is even resolved, via
+        # _policy_to_config()), so a hardcoded value here would clobber every profile's
+        # own fuzz setting identically — including deep_authorized's fuzz=True. Leave
+        # it unset so SCAN_PROFILES' own default flows through, unless an org
+        # explicitly overrides it via Organization.scan_policy.
     },
     "nuclei": {
         "automatic_scan": True,
@@ -64,9 +71,14 @@ DEFAULT_SCAN_CONFIG = {
     "full": {
         "scan_profile": "deep_authorized",
         "crawl": True,
-        "fuzz": False,
-        "nuclei_batch_size": 4,
-        "crawl_nuclei_batch_size": 1,
+        # fuzz intentionally omitted (was hardcoded False here, silently undoing
+        # SCAN_PROFILES["deep_authorized"]'s fuzz=True the same way batch_size was
+        # undone in Milestone 6 — profile.update(incoming) lets this dict always win).
+        # Kept in sync with SCAN_PROFILES["deep_authorized"]/PROFILE_RUNTIME_CAPS —
+        # this dict is merged in as apply_scan_profile()'s "incoming" override, which
+        # wins over the profile default, so a stale value here silently undoes that fix.
+        "nuclei_batch_size": 8,
+        "crawl_nuclei_batch_size": 8,
         "crawl_nuclei_scan_timeout": ENDPOINT_NUCLEI_TIMEOUT_CAP,
         "scan_timeout": 900,
         "template_timeout": 8,
@@ -113,7 +125,7 @@ DEFAULT_SCAN_CONFIG = {
     },
     "vuln": {
         "scan_profile": "deep_authorized",
-        "nuclei_batch_size": 4,
+        "nuclei_batch_size": 8,
         "scan_timeout": 900,
         "template_timeout": 8,
         "retries": 0,
@@ -147,22 +159,33 @@ CONFIG_LIMITS = {
     "service_fingerprint_max_targets": (1, 500),
 }
 
+# nuclei_batch_size/crawl_nuclei_batch_size caps were 4/1/1 (effectively one
+# nuclei subprocess per host or per URL) to isolate a slow target from
+# blocking a whole batch. That isolation already exists more cheaply at two
+# other layers: nuclei's own per-template timeout (-timeout, 6-8s) and
+# nuclei_worker.py::_run_nuclei's TimeoutError handler, which still parses
+# whatever partial results were written before a batch-level timeout kills
+# the process. Batch size 1 meant paying nuclei's template-load/init overhead
+# once per host/URL instead of once per batch — the dominant cost of a full
+# scan (observed: ~35 single-target batches x 2.5-6 min each). Raised to 8
+# across the board, matching scan_profiles.py's SCAN_PROFILES values (which
+# this cap would otherwise silently override back down).
 PROFILE_RUNTIME_CAPS = {
     "deep_authorized": {
         "scan_timeout": 900,
-        "nuclei_batch_size": 4,
-        "crawl_nuclei_batch_size": 1,
+        "nuclei_batch_size": 8,
+        "crawl_nuclei_batch_size": 8,
         "crawl_nuclei_scan_timeout": ENDPOINT_NUCLEI_TIMEOUT_CAP,
     },
     "endpoint": {
         "scan_timeout": ENDPOINT_NUCLEI_TIMEOUT_CAP,
-        "nuclei_batch_size": 1,
+        "nuclei_batch_size": 8,
         "concurrency": 4,
         "bulk_size": 4,
     },
     "limited": {
         "scan_timeout": 600,
-        "nuclei_batch_size": 4,
+        "nuclei_batch_size": 8,
         "concurrency": 4,
         "bulk_size": 4,
     },
@@ -306,13 +329,13 @@ class ScanService:
                 "template_timeout": min(int(base_config.get("template_timeout", 6)), 6),
                 "concurrency": min(int(base_config.get("concurrency", 4)), 4),
                 "bulk_size": min(int(base_config.get("bulk_size", 4)), 4),
-                "nuclei_batch_size": 1,
+                "nuclei_batch_size": 8,
                 "severities": ["critical", "high", "medium"],
             },
         )
 
-        host_batch_size = max(1, min(int(base_config.get("nuclei_batch_size", 4)), 4))
-        endpoint_batch_size = max(1, min(int(endpoint_config.get("nuclei_batch_size", 1)), 1))
+        host_batch_size = max(1, min(int(base_config.get("nuclei_batch_size", 8)), 8))
+        endpoint_batch_size = max(1, min(int(endpoint_config.get("nuclei_batch_size", 8)), 8))
         host_batches = _chunks(host_targets, host_batch_size)
         endpoint_batches = _chunks(endpoint_targets, endpoint_batch_size)
         total_batches = len(host_batches) + len(endpoint_batches)

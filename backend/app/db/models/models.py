@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import (
-    Boolean, Column, DateTime, Float, ForeignKey, Index,
+    Boolean, Column, Date, DateTime, Float, ForeignKey, Index,
     Integer, String, Text, UniqueConstraint, func, text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
@@ -571,6 +571,37 @@ class RiskScore(TimestampMixin, Base):
 
     # Relationships
     organization = relationship("Organization", back_populates="risk_scores")
+
+
+# ============================================================
+# EXPLOIT INTELLIGENCE (EPSS + CISA KEV)
+# ============================================================
+
+class ExploitIntel(Base):
+    """Keyless, publicly-published exploit-likelihood data per CVE, refreshed
+    daily by workers/scheduler/scheduler.py. Not tied to any org/workspace —
+    global reference data joined against Finding.cve_ids at scoring/read time,
+    not frozen onto a finding at scan time (EPSS scores shift daily; a finding
+    open for weeks should reflect today's exploit intelligence, not a stale
+    snapshot from when it was first discovered)."""
+    __tablename__ = "exploit_intel"
+
+    cve_id = Column(String(50), primary_key=True)
+
+    # EPSS (Exploit Prediction Scoring System, FIRST.org) — probability (0-1)
+    # a CVE will be exploited in the wild in the next 30 days, plus its
+    # percentile rank among all scored CVEs.
+    epss_score = Column(Float, nullable=True)
+    epss_percentile = Column(Float, nullable=True)
+    epss_date = Column(Date, nullable=True)
+
+    # CISA KEV (Known Exploited Vulnerabilities) — confirmed active exploitation.
+    is_kev = Column(Boolean, nullable=False, default=False, index=True)
+    kev_date_added = Column(Date, nullable=True)
+    kev_known_ransomware = Column(Boolean, nullable=False, default=False)
+    kev_due_date = Column(Date, nullable=True)
+
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
 
 # ============================================================

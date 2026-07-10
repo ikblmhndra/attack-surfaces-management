@@ -277,6 +277,15 @@ export interface Finding {
   cvss_score?:          number;
   cvss_vector?:         string;
   cwe_ids:              string[];
+  // Milestone 7: worst-case cross-check of a CVE template's expected product
+  // against the asset's fingerprinted tech stack ("high"/"low"/"unknown").
+  confidence?:          "high" | "low" | "unknown";
+  // Milestone 8: EPSS/CISA KEV exploit intelligence, worst-case across the
+  // finding's CVEs, looked up live (not frozen at scan time).
+  epss_score?:          number | null;
+  epss_percentile?:     number | null;
+  is_kev?:              boolean;
+  kev_known_ransomware?: boolean;
   affected_url?:        string;
   evidence?:            string;
   request_raw?:         string;

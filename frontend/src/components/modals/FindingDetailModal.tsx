@@ -10,7 +10,7 @@ import { formatDistanceToNow, format } from "date-fns";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { findingsAPI } from "@/lib/api";
-import { SeverityBadge, StatusBadge, CVEBadge } from "@/components/ui/SeverityBadge";
+import { SeverityBadge, StatusBadge, CVEBadge, KEVBadge, EPSSBadge, ConfidenceIndicator } from "@/components/ui/SeverityBadge";
 import { cn } from "@/lib/utils";
 
 interface FindingDetailModalProps {
@@ -81,6 +81,11 @@ export function FindingDetailModal({ finding, onClose }: FindingDetailModalProps
               <div className="flex items-center gap-2 mb-2 flex-wrap">
                 <SeverityBadge severity={finding.severity} />
                 <StatusBadge status={finding.status} />
+                {finding.is_kev && <KEVBadge knownRansomware={finding.kev_known_ransomware} />}
+                {typeof finding.epss_score === "number" && finding.epss_score > 0 && (
+                  <EPSSBadge score={finding.epss_score} />
+                )}
+                <ConfidenceIndicator confidence={finding.confidence} />
                 {finding.cve_ids?.map((cve: string) => (
                   <CVEBadge key={cve} cveId={cve} />
                 ))}
@@ -141,6 +146,12 @@ export function FindingDetailModal({ finding, onClose }: FindingDetailModalProps
                     { label: "Template", value: finding.template_id, mono: true },
                     { label: "Category", value: finding.category?.replace(/_/g, " "), capitalize: true },
                     { label: "CVSS Score", value: finding.cvss_score?.toFixed(1) || "—" },
+                    ...(typeof finding.epss_percentile === "number"
+                      ? [{ label: "EPSS Percentile", value: `${Math.round(finding.epss_percentile * 100)}th` }]
+                      : []),
+                    ...(finding.confidence && finding.confidence !== "unknown"
+                      ? [{ label: "Match Confidence", value: finding.confidence, capitalize: true }]
+                      : []),
                     { label: "First Seen", value: finding.first_seen ? formatDistanceToNow(new Date(finding.first_seen), { addSuffix: true }) : "—" },
                     { label: "Last Seen", value: finding.last_seen ? formatDistanceToNow(new Date(finding.last_seen), { addSuffix: true }) : "—" },
                     { label: "Scanner", value: finding.scanner || finding.source || "—" },

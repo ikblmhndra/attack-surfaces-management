@@ -23,7 +23,7 @@ import { motion } from "framer-motion";
 import { cn } from "@/lib/utils";
 import { apiClient } from "@/lib/api";
 import { useWorkspaceStore } from "@/store/workspace";
-import { SeverityBadge } from "@/components/ui/SeverityBadge";
+import { SeverityBadge, KEVBadge, EPSSBadge, ConfidenceIndicator } from "@/components/ui/SeverityBadge";
 import { FindingDetailModal } from "@/components/modals/FindingDetailModal";
 
 const columnHelper = createColumnHelper<any>();
@@ -122,9 +122,14 @@ export default function FindingsPage() {
       size: 320,
       cell: (info) => (
         <div>
-          <p className="text-sm font-medium text-foreground truncate max-w-[280px]">
-            {info.getValue()}
-          </p>
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <p className="text-sm font-medium text-foreground truncate max-w-[280px]">
+              {info.getValue()}
+            </p>
+            {info.row.original.is_kev && (
+              <KEVBadge compact knownRansomware={info.row.original.kev_known_ransomware} />
+            )}
+          </div>
           <p className="text-xs text-muted-foreground truncate max-w-[280px] mt-0.5">
             {info.row.original.template_id}
           </p>
@@ -168,16 +173,28 @@ export default function FindingsPage() {
       },
     }),
     columnHelper.accessor("cvss_score", {
-      header: "CVSS",
-      size: 70,
+      header: "CVSS / Exploit Intel",
+      size: 130,
       cell: (info) => {
         const v = info.getValue();
-        if (!v) return <span className="text-xs text-muted-foreground">—</span>;
-        const color = v >= 9 ? "#ef4444" : v >= 7 ? "#f97316" : v >= 4 ? "#eab308" : "#3b82f6";
+        const f = info.row.original;
+        const color = v ? (v >= 9 ? "#ef4444" : v >= 7 ? "#f97316" : v >= 4 ? "#eab308" : "#3b82f6") : undefined;
         return (
-          <span className="text-xs font-mono font-bold" style={{ color }}>
-            {v.toFixed(1)}
-          </span>
+          <div className="flex flex-col gap-1">
+            <div className="flex items-center gap-1.5">
+              {v ? (
+                <span className="text-xs font-mono font-bold" style={{ color }}>
+                  {v.toFixed(1)}
+                </span>
+              ) : (
+                <span className="text-xs text-muted-foreground">—</span>
+              )}
+              <ConfidenceIndicator confidence={f.confidence} />
+            </div>
+            {typeof f.epss_score === "number" && f.epss_score > 0 && (
+              <EPSSBadge score={f.epss_score} />
+            )}
+          </div>
         );
       },
     }),

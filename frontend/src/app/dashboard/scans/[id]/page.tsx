@@ -210,7 +210,7 @@ function PhaseRow({ phase }: { phase: any }) {
           {phase.phase === "discovery" && <DiscoverySummary summary={phase.summary || {}} />}
           {phase.phase === "crawl" && <EndpointSummary summary={phase.summary || {}} />}
           {phase.phase === "nuclei" && <NucleiSummary summary={phase.summary || {}} />}
-          {["tls", "dns_security", "takeover", "cloud_exposure", "service_fingerprint"].includes(phase.phase) && (
+          {["tls", "dns_security", "takeover", "cloud_exposure", "service_fingerprint", "git_secrets"].includes(phase.phase) && (
             <ScannerSummary summary={phase.summary || {}} />
           )}
         </div>

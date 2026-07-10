@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from workers.base_worker import BaseWorker
 from workers.db import get_session
+from workers.fuzz_wordlist import resolve_fuzz_wordlist
 from workers.queue_client import QueueClient
 from workers.scan_observability import record_target_selections
 from workers.scan_phase import update_scan_phase
@@ -1247,21 +1248,7 @@ class DiscoveryWorker(BaseWorker):
             return set()
 
         discovered = set()
-        wordlist = config.get("fuzz_wordlist", "")
-        for candidate in [wordlist, "/usr/share/wordlists/dirb/common.txt", "/usr/share/seclists/Discovery/Web-Content/common.txt"]:
-            if candidate and os.path.exists(candidate):
-                wordlist = candidate
-                break
-        else:
-            fallback = tmpdir / "fuzz_words.txt"
-            fallback.write_text("\n".join([
-                "admin", "login", "dashboard", "api", "v1", "v2", "graphql",
-                "backup", ".git", ".env", "config", "wp-admin", "wp-content",
-                "uploads", "files", "assets", "static", "status", "health",
-                ".well-known", "sitemap.xml", "robots.txt", "swagger",
-                "api-docs", "openapi.json", "jenkins", ".aws", ".azure",
-            ]))
-            wordlist = str(fallback)
+        wordlist = resolve_fuzz_wordlist(tmpdir, config)
 
         input_file = tmpdir / "fuzz_targets.txt"
         input_file.write_text("\n".join(urls))
@@ -1879,16 +1866,21 @@ class DiscoveryWorker(BaseWorker):
             limited_targets = candidates["web_limited_targets"]
             tech_map = candidates["tech_map"]
 
-            batch_size = max(1, min(int(config.get("nuclei_batch_size", 25)), 4))
+            # Was capped at 4 — raised to match web_crawl_worker.py's endpoint
+            # batching fix (nuclei's own per-template timeout plus partial-
+            # result recovery on a batch timeout already isolate a slow host
+            # without needing tiny batches).
+            batch_size = max(1, min(int(config.get("nuclei_batch_size", 25)), 8))
             standard_config = {
                 **config,
                 "scan_timeout": min(int(config.get("scan_timeout", 900)), 900),
                 "nuclei_batch_size": batch_size,
-                "severities": [
-                    severity
-                    for severity in (config.get("severities") or ["critical", "high", "medium", "low"])
-                    if severity != "info"
-                ],
+                # Don't strip "info" here — scan_profiles.py now deliberately
+                # includes it (exposed-panel/exposure templates are mostly
+                # info-tagged), and nuclei_worker.py's
+                # _is_low_value_info_finding() already filters fingerprinting
+                # noise out of whatever info-severity findings come back.
+                "severities": config.get("severities") or ["critical", "high", "medium", "low", "info"],
             }
             limited_config = child_profile_config(
                 "limited",
@@ -1944,7 +1936,7 @@ class DiscoveryWorker(BaseWorker):
                 + crawl_scan_targets
                 + (subdomains or [])
             )
-            scanner_families = ["tls", "dns", "takeover", "cloud"]
+            scanner_families = ["tls", "dns", "takeover", "cloud", "git_secrets"]
             async with get_session() as db:
                 for family in scanner_families:
                     await update_scan_phase(
@@ -1955,6 +1947,7 @@ class DiscoveryWorker(BaseWorker):
                             "dns": "dns_security",
                             "takeover": "takeover",
                             "cloud": "cloud_exposure",
+                            "git_secrets": "git_secrets",
                         }[family],
                         "queued",
                         targets_total=len(scanner_targets),
