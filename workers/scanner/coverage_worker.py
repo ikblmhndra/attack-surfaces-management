@@ -26,7 +26,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from workers.base_worker import BaseWorker
 from workers.db import get_session
-from workers.db_models import Asset, Organization, Port, Subdomain
+from workers.db_models import Asset, Organization, Port, Subdomain, Technology
 from workers.discovery.bucket_candidates import generate_bucket_candidates
 from workers.scan_observability import record_target_selections
 from workers.scan_phase import update_scan_phase
@@ -49,6 +49,7 @@ PHASE_BY_FAMILY = {
     "cloud": "cloud_exposure",
     "service": "service_fingerprint",
     "git_secrets": "git_secrets",
+    "eol": "eol_check",
 }
 
 RISKY_PORTS = {
@@ -126,6 +127,8 @@ class ScannerCoverageWorker(BaseWorker):
                 findings, summary, selected = await self._scan_cloud(org_id, workspace_id, targets, config)
             elif family == "git_secrets":
                 findings, summary, selected = await self._scan_git_secrets(org_id, workspace_id, targets, config)
+            elif family == "eol":
+                findings, summary, selected = await self._scan_eol(org_id, workspace_id, targets, config)
             else:
                 findings, summary, selected = await self._scan_services(org_id, workspace_id, message.get("services") or [], config)
 
@@ -562,7 +565,10 @@ class ScannerCoverageWorker(BaseWorker):
 
             if output_file.exists():
                 try:
-                    records = json.loads(output_file.read_text(errors="ignore") or "[]")
+                    # subzy (with --hide_fails) writes the literal JSON `null`,
+                    # not `[]`, when zero candidates are vulnerable — the
+                    # overwhelmingly common case — which json.loads()s to None.
+                    records = json.loads(output_file.read_text(errors="ignore") or "[]") or []
                 except json.JSONDecodeError:
                     records = []
                 for record in records:
@@ -900,6 +906,79 @@ class ScannerCoverageWorker(BaseWorker):
             "evidence": f"{host}/.git/HEAD returned a valid git ref/SHA, confirming an exposed repository.",
         }
 
+    async def _scan_eol(self, org_id: str, workspace_id: str, targets: List[Any], config: Dict[str, Any]):
+        """Cross-reference already-detected Technology rows (name+version) —
+        collected earlier in the scan by httpx/nuclei tech-detect, not fetched
+        here — against endoflife.date. Unlike the other scanner-family checks,
+        this makes no requests to the scanned org's own infrastructure at all;
+        `targets` is accepted only for interface consistency with the other
+        scanner-family dispatch, the actual working set comes straight from
+        this org's own already-persisted Technology rows.
+        """
+        from app.services.eol_intel import get_eol_status
+
+        max_products = int(config.get("eol_max_products", 150))
+        async with get_session() as db:
+            rows = (await db.execute(
+                select(Technology.name, Technology.version, Asset.value, Asset.id)
+                .join(Asset, Asset.id == Technology.asset_id)
+                .where(
+                    Technology.org_id == org_id,
+                    Technology.version.is_not(None),
+                    Technology.version != "",
+                )
+                .limit(max_products)
+            )).all()
+
+        findings: List[Dict[str, Any]] = []
+        observations: List[Dict[str, Any]] = []
+        seen_lookups: Dict[tuple, Optional[Dict[str, Any]]] = {}
+
+        for name, version, asset_value, asset_id in rows:
+            lookup_key = (name.strip().lower(), version)
+            if lookup_key not in seen_lookups:
+                async with get_session() as db:
+                    seen_lookups[lookup_key] = await get_eol_status(db, name, version)
+            status = seen_lookups[lookup_key]
+            if status is None:
+                continue
+            eol_date = status["eol_date"]
+            # date isn't JSON-serializable — every other check in this file
+            # (_tls_observe's expires_at, above) converts to isoformat before
+            # it ever reaches an observation/proof dict; do the same here.
+            json_safe_status = {**status, "eol_date": eol_date.isoformat() if eol_date else None}
+            observations.append({
+                "host": asset_value, "name": name, "version": version, **json_safe_status,
+            })
+            if not status["is_eol"]:
+                continue
+
+            days_since_eol = (datetime.now(timezone.utc).date() - eol_date).days if eol_date else 0
+            severity = "high" if days_since_eol > 365 else "medium"
+
+            findings.append(make_finding(
+                org_id=org_id,
+                workspace_id=workspace_id,
+                scanner="eol_scanner",
+                check_id=f"eol_{status['product']}_{status['cycle']}",
+                target=asset_value,
+                title=f"End-of-life software: {name} {version}",
+                severity=severity,
+                category="eol_software",
+                description=(
+                    f"{name} {version} (cycle {status['cycle']}) reached end-of-life"
+                    f"{' on ' + eol_date.isoformat() if eol_date else ''} and no longer "
+                    "receives security updates from its maintainer."
+                ),
+                evidence=f"{asset_value} runs {name} {version}, matched to endoflife.date cycle {status['cycle']}.",
+                proof=json_safe_status,
+                remediation=f"Upgrade {name} past {status['cycle']} to a supported release (latest: {status.get('latest_version') or 'see vendor'}).",
+            ))
+
+        selected = [{"target": obs["host"], "target_type": "host", "metadata": {"tech": obs["name"], "version": obs["version"]}} for obs in observations]
+        summary = {"scanner_family": "eol", "observed": len(observations), "products_checked": len(seen_lookups), "info_observations": observations[:50]}
+        return findings, summary, selected
+
     async def _scan_services(self, org_id: str, workspace_id: str, services: List[Dict[str, Any]], config: Dict[str, Any]):
         services = services[: int(config.get("service_fingerprint_max_targets", 200))]
         enriched = await self._nmap_enrich_services(services, config)
@@ -942,7 +1021,10 @@ class ScannerCoverageWorker(BaseWorker):
                 if not ip or not port:
                     continue
                 output = tmpdir / f"nmap-{ip.replace(':', '_')}-{port}.json"
-                cmd = [nmap, "-sV", "--version-light", "-Pn", "-p", port, "-oX", str(output), str(ip)]
+                cmd = [nmap, "-sV"]
+                if config.get("nmap_use_version_light", True):
+                    cmd.append("--version-light")
+                cmd.extend(["-Pn", "-p", port, "-oX", str(output), str(ip)])
                 try:
                     proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
                     await asyncio.wait_for(proc.communicate(), timeout=int(config.get("service_nmap_timeout", 45)))

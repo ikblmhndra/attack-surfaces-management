@@ -54,7 +54,13 @@ export default function RisksPage() {
 
   const latest = scoreData?.items?.[0] || scoreData;
   const historyData = history?.history || history?.items || [];
-  const breakdownData = breakdown?.category_scores || breakdown?.factors || [];
+  // GET /scores/breakdown's real shape is { breakdown: {category: {...}, ...},
+  // factors: [...], overall, grade } — "category_scores" doesn't exist on it.
+  // breakdown.breakdown is keyed by category name (all 9 categories); the old
+  // fallback to breakdown.factors (a sparse array, only categories with a
+  // deduction, no category name as its own key) rendered as array indices
+  // once run through Object.entries below.
+  const breakdownData = breakdown?.breakdown || {};
 
   return (
     <div className="p-6 space-y-6">
@@ -82,7 +88,7 @@ export default function RisksPage() {
               { label: "Overall Score", value: latest?.overall_score ?? latest?.overall ?? "—", sub: latest?.grade ? `Grade ${latest.grade}` : "—" },
               { label: "Critical", value: latest?.critical ?? 0, color: "text-red-400" },
               { label: "High", value: latest?.high ?? 0, color: "text-orange-400" },
-              { label: "Total Findings", value: latest?.total_findings ?? latest?.medium ?? "—" },
+              { label: "Total Findings", value: latest?.total_findings ?? "—" },
             ].map((kpi, i) => (
               <motion.div
                 key={kpi.label}
@@ -175,7 +181,7 @@ export default function RisksPage() {
             {/* Category breakdown */}
             <div className="col-span-12 glass-card p-5">
               <h2 className="text-sm font-semibold text-foreground mb-4">Category Breakdown</h2>
-              {Object.keys(breakdownData).length > 0 || Array.isArray(breakdownData) && breakdownData.length > 0 ? (
+              {Object.keys(breakdownData).length > 0 ? (
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                   {Object.entries(breakdownData).map(([key, val]: [string, any]) => {
                     const score = val.score ?? val;

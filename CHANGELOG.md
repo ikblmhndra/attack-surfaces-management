@@ -4,6 +4,535 @@ All notable changes to this project are documented below, sorted newest-first.
 
 ---
 
+## 2026-07-11 — Milestone 15: End-of-Life Software Enrichment (new scanner-family check)
+
+User asked whether already-collected findings/data could be enriched further. Investigation (with the
+user's sign-off before building) found a concrete, high-value gap: `risk_engine.py`'s `outdated_software`/
+`eol_software` scoring categories (Patch Hygiene) had existed since early in the project but had **zero**
+real findings feeding them anywhere in the database, despite the platform already collecting rich
+technology+version data (the `technologies` table, populated by httpx/nuclei tech-detect) that was never
+cross-checked against real end-of-life status. Confirmed against the live endoflife.date API (not assumed)
+that several already-detected versions in the database were genuinely, meaningfully overdue — an OpenSSL
+1.0.2k with no security patches since 2019, PHP 7.4.x (EOL since Nov 2022), Drupal 7 (EOL Jan 2025).
+
+### Added: keyless EOL lookup + cache, new `eol` scanner-family check
+- **New table** `eol_intel` (migration `016_eol_intel`) — caches endoflife.date's per-product-cycle EOL
+  data (`product`, `cycle`, `eol_date`, `latest_version`). Same shape/spirit as the existing
+  `exploit_intel` table (M14), but a different refresh model: EPSS shifts daily and needs scheduled
+  refresh, but a cycle's EOL date is fixed once published, so a product's cycle list is fetched from
+  endoflife.date **exactly once** (the first time any of its cycles is looked up) and never re-fetched —
+  keeping the platform's no-paid/keyless-enrichment posture (see CLAUDE.md) while adding real signal.
+  Design explicitly walked through with the user first: cache-aside by product (not per finding/category —
+  category is a many-to-one grouping label, CVSS/EOL data is inherently per-CVE/per-product), background
+  worker-driven rather than blocking any API request.
+- **New module** `backend/app/services/eol_intel.py`: `PRODUCT_SLUG_MAP` (Technology.name → endoflife.date
+  product slug, ~28 products covering everything actually detected plus common pre-emptive coverage),
+  per-product version→cycle normalizers (`_default_cycle` = major.minor for most products; `_openssl_cycle`
+  handles OpenSSL's own inconsistent convention — 1.0.x/1.1.x track major.minor.**patch**, 3.x tracks
+  major.minor only, verified against the real API before writing the rule), `get_eol_status()` (cache-first:
+  only hits endoflife.date if the product has never been cached at all).
+- **New scanner-family check** `_scan_eol` in `workers/scanner/coverage_worker.py`, wired into
+  `discovery_worker.py`'s existing `scanner_families` dispatch (`scan.scanner` queue, no new RabbitMQ
+  topology needed) alongside tls/dns/takeover/cloud/git_secrets. Unlike every other scanner-family check,
+  this makes **no requests to the scanned org's own infrastructure at all** — it cross-references the
+  `technologies` table already populated earlier in the scan against the (cached) EOL data. Persists
+  `eol_software` findings (severity `high` if EOL >365 days ago, `medium` otherwise) with the real
+  eol_date/latest_version in `proof`, reusing risk_engine.py's already-existing (previously dead)
+  `eol_software` → `PATCH_HYGIENE` category mapping — no risk_engine.py change needed.
+
+### A real bug caught by testing before deploying: `is_eol` computed wrong
+- Initial version set `is_eol = (eol_date is not None)` — wrong: a cycle can have a *future* eol_date
+  (e.g. PHP 8.3, eol 2027-12-31) and isn't EOL yet. Caught immediately by running the real lookup against
+  live data before wiring it into the scanner (PHP 8.3.28 came back `is_eol: True` with a 2027 date, plainly
+  wrong). Fixed by comparing `eol_date` against today's date, and — since this product's cycle list is
+  never re-fetched under the fetch-once design — recomputing `is_eol` from the stored `eol_date` at every
+  read rather than trusting a stored boolean that would otherwise go stale once a future eol_date arrives.
+
+### Verification
+- 24 new unit tests in `backend/tests/unit/test_eol_intel.py` (cycle normalization against real verified
+  API cases, `get_eol_status` cache-hit/cache-miss branching via a fake DB, the future-eol-date regression
+  above). `docker compose exec api pytest tests/unit -q --ignore=tests/unit/test_scan_pipeline_state.py` —
+  152 passed (was 128), 1 skipped, no regressions.
+- Ran the real `_scan_eol` check directly against all 3 previously-validated orgs (`pu.go.id`, `kpi.go.id`,
+  `pasarjaya.co.id`) — not a synthetic test. Found real EOL software: 14 findings on `pu.go.id` (Nginx
+  1.14/1.24, PHP 7.2/7.4, Drupal 7, OpenSSL 1.0.2k/1.1.1k, WordPress 6.8.2), 23 on `pasarjaya.co.id`
+  (mostly PHP 7.4.x, several OpenSSL 1.0.2k/1.1.1n/1.1.1p/3.1.3 instances), 0 on `kpi.go.id` (its detected
+  stack is genuinely current — correctly produced no false positives). Restarted `worker-scanner`/
+  `worker-discovery` (`workers/` is read-write bind-mounted, no image rebuild needed) so future real scans
+  pick this up automatically.
+- Triggered a fresh `risk.compute` for both affected orgs: `pasarjaya.co.id` dropped 56→48 (Patch Hygiene
+  wasn't already floored, so this is a real, consequential scoring change); `pu.go.id` stayed at 71 (Patch
+  Hygiene was already floored at F/0 from M14's KEV-boosted Zimbra criticals — more findings piling onto an
+  already-zeroed category doesn't move the number further, expected).
+- Confirmed visually in the real web UI (Playwright): Findings page shows "End-of-life software: PHP 7.4.33"
+  etc. with correct category/severity/asset and real "2 minutes ago" timestamps; Risk Scores page's Patch
+  Hygiene category correctly shows the combined finding count and updated grade.
+
+### Found but not fixed (out of scope for this pass, noted for later)
+- Nuclei already has its own generic `*-eol` templates (e.g. `php-eol`, seen live on `pasarjaya.co.id`'s
+  Findings page as "PHP End-of-Life - Detect") that detect end-of-life software via banner/response
+  fingerprinting independently of this new Technology-table cross-reference — and they fall through
+  `_map_category`'s keyword matching to the wrong default (`cors_misconfiguration`) since `"eol"` isn't one
+  of its keyword buckets. Two different EOL-detection paths now coexist for the same underlying condition
+  (not literally duplicate rows — different fingerprints — but redundant signal). Worth a follow-up to
+  either fix that template family's categorization or reconcile/dedupe against this new check.
+
+---
+
+## 2026-07-11 — Milestone 14: EPSS/KEV exploit-intel lookup silently broken by CVE-ID casing
+
+User asked why some findings still weren't showing a CVSS score / exploit-intel badge. `cvss_score` gaps
+turned out to be a genuine, separate upstream-data limitation (some nuclei templates just don't declare
+`classification.cvss-score` even when they reference a real CVE — no code fix available there). The
+exploit-intel (EPSS score / CISA KEV) gap was a real, high-impact bug.
+
+### Fixed: EPSS/KEV lookup was case-sensitive; almost every real CVE finding missed it
+- **File**: `backend/app/services/exploit_intel.py` (`get_exploit_intel`)
+- `exploit_intel.cve_id` is always canonical uppercase (straight from the EPSS/CISA KEV upstream feeds).
+  `Finding.cve_ids`, however, is usually **lowercase** — nuclei's own `classification.cve-id` template
+  metadata (the primary extraction path in `nuclei_worker.py`) uses lowercase, and only the secondary
+  fallback path (regex-matching the template filename when metadata is empty) uppercases. `get_exploit_intel`
+  did a plain case-sensitive `ExploitIntel.cve_id.in_(cve_ids)`, so any finding with a lowercase CVE ID
+  silently got no EPSS score and no KEV flag — not "missing data," a string-casing mismatch.
+  **12 of 15** real CVE-tagged findings platform-wide were affected. Confirmed via the live scans validated
+  in Milestones 12-13: the Zimbra "Unrestricted File Upload" finding (CVE-2022-41352, a *critical* finding
+  on both `pu.go.id` and `kpi.go.id`) is CISA KEV-listed with a 95.5th-percentile EPSS score, and the
+  Memcached Command Injection finding (CVE-2022-27924, `pu.go.id`) is KEV-listed **with confirmed
+  ransomware-campaign use** — neither fact was surfacing anywhere, despite the real intel already sitting
+  in the `exploit_intel` table.
+- Fixed by normalizing case inside the lookup itself (not by changing how `cve_ids` are stored) — no
+  backfill needed, since exploit intel is deliberately looked up live at read/scoring time, never frozen
+  onto a `Finding` row (EPSS shifts daily; see the module's own docstring). `get_exploit_intel` now queries
+  by uppercased CVE ID and maps the result back to every casing variant actually present in the caller's
+  input list, so all four call sites (`risk_worker.py`'s scoring pass, and `findings.py`'s list/detail/CSV
+  export endpoints) work unchanged.
+- Verified live through the real API (not just a unit test): `GET /findings/{id}` for the kpi.go.id Zimbra
+  finding now returns `epss_score: 0.95478`, `epss_percentile: 0.9986`, `is_kev: true` — all previously
+  `null`/`false`.
+
+### Verification
+- Added `TestGetExploitIntel` (4 cases: lowercase-vs-uppercase-row match, already-uppercase match, the
+  same CVE referenced with two different casings across findings, empty input) to
+  `backend/tests/unit/test_exploit_intel.py` — this file needs no `workers.*` import, so unlike the
+  scanner-worker tests it runs in the normal `api`-container regression suite.
+  `docker compose exec api pytest tests/unit -q --ignore=tests/unit/test_scan_pipeline_state.py` — 128
+  passed (was 124), 1 skipped, no regressions.
+- Restarted `api` and `worker-risk` (both import `risk_engine.py`/`exploit_intel.py` from the read-only-
+  mounted `backend/app`, cached in the running process) to apply the fix, then triggered a fresh
+  `risk.compute` for all 4 orgs with CVE-tagged findings. `pu.go.id`: 72→71 (small drop — the
+  now-correctly-applied KEV/ransomware boost outweighed the earlier miscategorization fix's small gain).
+  `kpi.go.id`/`pasarjaya.co.id`/ACME Corp: unchanged — `kpi.go.id`'s Patch Hygiene category was already
+  floored at grade F/0 from raw severity alone (the boost still matters for score-recovery resistance and
+  for the now-correct EPSS/KEV badges, just doesn't move an already-floored category further),
+  `pasarjaya.co.id`'s one CVE finding was already correctly-cased, and ACME Corp has no CVE findings at all.
+
+---
+
+## 2026-07-11 — Milestone 13: Second Live-Scan Validation (kpi.go.id) + risk category-map audit
+
+Follow-up validation of another real scan (`5218afce-ed64-4b9b-bab9-9ef5c23ecf88`, org `kpi.go.id`, `full`).
+Confirmed Milestone 12's two fixes hold under a second real scan: `takeover` phase completed cleanly
+(0 candidates this time — no CNAME matched a known provider, so it correctly short-circuited rather than
+crashing), and no `http-*` nuclei template was miscategorized. Findings/scan_findings/risk_scores counts
+all agreed at 95; 2 legitimate critical findings (Zimbra Collaboration unrestricted file upload,
+CVE-2022-41352, on both `webmail.kpi.go.id` and `mail.kpi.go.id`). What looked like duplicate findings on
+manual inspection (25× "HTTP Missing Security Headers" on one asset, etc.) were verified to be genuinely
+distinct `affected_url`s (25 different crawled endpoints) — not a dedup bug, same pattern confirmed in
+Milestone 12.
+
+### Fixed: 3 finding categories missing from risk_engine's scoring map entirely
+- **File**: `backend/app/services/risk_engine.py` (`FINDING_CATEGORY_MAP`)
+- Went looking for siblings of Milestone 12's `_map_category` bug by diffing every literal `category="..."`
+  string used across `workers/scanner/*.py` against this map's keys. Found three real gaps where a finding
+  category is produced by a scanner but was never added to the map — meaning any finding with that exact
+  category silently fell through to the generic `ScoreCategory.MISCONFIGURATION` default bucket instead of
+  its correct, more specific category:
+  - `dmarc_misconfiguration` (coverage_worker.py's DNS scanner — "DMARC policy is monitoring only, `p=none`")
+    → added as `ScoreCategory.DNS_HEALTH`, matching its sibling `missing_dmarc`. This one wasn't just
+    latent: it had already produced 1 real finding in this scan, previously being scored under the wrong
+    (5%-weighted) category instead of DNS Health's 10% weight.
+  - `tls_misconfiguration` (coverage_worker.py's TLS scanner — certificate hostname/SAN mismatch) → added
+    as `ScoreCategory.TLS_SECURITY`.
+  - `cloud_public_exposure` (coverage_worker.py's cloud scanner — publicly-readable discovered bucket) →
+    added as `ScoreCategory.EXPOSURE_MGMT`.
+  - The latter two are currently latent (zero findings of either category exist anywhere in the database
+    yet — neither check has fired on real data so far) but would have hit the exact same silent
+    miscategorization the moment either one did.
+- Recomputed `kpi.go.id`'s risk score after the fix (overall score unchanged at 70/C — a single low-severity
+  finding moving 5%→10% category weight wasn't enough to move the rounded total, but its DNS Health category
+  breakdown now correctly shows `finding_count: 12` including the DMARC finding, and Misconfiguration
+  correctly dropped to 5).
+
+### Fixed (incidental): stale test masked by the same api-container collection gap
+- **File**: `backend/tests/unit/test_scan_pipeline_state.py`
+- While re-verifying Milestone 12's test additions, ran the full file again and confirmed
+  `test_port_worker_uses_ip_address_id_for_ports` (flagged but not yet fixed in M12) is a stale assertion,
+  not a product bug: `port_worker.py::_persist_ip_assets`'s `assets` insert payload gained
+  ownership/scope-confidence fields at some point after the test was written, and the test's expected dict
+  was never updated. Updated the assertion to match the real, current payload. Added a module-level
+  docstring explaining why this file can't run through the standard `api`-container regression command and
+  how to actually exercise it (transient `pytest` install inside a worker container, since `workers/` isn't
+  importable in `api` and no worker container has `pytest` installed).
+
+### Verification
+- `docker compose exec api pytest tests/unit -q --ignore=tests/unit/test_scan_pipeline_state.py` — 124
+  passed, 1 skipped, no regressions.
+- Re-ran `test_scan_pipeline_state.py` directly (transient `pytest` inside `worker-nuclei`, same method as
+  Milestone 12): all 8 tests pass.
+- `backend/app` is read-only mounted into worker containers but the running process still caches the old
+  module in memory — restarted `worker-risk` and `api` (both import `risk_engine.py`) to pick up the
+  category-map fix for real, then triggered a fresh `risk.compute` for `kpi.go.id` and confirmed the
+  corrected breakdown via `psql`.
+
+---
+
+## 2026-07-10 — Milestone 12: End-to-End Scan Validation (2 real bugs found via a live scan)
+
+User ran a real `full` scan against `pu.go.id` through the web UI (scan `6a8ef245-6886-493a-b670-c31f4950daaf`)
+and asked for a full pipeline validation, start to finish. Every stage completed and all cross-table
+counts were internally consistent (findings/scan_findings/risk_scores.total_findings all agreed at 128;
+risk score computed_at matched scan completed_at to the second) — except one phase had failed outright,
+and one category looked suspicious on inspection. Both traced to real, previously-undiscovered bugs.
+
+### Fixed: subdomain takeover check crashes the instant it has real candidates to check
+- **File**: `workers/scanner/coverage_worker.py` (`_subzy_scan`)
+- The `takeover` phase showed `status: "failed"`, `last_error: "'NoneType' object is not iterable"`.
+  Reproduced directly against the real scan data: `subzy` is invoked with `--hide_fails`, and when zero
+  candidates come back vulnerable (the overwhelmingly common outcome), it writes the literal JSON `null`
+  to its output file instead of `[]`. `json.loads("null")` → Python `None`, and the subsequent `for record
+  in records:` crashes. Fixed with `records = json.loads(...) or []`.
+  Checked every other scan in the database's history: **8 of 9 prior "completed" takeover phases had
+  `targets_total: 0`** — no CNAME in any previously-scanned org happened to match a known
+  takeover-provider pattern, so `subzy` never actually ran with real input before. This `pu.go.id` scan
+  was the first time the phase had real candidates (224, one matching an AWS ELB CNAME) — and it crashed
+  immediately. The feature had never been exercised end-to-end with real data until this scan; it is now.
+
+### Fixed: nuclei `http-*` templates miscategorized as `exposed_admin_panel`, platform-wide
+- **File**: `workers/scanner/nuclei_worker.py` (`_map_category`)
+- Noticed while sanity-checking the category breakdown: "HTTP Missing Security Headers" (18× in this
+  scan) was tagged `exposed_admin_panel` instead of `missing_hsts`. Root cause: `_map_category()` had a
+  "check template ID prefix" loop matching `CATEGORY_MAP`'s keys (`http`, `dns`, `ssl`, `network`,
+  `misconfiguration`, `cve`, ...) against `template_id.startswith(prefix)`. Those keys model nuclei's tag
+  taxonomy, not a template-naming convention — but a large fraction of real nuclei template IDs happen to
+  literally start with `"http-"` (`http-missing-security-headers`, etc.), so they all got swallowed into
+  `CATEGORY_MAP["http"] = "exposed_admin_panel"` before the (correct, more specific) tag-matching and
+  keyword-matching logic below it ever ran. Removed the prefix loop; verified every previously-working
+  case (CVE templates via their real `"cve"` tag, IIS/misc templates via the existing keyword fallback)
+  still resolves correctly with it gone.
+  Quantified impact: **53 findings platform-wide** (18 in `pu.go.id`, 35 in `pasarjaya.co.id`) were
+  miscategorized this way, corrupting the Exposure Management vs. Web Security category-weight split in
+  those orgs' risk scores.
+
+### Backfilled: recategorized the 53 pre-existing miscategorized findings
+- Recomputed `category` for every `nuclei`-sourced finding in the database from its real `template_id` +
+  `tags` using the fixed `_map_category()` logic (not a hand-rolled query — the actual function, so only
+  rows that genuinely disagree with the corrected logic are touched). All 53 flipped from
+  `exposed_admin_panel` → `missing_hsts`, matching the manually-quantified count exactly. Confirmed scoped
+  across all organizations (not just `pu.go.id`) after finding the bug also affected `pasarjaya.co.id` —
+  scoping the backfill to only the org under investigation would have silently left that org's data wrong.
+- Triggered a fresh `risk.compute` for both affected orgs afterward so their currently-displayed risk
+  score/category breakdown reflects the corrected data immediately, instead of waiting for each org's next
+  scheduled scan. `pu.go.id`: 71→72 (Grade C, unchanged). `pasarjaya.co.id`: recomputed to 56 (Grade D).
+
+### Verification
+- Reproduced both bugs against real production data before fixing (standalone scripts run inside the
+  `worker-scanner`/`worker-nuclei` containers against the actual `pu.go.id` dataset), and re-ran the same
+  repro after the fix to confirm the crash/miscategorization is gone.
+- Added two unit tests to `backend/tests/unit/test_scan_pipeline_state.py` (`_map_category` no longer lets
+  the `http`/`dns`/`ssl`/etc. prefix shadow keyword matching; CVE-tagged templates still resolve to
+  `known_cve` via their tag). Note: this test file cannot be collected in the `api` container (`workers`
+  package isn't mounted there — pre-existing, already documented) or run via any worker container (no
+  `pytest` installed there) — verified instead by installing `pytest` transiently inside `worker-nuclei`
+  and running the file directly; both new tests pass. Incidentally found the pre-existing
+  `test_port_worker_uses_ip_address_id_for_ports` in the same file already fails independent of this
+  change — investigated as a follow-up (below).
+- `docker compose exec api pytest tests/unit -q --ignore=tests/unit/test_scan_pipeline_state.py` — 124
+  passed, 1 skipped, no regressions.
+- `workers/` is bind-mounted read-write into worker containers (unlike `backend/app`, which workers mount
+  read-only) — restarted `worker-scanner`/`worker-nuclei` (no image rebuild needed) to pick up both fixes
+  for real ongoing scans.
+
+### Follow-up: chased down every remaining loose end flagged above
+- **Fixed a stale test, not a product bug**: `test_port_worker_uses_ip_address_id_for_ports` asserted an
+  outdated, narrower shape for `port_worker.py::_persist_ip_assets`'s `assets` insert payload.
+  `_persist_ip_assets` had grown ownership/scope-confidence fields (`confidence`, `is_in_scope`,
+  `scope_status`, `ownership_confidence`, `ownership_reason`, `exposure_status`, `liveness_status`,
+  `validation_sources`, `last_verified_at`, a richer `metadata.validation`) at some point after this test
+  was written, and the mismatch was invisible because this test file can't be collected in the `api`
+  container (see new module-level note in the file) so it's never run in routine checks. Updated the
+  test's expected payload to match the real, current implementation — the production code was already
+  correct. Added a module-level docstring note explaining how to actually run this file (transient
+  `pytest` install inside a worker container) since there's currently no way to exercise it otherwise.
+- **Confirmed nuclei's 3 timed-out batches were benign, not data loss**: traced `_run_nuclei`'s timeout
+  path — on `asyncio.TimeoutError` it kills the subprocess but then calls `_parse_results_file()`, which
+  reads whatever nuclei had already streamed to its `-jsonl` output before being killed. The `0` raw/
+  persisted findings logged against the timed-out batches is the genuine partial-recovery count (that
+  specific batch of endpoints hadn't matched anything yet when the timeout fired), not evidence that
+  results were dropped. Working as designed.
+- **Checked nikto_worker.py's own `_map_category` for the same bug class**: it's structurally different
+  (pure substring matching against `description`/`url`, no shared prefix/tag dict), so it was never
+  exposed to the nuclei bug's failure mode. Left as-is — nikto is also confirmed dead code (no
+  `worker-nikto` service, nothing publishes `scan.nikto`), consistent with the Milestone 7 decision not to
+  invest further verification effort there.
+- **Cross-checked every category `_map_category` can now produce against `risk_engine.py`'s
+  `FINDING_CATEGORY_MAP`**: all of them (`known_cve`, `exposed_admin_panel`, `missing_hsts`,
+  `expired_certificate`, `cors_misconfiguration`, `missing_spf`, `subdomain_takeover`, `debug_endpoint`,
+  `exposed_git`, `exposed_service`, `default_credentials`, `exposed_api`, `outdated_software`) resolve to a
+  real `ScoreCategory` — no nuclei finding silently falls through to the ungraded default bucket.
+- Re-ran the full test file after the fix: all 8 tests pass (was 7/8). Re-ran
+  `docker compose exec api pytest tests/unit -q --ignore=tests/unit/test_scan_pipeline_state.py` — still
+  124 passed, 1 skipped, no regressions from the test-file edit.
+
+---
+
+## 2026-07-10 — Milestone 11: Dashboard Data Audit (9 clarity/data-wiring bugs)
+
+User asked for a frontend/dashboard audit — is the displayed data correct and clear, revamp if needed.
+A full page-by-page tour (Playwright) found the underlying data model and design were sound; every
+issue was a data-wiring or serialization bug, not a design problem, so no revamp was needed. All 9 fixed:
+
+### Fixed: Overview/Risk Scores KPIs reading from the wrong or missing fields
+- **Files**: `backend/app/api/v1/endpoints/scores.py`, `frontend/src/app/dashboard/page.tsx`,
+  `frontend/src/app/dashboard/risks/page.tsx`
+- `GET /scores` was missing `medium`/`low`/`info`/`total_findings` from its serialization entirely.
+  `GET /organizations/{id}`'s `total_findings` is a live-counted field sibling to `risk_score`, not
+  nested inside it — the Overview page was reading `score?.total_findings` (always undefined) instead
+  of `scoreData?.total_findings`. Both fixed; "Open Findings" and "Total Findings" now render real
+  numbers instead of "—".
+
+### Fixed: Category Breakdown rendering array indices ("0","1","2"...) instead of category names
+- **File**: `frontend/src/app/dashboard/risks/page.tsx`
+- `GET /scores/breakdown`'s real shape is `{breakdown: {category: {...}, ...}, factors: [...], overall,
+  grade}` — the frontend read a nonexistent `category_scores` key, fell back to `factors` (a sparse
+  array with no category name as its own key), and `Object.entries()` on an array yields numeric-string
+  indices. Fixed to read `breakdown.breakdown`; the existing `CATEGORY_LABELS` mapping needed no changes.
+
+### Fixed (clarity, not a bug): Assets list Technologies/HTTP/TLS Expiry blank for ~96% of rows
+- **File**: `frontend/src/app/dashboard/assets/page.tsx`
+- Verified via direct SQL cross-referencing `liveness_status` before changing anything: the blank cells
+  are legitimately unresolved/dns_only hosts that were never probed — every truly "alive" host already
+  had complete data. Not a backend sync bug. Added an explicit "Not resolved" / "No HTTP response" label
+  in place of a bare "—" so the distinction between "never probed" and "probed, nothing found" is visible.
+
+### Fixed: Attack Surface graph always showing "IPs: 0"
+- **File**: `frontend/src/app/dashboard/attack-surface/page.tsx`
+- The graph's asset fetch used `page_size=200` sorted by `last_seen desc`; IP-type assets are touched far
+  less often than subdomains (a port scan runs once vs. constant DNS/HTTP rechecks), so they consistently
+  sorted outside the window and were never fetched — not a rendering bug, just never present in the
+  dataset. Added a second targeted `asset_type=ip` fetch merged into the node set by ID.
+
+### Fixed: DNS Intel page never received the detailed fields it was designed to show
+- **File**: `backend/app/api/v1/endpoints/assets.py`
+- The frontend already called `/assets` expecting a richer `dns_records`/`security_headers`/
+  `redirect_chain`/`tls_info` payload via an `expand=dns` contract that was never implemented
+  server-side — `_asset_to_dict()`'s existing `detailed=True` gate was correct but never triggered by
+  the list endpoint. Added the `expand` query param and wired it through.
+
+### Fixed: TLS Issuer/Version columns always empty
+- **File**: `workers/scanner/discovery_worker.py`
+- Existing code read `tls.get("issuer", {}).get("organization", "")` and `tls.get("version", "")` —
+  neither key exists in httpx's real `-tls-grab -json` output, confirmed by running httpx directly
+  inside the worker container against a live target rather than assuming the schema. Real fields are
+  flat: `issuer_org` (array), `issuer_cn`, `issuer_dn`, `tls_version`. Fixed accordingly. Forward-fixing
+  only — raw TLS JSON was never historically persisted, so there's nothing to backfill.
+
+### Fixed: Network Intelligence table showed only Source + permanently-empty Risk Score/Tags/Categories
+- **Files**: `backend/app/api/v1/endpoints/intel.py`, `frontend/src/app/dashboard/intel/page.tsx`
+- `risk_score`/`tags`/`categories` are structurally always null/empty for the no-key `network_baseline`
+  enrichment (see CLAUDE.md's documented no-paid-API-keys decision) — the table's only non-empty content
+  was the `source` label, for all 26 rows. The actually-populated data (ASN/ISP/BGP prefix/cloud
+  provider/CDN/hosting flags) sat unrendered inside the `data` JSONB column, which the `/intel` endpoint
+  didn't even serialize into the API response. Added `data`, `categories`, `asset_id`, `asset_value` to
+  the endpoint response; rebuilt the table around Asset/Source/ASN-ISP/BGP-Prefix/Cloud-Hosting columns,
+  keeping Risk as a compact fallback column for whenever a real-scored intel source is added later.
+
+### Fixed: Reports page overstated Compliance/Custom report capability
+- **File**: `frontend/src/app/dashboard/reports/page.tsx`
+- Card copy claimed "PCI-DSS, SOC2, ISO 27001 mapping" and "select specific sections" — per
+  `report_service.py::DETAILED_REPORT_TYPES`, both are undocumented aliases of the technical report with
+  no real framework-mapping or section-picker logic. Reworded to state the actual behavior (full findings
+  list, same detail as Technical) rather than fabricated capability, matching Milestone 5's earlier
+  "Threat Intelligence" → "Network Intelligence" honesty-over-cosmetics precedent.
+
+### Verification
+- `npx tsc --noEmit` clean on every touched frontend file.
+- `docker compose exec api pytest tests/unit -q --ignore=tests/unit/test_scan_pipeline_state.py` — 124
+  passed, 1 skipped, no regressions.
+- Rebuilt and redeployed the `frontend` container (production build, no dev volume mount — code changes
+  don't take effect without this) and restarted `api` (mounted read-write but no `--reload`, so the
+  `/intel` serialization change needed a restart too).
+- Re-toured all 7 affected pages via Playwright post-deploy against real seeded data
+  (`pasarjaya.co.id`, 866 assets): confirmed Open Findings=173 and Category Breakdown showing real
+  category names on Overview/Risk Scores, IPs=26 on the Attack Surface graph, "Not resolved"/"No HTTP
+  response" labels and populated DNS/TLS data on Assets/DNS Intel/TLS pages, real ASN/ISP/BGP
+  prefix/GCP+Hosting badges on Network Intel, and corrected copy on Reports.
+
+---
+
+## 2026-07-10 — Milestone 10: Tool Parameter Tuning (+ a pre-existing "quick" scan bug found while tracing it)
+
+User asked for a fine-tuning pass over the actual CLI parameters of already-integrated tools (not new
+tools) for the `deep_authorized` profile, benchmarked loosely against what a mature commercial ASM
+product would tune for. Four concrete targets identified from reading every tool invocation in the
+worker codebase:
+
+### Fixed: katana crawl depth was too shallow to ever trigger known-files discovery
+- **File**: `backend/app/services/scan_service.py` (`DEFAULT_SCAN_CONFIG["full"]["crawl_depth"]`)
+- `web_crawl_worker.py::_run_katana` only passes `-kf all` (known-files discovery: robots.txt,
+  sitemap.xml, etc. — a cheap, high-signal endpoint source) when `crawl_depth >= 3`. The `full`/`vuln`
+  scan types (which resolve to the `deep_authorized` profile, the platform's "thorough" option) were
+  only ever getting `crawl_depth=2`, so this profile never actually got known-files discovery. Raised to
+  3 (within `CONFIG_LIMITS["crawl_depth"]`'s existing 1-4 range).
+
+### Fixed: nuclei concurrency/bulk-size were well below nuclei's own defaults for the "deep" profile
+- **Files**: `backend/app/services/scan_service.py` (`DEFAULT_SCAN_CONFIG["full"]`/`["vuln"]`),
+  `backend/app/services/scan_profiles.py` (`SCAN_PROFILES["deep_authorized"]`, kept in sync)
+- Both were hardcoded to 6 (host-parallelism-per-template and template-parallelism, respectively) —
+  nuclei's own built-in defaults are 25/25. Raised to 20, the ceiling `CONFIG_LIMITS` already enforces
+  (didn't raise the ceiling itself — that's a separate, more consequential call affecting every profile
+  including `safe`, not in scope here). The actual protection against overwhelming a target is the
+  separate per-second `-rate-limit` flag, not these two — so this mainly buys back scan wall-clock time
+  without changing how aggressively any single target gets hit per second.
+
+### Fixed: nmap `--version-light` was hardcoded on even for the authorized/deep profile
+- **Files**: `workers/scanner/coverage_worker.py` (`_nmap_enrich_services`), `backend/app/services/scan_profiles.py`
+- `--version-light` skips nmap's more thorough version-detection probes for speed. This only ever runs
+  against a small, already-bounded set of discovered ports (`service_fingerprint_max_targets`, capped at
+  50, each with its own 45s timeout) — the accuracy trade is worth it specifically for `deep_authorized`,
+  since more precise service/version fingerprinting feeds directly into Patch Hygiene risk scoring. Made
+  the flag conditional on a new `nmap_use_version_light` config key (default `True`, matching prior
+  behavior for every other profile; `deep_authorized` sets it `False`). Named
+  `nmap_use_version_light` rather than `nmap_version_light` to avoid colliding with the existing
+  per-service dict key of that name (`coverage_worker.py` already uses `item["nmap_version_light"]` to
+  store nmap's raw output text — same word, different thing, would have been a confusing shadow).
+
+### Fixed: subfinder's own default cuts off passive-source enumeration early for a thorough scan
+- **File**: `backend/app/services/scan_profiles.py`
+- subfinder's own `-max-time` default (10 minutes) was left as-is even for `deep_authorized`. Raised to
+  15 for this profile specifically via a new `subfinder_max_time` config key (previously unset anywhere
+  in the config chain, so this was a clean addition with no competing layer to fix).
+
+### Found and fixed while tracing the above: `DEFAULT_SCAN_POLICY` was silently overriding "quick" scans' own tuning
+- **File**: `backend/app/services/scan_service.py`
+- While verifying the `crawl_depth` and `concurrency`/`bulk_size` changes would actually reach a real
+  scan (the established "trace every layer" discipline from Milestones 6-9), found that
+  `DEFAULT_SCAN_POLICY["crawl"]["depth"]=2` and `DEFAULT_SCAN_POLICY["rate_limits"]["nuclei_concurrency"/
+  "nuclei_bulk_size"]=6` are **scan-type-agnostic** — `_policy_to_config()`'s output is merged in *after*
+  `DEFAULT_SCAN_CONFIG[scan_type]` in `create_and_queue()`, so it always wins regardless of scan type.
+  This meant `"quick"` scans (meant to be fast: `crawl_depth=1`, `concurrency=15`, `bulk_size=15` in
+  `DEFAULT_SCAN_CONFIG["quick"]`) were **already** silently getting `crawl_depth=2`, `concurrency=6`,
+  `bulk_size=6` instead — a real, previously-undiscovered bug, independent of anything asked for in this
+  pass, that would have gotten *worse* had `DEFAULT_SCAN_POLICY`'s values simply been raised in place to
+  match the new `deep_authorized` tuning (quick scans would have inherited `crawl_depth=3`/`concurrency=20`
+  too). Fixed the same way as Milestone 7's `fuzz` key: removed the offending keys from
+  `DEFAULT_SCAN_POLICY` entirely (documented why) so each scan type's own `DEFAULT_SCAN_CONFIG` value
+  flows through unclobbered, then raised `deep_authorized`'s values in the one place that's actually
+  scan-type-scoped.
+
+### Verification
+- `docker compose exec api pytest tests/unit -q` — 124 passed, 1 skipped (pre-existing, unrelated), no
+  regressions.
+- Created two real scans through the actual API (not isolated function calls) — one `full`, one `quick`
+  — and inspected persisted `scans.config`: `full` now shows `crawl_depth=3, concurrency=20, bulk_size=20,
+  nmap_use_version_light=false, subfinder_max_time=15`; `quick` now correctly shows its own
+  `crawl_depth=1, concurrency=15, bulk_size=15` for the first time (previously silently 2/6/6 due to the
+  bug above).
+
+---
+
+## 2026-07-10 — Milestone 9: Finding Content Freezes on Rescan (and a live nuclei cve_ids bug found via UI QA)
+
+Direct follow-up to Milestone 7's A1 fix and to a bug the *frontend* verification pass for Milestone 8
+surfaced live (see below) — both point at the same underlying gap.
+
+### Fixed: Finding content (severity, proof, cve_ids, evidence, ...) never refreshed on rescan
+- **Files**: `workers/scanner/scanner_common.py` (new `content_refresh_updates()`),
+  `workers/scanner/nuclei_worker.py`, `workers/scanner/nikto_worker.py`
+- Milestone 7's `status_preserving_conflict_updates()` correctly protects triage fields
+  (`status`/`is_risk_accepted`/`resolved_at`) on a Finding upsert — but every *other* column was left
+  completely out of the `ON CONFLICT DO UPDATE SET` clause for `nuclei_worker.py`/`nikto_worker.py`,
+  meaning Postgres left them untouched. In practice: a finding's `severity`, `proof` (which is where
+  Milestone 7's confidence score and Milestone 8's EPSS/KEV lookups live), `cve_ids`, `cvss_score`,
+  `evidence`, `request_raw`/`response_raw`, `title`, `description`, `remediation`, and `references` all
+  froze at whatever they were the *first* time a finding was ever persisted — even though every
+  subsequent rescan re-parses genuinely current values for all of them. This silently starved the
+  Milestone 7/8 work of any value for **recurring** findings (the majority of findings in any repeat-scan
+  deployment), which is exactly what an unrelated frontend verification pass for Milestone 8 just
+  caught live (below).
+- Added `content_refresh_updates(stmt, fields)` in `scanner_common.py`: builds SET-clause fragments from
+  the attempted-insert row (`stmt.excluded.<column>`) for a caller-specified list of mutable content
+  fields, layered on top of (not replacing) `status_preserving_conflict_updates()`. Wired into all three
+  upsert call sites: `scanner_common.py::persist_findings` (extended its existing partial
+  severity/proof/evidence refresh to also cover title/description/category/subcategory/affected_url/
+  remediation/references), `nuclei_worker.py::_persist_findings` and `nikto_worker.py::_persist_findings`
+  (had *no* content refresh at all — added title/description/severity/category/cve_ids/cvss_score/
+  affected_url/evidence/request_raw/response_raw/proof/remediation/references). `nikto_worker.py` is
+  still dead/unwired code (no consumer, per Milestone 7's note) — fixed anyway, same reasoning as before.
+- Deliberately **not** included in the refresh set: `template_id` (part of the fingerprint itself — can
+  never actually differ between two rows that conflict on the same fingerprint, so refreshing it would
+  be a no-op) and every triage-owned field (`is_false_positive`, `false_positive_reason`,
+  `risk_acceptance_reason`, `risk_accepted_until` — these were never in any upsert's SET clause at all,
+  so they were already implicitly protected; confirmed, not just assumed).
+- **Verified against real Postgres** (not just the isolated helper): 2 new tests in
+  `workers/tests/test_finding_upsert_integration.py` — `test_content_refreshes_on_rescan` (persist a
+  finding at severity=low/proof.confidence=unknown, re-persist the same fingerprint at severity=critical/
+  proof.confidence=high, confirm the row now shows the *new* values) and
+  `test_content_refresh_does_not_override_protected_status` (mark a finding false_positive, re-persist
+  with a corrected severity, confirm severity updates **and** status stays false_positive — the two
+  behaviors have to compose correctly, not just each work in isolation). Re-ran all 4 of Milestone 7's
+  original upsert tests too — still passing, confirming the content-refresh addition didn't reintroduce
+  the status-reset bug it was built to avoid.
+
+### Found via frontend visual QA (Milestone 8's Playwright setup) and fixed: nuclei sometimes never populates `cve_ids` at all
+- **File**: `workers/scanner/nuclei_worker.py` (new `CVE_ID_PATTERN` fallback in `_parse_finding`)
+- Set up a real headless-browser verification pass for the Milestone 7/8 frontend badges (see below) and
+  immediately found a live example: a finding titled "React Server Components - Denial of Service" with
+  `template_id: "CVE-2025-55184"` — the template's own ID *is* the CVE number — had `cve_ids: []` in the
+  database. Nuclei's own `info.classification.cve-id` metadata field was simply never populated by this
+  particular template's author, and `_parse_finding` only ever read from that structured field. Meanwhile
+  `_map_category()`'s cruder `if "cve" in template_lower` keyword check correctly classified it as
+  `known_cve` — the two code paths disagreed, and the more important one (the one Milestone 7 confidence
+  scoring and Milestone 8 EPSS/KEV lookups actually key off) lost. Added a regex fallback
+  (`CVE-\d{4}-\d{4,}`, case-insensitive) against `template_id` and the template's `name` field, used only
+  when nuclei's own classification metadata came back empty.
+- This fix alone doesn't retroactively repair already-persisted findings (upserts didn't refresh
+  `cve_ids` until the fix directly above landed in this same milestone) — did a one-time, user-approved,
+  narrowly-scoped `UPDATE` backfilling `cve_ids` for existing findings in the test org whose `template_id`
+  matches the CVE pattern but whose `cve_ids` was empty (1 row). Going forward, both fixes in this
+  milestone compose: new/corrected CVE IDs get extracted *and* actually stick on rescan.
+
+### Added: frontend surfacing for Milestone 7 confidence + Milestone 8 EPSS/KEV, with real screenshot verification
+- **Files**: `frontend/src/types/index.ts`, `frontend/src/components/ui/SeverityBadge.tsx` (new
+  `KEVBadge`, `EPSSBadge`, `ConfidenceIndicator`), `frontend/src/app/dashboard/findings/page.tsx`,
+  `frontend/src/components/modals/FindingDetailModal.tsx`
+- Both milestones' data was reaching the API with no UI to render it — added a pulsing red "Actively
+  Exploited" (KEV) badge inline on the finding title (a "· Ransomware" variant when
+  `kev_known_ransomware`), an EPSS percentage badge (only shown for scores > 0, orange when ≥ 50%), a
+  compact confidence dot+label (only for "high"/"low" — "unknown" is the majority case and would just be
+  table noise), and an "EPSS Percentile"/"Match Confidence" tile in the finding detail modal.
+- **This deployment's frontend is a production Next.js build** (`docker-compose.yml`'s `frontend`
+  service: `target: production`, no source volume mount) — needed `docker compose build frontend` +
+  `docker compose up -d --no-deps frontend` to actually deploy, not the restart-only pattern that works
+  for the bind-mounted workers/api.
+- **Set up real browser-based visual verification for this session** (previously not possible — no
+  browser/screenshot tool was available): installed Playwright + Chromium in a scratch directory,
+  scripted a real login → navigate → screenshot flow against the live app. This is what caught the
+  `cve_ids` gap above — a `grep`-level check of the compiled bundle had confirmed the *code* shipped
+  correctly, but only an actual rendered screenshot revealed the badges had no real data to attach to
+  for this org's findings. After both fixes above (parsing fallback + backfill), re-ran the same
+  screenshot and confirmed the EPSS badge, CVE badge, and EPSS Percentile tile all render correctly on
+  both the findings list and the detail modal.
+
+### Verification
+- `docker compose exec api pytest tests/unit -q` — 124 passed, 1 skipped (pre-existing, unrelated), no
+  regressions.
+- `workers/tests/test_finding_upsert_integration.py` — 6/6 passing individually (4 from Milestone 7 +
+  2 new for this milestone).
+- Real screenshots (list view + detail modal) confirmed the fix end-to-end: EPSS badge and percentile
+  now visible for a finding whose `cve_ids` was previously empty due to the nuclei parsing gap.
+
+---
+
 ## 2026-07-10 — Milestone 8: Exploit Intelligence (EPSS + CISA KEV)
 
 User asked for the risk-scoring data to be "richer from an attack-surface perspective" — specifically,

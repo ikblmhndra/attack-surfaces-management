@@ -1,5 +1,12 @@
 """
 Unit tests for scan lifecycle and port persistence safety.
+
+NOTE: this file imports from `workers.*`, which isn't mounted into the `api`
+container (only `backend/app` is) — it fails to collect there, so it's excluded
+from the standard `pytest tests/unit --ignore=tests/unit/test_scan_pipeline_state.py`
+regression command and doesn't run in routine CI-style checks. No worker container
+has pytest installed either. Run it by installing pytest transiently inside a
+worker container (e.g. `worker-nuclei`) and pointing it at a copy of this file.
 """
 import sys
 from pathlib import Path
@@ -146,6 +153,10 @@ async def test_port_worker_uses_ip_address_id_for_ports(monkeypatch):
         ip_ids=ip_ids,
     )
 
+    # Full expected payload — kept in sync with port_worker.py::_persist_ip_assets's
+    # asset_values dict, which grew ownership/scope-confidence fields after this test
+    # was first written; the mismatch was invisible because this file can't be
+    # collected in the api container (see module-level note) so it never ran in CI.
     assert ("assets", {
         "org_id": "org-1",
         "workspace_id": "ws-1",
@@ -153,8 +164,23 @@ async def test_port_worker_uses_ip_address_id_for_ports(monkeypatch):
         "value": "192.0.2.10",
         "status": "active",
         "discovery_method": "dns_resolution",
+        "confidence": 0.65,
+        "is_in_scope": True,
+        "scope_status": "probable",
+        "ownership_confidence": 0.65,
+        "ownership_reason": "resolved from validated in-scope host",
+        "exposure_status": "exposed",
+        "liveness_status": "alive",
+        "validation_sources": calls[0][1]["validation_sources"],
+        "last_verified_at": calls[0][1]["last_verified_at"],
         "last_seen": calls[0][1]["last_seen"],
-        "metadata": {"source": "port_worker"},
+        "metadata": {
+            "source": "port_worker",
+            "validation": {
+                "method": "dns_resolution_port_scan",
+                "reasons": ["resolved_from_validated_host", "port_scan_target"],
+            },
+        },
     }) in calls
     assert ("ip_addresses", {
         "asset_id": "asset-id",
@@ -186,3 +212,25 @@ def test_nuclei_tech_tags_are_curated():
         "nextjs",
         "react",
     }
+
+
+def test_map_category_does_not_let_http_prefix_shadow_keyword_match():
+    # Regression: CATEGORY_MAP's "http" key models nuclei's tag taxonomy, not a
+    # template-ID prefix. "http-missing-security-headers" (and every other
+    # http-*/dns-*/ssl-*/network-*/misconfiguration-* template ID) used to get
+    # swallowed into CATEGORY_MAP["http"]="exposed_admin_panel" before the more
+    # specific keyword matching below it ever ran.
+    worker = NucleiWorker()
+
+    assert worker._map_category(
+        "http-missing-security-headers", ["misconfig", "headers", "generic", "vuln"]
+    ) == "missing_hsts"
+    assert worker._map_category("iis-shortname-detect", ["iis", "edb", "vuln"]) == "cors_misconfiguration"
+
+
+def test_map_category_still_resolves_known_cve_via_tag():
+    worker = NucleiWorker()
+
+    assert worker._map_category(
+        "CVE-2025-55184", ["cve", "cve2025", "react", "nextjs", "vuln", "vkev"]
+    ) == "known_cve"

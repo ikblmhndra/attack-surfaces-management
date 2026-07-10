@@ -70,6 +70,24 @@ def status_preserving_conflict_updates(now: datetime) -> Dict[str, Any]:
     }
 
 
+def content_refresh_updates(stmt, fields: Iterable[str]) -> Dict[str, Any]:
+    """SET-clause fragments that refresh a Finding's mutable *content* on
+    rediscovery, sourced from the attempted-insert row (`stmt.excluded`).
+
+    status_preserving_conflict_updates() only protects triage fields
+    (status/is_risk_accepted/resolved_at) — every other column was left
+    completely untouched on conflict, freezing severity/proof/cve_ids/evidence/
+    etc. at whatever they were the first time a finding was ever seen. In
+    practice this meant a rediscovered finding kept stale confidence/EPSS/KEV
+    data forever (see CHANGELOG.md) even though a fresh scan re-parsed
+    genuinely current values for it. Only pass field names that are actually
+    present in the caller's own `.values()` call — `stmt.excluded.<col>`
+    resolves to that column's table default (not "leave unchanged") for any
+    column the INSERT didn't explicitly set.
+    """
+    return {field: getattr(stmt.excluded, field) for field in fields}
+
+
 def make_finding(
     *,
     org_id: str,
@@ -163,9 +181,10 @@ async def persist_findings(db, scan_id: str, findings: Iterable[Dict[str, Any]])
             index_elements=["fingerprint", "org_id"],
             set_={
                 **status_preserving_conflict_updates(now),
-                "severity": values["severity"],
-                "proof": values["proof"],
-                "evidence": values["evidence"],
+                **content_refresh_updates(stmt, [
+                    "title", "description", "severity", "category", "subcategory",
+                    "affected_url", "evidence", "proof", "remediation", "references",
+                ]),
             },
         ).returning(Finding.__table__.c.id, Finding.__table__.c.first_seen)
         row = (await db.execute(stmt)).fetchone()

@@ -24,13 +24,23 @@ export default function AttackSurfacePage() {
     queryFn: async () => {
       if (!activeOrg?.id) return { nodes: [], edges: [] };
 
-      // Fetch top assets and their relationships
-      const [assetsResp, findingsResp] = await Promise.all([
+      // Fetch top assets and their relationships. IP-type assets are fetched
+      // separately and merged in: they're touched far less often than
+      // subdomains (a port scan runs once, DNS/HTTP rechecks on subdomains run
+      // constantly), so sorted by last_seen desc they consistently rank
+      // outside the general page_size=200 window and would otherwise never
+      // appear on the graph at all — not a rendering bug, just never fetched.
+      const [assetsResp, ipsResp, findingsResp] = await Promise.all([
         apiClient.get(`/assets?org_id=${activeOrg.id}&page_size=200&status=active`),
+        apiClient.get(`/assets?org_id=${activeOrg.id}&asset_type=ip&page_size=200&status=active`),
         apiClient.get(`/findings?org_id=${activeOrg.id}&status=open&page_size=100`),
       ]);
 
-      const assets = assetsResp.data.items || [];
+      const assetsById = new Map<string, any>();
+      for (const asset of [...(assetsResp.data.items || []), ...(ipsResp.data.items || [])]) {
+        assetsById.set(asset.id, asset);
+      }
+      const assets = Array.from(assetsById.values());
       const findings = findingsResp.data.items || [];
 
       // Build graph nodes

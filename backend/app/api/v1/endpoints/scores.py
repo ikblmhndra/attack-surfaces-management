@@ -20,6 +20,8 @@ async def list_scores(org_id: Optional[UUID] = Query(None),
     scores = (await db.execute(query)).scalars().all()
     return {"items": [{"id": str(s.id), "org_id": str(s.org_id), "overall_score": s.overall_score,
                        "grade": s.grade, "critical": s.critical_count, "high": s.high_count,
+                       "medium": s.medium_count, "low": s.low_count, "info": s.info_count,
+                       "total_findings": s.total_findings,
                        "total_assets": s.total_assets, "computed_at": s.computed_at.isoformat()} for s in scores]}
 
 @router.get("/history")

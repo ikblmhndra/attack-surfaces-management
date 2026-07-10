@@ -992,10 +992,16 @@ class NucleiWorker(BaseWorker):
         """Map nuclei template to platform finding category."""
         template_lower = template_id.lower()
 
-        # Check template ID prefix
-        for prefix, category in CATEGORY_MAP.items():
-            if template_lower.startswith(prefix):
-                return category
+        # NOTE: previously also matched CATEGORY_MAP's keys as template_id
+        # *prefixes* (e.g. "http", "dns", "ssl", "network", "misconfiguration").
+        # Those keys are nuclei tag names, not template-naming convention — but a
+        # huge fraction of real template IDs literally start with "http-"
+        # (http-missing-security-headers, etc.), so that prefix check hijacked
+        # them all into "exposed_admin_panel" before the tags/keyword matching
+        # below ever got a chance. Removed; tags + keyword matching already
+        # cover every CATEGORY_MAP key correctly (verified against real template
+        # tags: cve-tagged templates carry a literal "cve" tag, ssl/tls templates
+        # match the "ssl"/"tls"/"cert" keyword check, etc).
 
         # Check tags
         for tag in tags:
@@ -1036,7 +1042,7 @@ class NucleiWorker(BaseWorker):
         """Upsert findings, return list of persisted finding IDs."""
         from sqlalchemy.dialects.postgresql import insert as pg_insert
         from workers.db_models import Asset, Finding, ScanFinding
-        from workers.scanner.scanner_common import status_preserving_conflict_updates
+        from workers.scanner.scanner_common import content_refresh_updates, status_preserving_conflict_updates
 
         persisted_ids = []
         now = datetime.now(timezone.utc)
@@ -1079,7 +1085,14 @@ class NucleiWorker(BaseWorker):
             stmt = pg_insert(Finding.__table__).values(**values, first_seen=now)
             stmt = stmt.on_conflict_do_update(
                 index_elements=["fingerprint", "org_id"],
-                set_=status_preserving_conflict_updates(now),
+                set_={
+                    **status_preserving_conflict_updates(now),
+                    **content_refresh_updates(stmt, [
+                        "title", "description", "severity", "category",
+                        "cve_ids", "cvss_score", "affected_url", "evidence",
+                        "request_raw", "response_raw", "proof", "remediation", "references",
+                    ]),
+                },
             ).returning(Finding.__table__.c.id, Finding.__table__.c.first_seen)
 
             result = await db.execute(stmt)

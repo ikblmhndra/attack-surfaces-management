@@ -167,8 +167,12 @@ SCAN_PROFILES: Dict[str, Dict[str, Any]] = {
         "ports": "top-1000",
         "scan_timeout": 900,
         "template_timeout": 8,
-        "concurrency": 6,
-        "bulk_size": 6,
+        # Kept in sync with scan_service.py's DEFAULT_SCAN_CONFIG["full"/"vuln"]
+        # (that dict is what "incoming" actually resolves to in practice — see
+        # its comments — but keeping this profile's own value correct too
+        # avoids this file silently documenting a stale intent).
+        "concurrency": 20,
+        "bulk_size": 20,
         "nuclei_batch_size": 8,
         "crawl_nuclei_max_targets": 25,
         # See "default" profile above — same fix, same reasoning.
@@ -188,6 +192,19 @@ SCAN_PROFILES: Dict[str, Dict[str, Any]] = {
         # further.
         "js_analysis_enabled": True,
         "js_analysis_max_files": 50,
+        # nmap's --version-light flag skips more thorough version-detection
+        # probes for speed; this profile only nmaps a small, already-bounded
+        # set of discovered ports (service_fingerprint_max_targets), so the
+        # accuracy trade is worth it for the authorized/deep profile
+        # specifically — full -sV feeds directly into Patch Hygiene risk
+        # scoring. (Named nmap_use_version_light, not nmap_version_light —
+        # that name is already used for the per-service dict key storing
+        # nmap's raw output text in coverage_worker.py.)
+        "nmap_use_version_light": False,
+        # subfinder's own default (10 min) cuts passive-source enumeration off
+        # before slower sources (e.g. certificate-transparency-adjacent APIs)
+        # finish returning for a thorough scan.
+        "subfinder_max_time": 15,
     },
     "endpoint": {
         "scan_profile": "endpoint",

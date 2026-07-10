@@ -238,6 +238,14 @@ function AssetRow({ asset, onClick }: { asset: any; onClick: (a: any) => void })
   const cfg = ASSET_TYPE_CONFIG[asset.asset_type as keyof typeof ASSET_TYPE_CONFIG];
   const Icon = cfg?.icon || Globe;
 
+  // Technologies/HTTP/TLS are only ever gathered by probing a live host — for
+  // unresolved/dns-only assets (the majority in a typical org) there's
+  // structurally nothing to show, which looks identical to "probed, nothing
+  // found" as a bare "—". Distinguish the two so empty doesn't read as broken.
+  const notReachable = asset.liveness_status === "unresolved";
+  const dnsOnlyNoHttp = asset.liveness_status === "dns_only";
+  const unreachableLabel = notReachable ? "Not resolved" : dnsOnlyNoHttp ? "No HTTP response" : null;
+
   // TLS expiry color
   const tls = sub?.tls_expiry;
   let tlsColor = "text-muted-foreground";
@@ -277,20 +285,26 @@ function AssetRow({ asset, onClick }: { asset: any; onClick: (a: any) => void })
       </td>
       <td><StatusBadge status={asset.status} /></td>
       <td>
-        <div className="flex flex-wrap gap-1 max-w-[180px]">
-          {(sub?.technologies || []).slice(0, 3).map((t: string) => (
-            <span key={t} className="text-xs bg-surface-700 text-muted-foreground px-1.5 py-0.5 rounded truncate max-w-[80px]">{t}</span>
-          ))}
-          {(sub?.technologies || []).length > 3 && (
-            <span className="text-xs text-muted-foreground">+{sub.technologies.length - 3}</span>
-          )}
-        </div>
+        {(sub?.technologies || []).length > 0 ? (
+          <div className="flex flex-wrap gap-1 max-w-[180px]">
+            {sub.technologies.slice(0, 3).map((t: string) => (
+              <span key={t} className="text-xs bg-surface-700 text-muted-foreground px-1.5 py-0.5 rounded truncate max-w-[80px]">{t}</span>
+            ))}
+            {sub.technologies.length > 3 && (
+              <span className="text-xs text-muted-foreground">+{sub.technologies.length - 3}</span>
+            )}
+          </div>
+        ) : unreachableLabel ? (
+          <span className="text-xs text-muted-foreground/60 italic">{unreachableLabel}</span>
+        ) : <span className="text-xs text-muted-foreground">—</span>}
       </td>
       <td>
         {sub?.http_status ? (
           <HttpStatusBadge status={sub.http_status} statusClass={sub.http_status_class} />
         ) : ip?.open_ports_count ? (
           <span className="text-xs text-muted-foreground">{ip.open_ports_count} ports</span>
+        ) : unreachableLabel ? (
+          <span className="text-xs text-muted-foreground/60 italic">{unreachableLabel}</span>
         ) : <span className="text-xs text-muted-foreground">—</span>}
       </td>
       <td>
@@ -298,6 +312,8 @@ function AssetRow({ asset, onClick }: { asset: any; onClick: (a: any) => void })
           <span className={cn("text-xs font-mono flex items-center gap-1", tlsColor)}>
             <Lock className="w-3 h-3" />{tlsLabel}
           </span>
+        ) : unreachableLabel ? (
+          <span className="text-xs text-muted-foreground/60 italic">{unreachableLabel}</span>
         ) : <span className="text-xs text-muted-foreground">—</span>}
       </td>
       <td>

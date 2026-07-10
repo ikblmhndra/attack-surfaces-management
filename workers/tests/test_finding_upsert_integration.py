@@ -199,3 +199,86 @@ async def test_resolved_finding_reopens_on_rescan(test_asset):
     finding = await _get_finding(finding_dict["fingerprint"])
     assert finding.status == "open"
     assert finding.resolved_at is None
+
+
+@pytest.mark.asyncio
+async def test_content_refreshes_on_rescan(test_asset):
+    """Follow-up fix: status_preserving_conflict_updates() only ever protected
+    triage fields — severity/proof/evidence/cve_ids were left completely
+    frozen at whatever they were the first time a finding was persisted, even
+    though a rescan re-parses genuinely current values (confidence, EPSS/KEV
+    lookups, an updated severity). content_refresh_updates() must actually
+    apply the new values on a rediscovery, not just preserve the old ones."""
+    workspace_id = test_asset["workspace_id"]
+    check_id = "m7_content_refresh_test"
+
+    first_pass = make_finding(
+        org_id=ORG_ID, workspace_id=workspace_id, scanner="test", check_id=check_id,
+        target=TEST_TARGET, title="Old title", severity="low", category="open_port",
+        description="stale description", evidence="stale evidence",
+        proof={"confidence": "unknown"},
+    )
+    async with get_session() as db:
+        await persist_findings(db, test_asset["scan_id_1"], [first_pass])
+        await db.commit()
+
+    finding = await _get_finding(first_pass["fingerprint"])
+    assert finding.severity == "low"
+    assert finding.proof.get("confidence") == "unknown"
+
+    second_pass = make_finding(
+        org_id=ORG_ID, workspace_id=workspace_id, scanner="test", check_id=check_id,
+        target=TEST_TARGET, title="Updated title", severity="critical", category="open_port",
+        description="fresh description", evidence="fresh evidence",
+        proof={"confidence": "high"},
+    )
+    async with get_session() as db:
+        await persist_findings(db, test_asset["scan_id_2"], [second_pass])
+        await db.commit()
+
+    finding = await _get_finding(first_pass["fingerprint"])
+    assert finding.severity == "critical"
+    assert finding.title == "Updated title"
+    assert finding.evidence == "fresh evidence"
+    assert finding.proof.get("confidence") == "high"
+
+
+@pytest.mark.asyncio
+async def test_content_refresh_does_not_override_protected_status(test_asset):
+    """The content refresh must layer on top of, not replace, the triage
+    protection — a false_positive finding whose severity gets corrected by a
+    rescan should show the corrected severity but must still stay marked
+    false_positive, not flip back to open."""
+    workspace_id = test_asset["workspace_id"]
+    check_id = "m7_content_refresh_fp_test"
+
+    first_pass = make_finding(
+        org_id=ORG_ID, workspace_id=workspace_id, scanner="test", check_id=check_id,
+        target=TEST_TARGET, title="Finding", severity="medium", category="open_port",
+        description="d", evidence="e",
+    )
+    async with get_session() as db:
+        await persist_findings(db, test_asset["scan_id_1"], [first_pass])
+        await db.commit()
+
+    finding = await _get_finding(first_pass["fingerprint"])
+    async with get_session() as db:
+        await db.execute(
+            Finding.__table__.update()
+            .where(Finding.id == finding.id)
+            .values(status="false_positive", is_false_positive=True)
+        )
+        await db.commit()
+
+    second_pass = make_finding(
+        org_id=ORG_ID, workspace_id=workspace_id, scanner="test", check_id=check_id,
+        target=TEST_TARGET, title="Finding", severity="high", category="open_port",
+        description="d", evidence="e",
+    )
+    async with get_session() as db:
+        await persist_findings(db, test_asset["scan_id_2"], [second_pass])
+        await db.commit()
+
+    finding = await _get_finding(first_pass["fingerprint"])
+    assert finding.severity == "high"
+    assert finding.status == "false_positive"

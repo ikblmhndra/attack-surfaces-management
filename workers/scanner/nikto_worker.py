@@ -259,7 +259,7 @@ class NiktoWorker(BaseWorker):
         """Upsert findings, return list of persisted finding IDs."""
         from sqlalchemy.dialects.postgresql import insert as pg_insert
         from workers.db_models import Asset, Finding, ScanFinding
-        from workers.scanner.scanner_common import status_preserving_conflict_updates
+        from workers.scanner.scanner_common import content_refresh_updates, status_preserving_conflict_updates
 
         persisted_ids = []
         now = datetime.now(timezone.utc)
@@ -300,7 +300,14 @@ class NiktoWorker(BaseWorker):
             stmt = pg_insert(Finding.__table__).values(**values, first_seen=now)
             stmt = stmt.on_conflict_do_update(
                 constraint="uq_finding_fingerprint_org",
-                set_=status_preserving_conflict_updates(now),
+                set_={
+                    **status_preserving_conflict_updates(now),
+                    **content_refresh_updates(stmt, [
+                        "title", "description", "severity", "category",
+                        "cve_ids", "cvss_score", "affected_url", "evidence",
+                        "request_raw", "response_raw", "proof", "remediation", "references",
+                    ]),
+                },
             ).returning(Finding.__table__.c.id, Finding.__table__.c.first_seen)
 
             result = await db.execute(stmt)

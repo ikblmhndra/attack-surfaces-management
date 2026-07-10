@@ -226,7 +226,10 @@ export default function DashboardPage() {
             },
             {
               label: "Open Findings",
-              value: score?.total_findings?.toLocaleString() ?? "—",
+              // total_findings is a live count on the org response itself, not
+              // nested under risk_score (which has no such field) — this was
+              // silently reading undefined forever.
+              value: scoreData?.total_findings?.toLocaleString() ?? "—",
               sub: `${score?.critical ?? 0} critical`,
               icon: AlertTriangle,
               color: score?.critical > 0 ? "red" : "orange",

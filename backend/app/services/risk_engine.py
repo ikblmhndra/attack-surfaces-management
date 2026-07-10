@@ -70,6 +70,7 @@ FINDING_CATEGORY_MAP: Dict[str, ScoreCategory] = {
     # DNS
     "missing_spf": ScoreCategory.DNS_HEALTH,
     "missing_dmarc": ScoreCategory.DNS_HEALTH,
+    "dmarc_misconfiguration": ScoreCategory.DNS_HEALTH,
     "missing_dnssec": ScoreCategory.DNS_HEALTH,
     "zone_transfer": ScoreCategory.DNS_HEALTH,
     "dangling_dns": ScoreCategory.DNS_HEALTH,
@@ -89,6 +90,7 @@ FINDING_CATEGORY_MAP: Dict[str, ScoreCategory] = {
     "old_tls_version": ScoreCategory.TLS_SECURITY,
     "cert_expiring_soon": ScoreCategory.TLS_SECURITY,
     "wildcard_certificate": ScoreCategory.TLS_SECURITY,
+    "tls_misconfiguration": ScoreCategory.TLS_SECURITY,
     # Exposure
     "exposed_admin_panel": ScoreCategory.EXPOSURE_MGMT,
     "default_credentials": ScoreCategory.EXPOSURE_MGMT,
@@ -96,6 +98,7 @@ FINDING_CATEGORY_MAP: Dict[str, ScoreCategory] = {
     "exposed_storage": ScoreCategory.EXPOSURE_MGMT,
     "exposed_api": ScoreCategory.EXPOSURE_MGMT,
     "open_redirect": ScoreCategory.EXPOSURE_MGMT,
+    "cloud_public_exposure": ScoreCategory.EXPOSURE_MGMT,
     # Patch hygiene
     "known_cve": ScoreCategory.PATCH_HYGIENE,
     "outdated_software": ScoreCategory.PATCH_HYGIENE,

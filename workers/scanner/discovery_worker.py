@@ -1517,6 +1517,7 @@ class DiscoveryWorker(BaseWorker):
             # Upsert Subdomain details
             dns_info = dns_data.get(host, {})
             tls = http_data.get("tls", {})
+            tls_issuer = ", ".join(tls.get("issuer_org") or []) or (tls.get("issuer_cn") or "") if tls else ""
 
             technologies = []
             seen_tech = set()
@@ -1556,10 +1557,14 @@ class DiscoveryWorker(BaseWorker):
                 "cdn_provider": (http_data.get("cdn_name") or "")[:100] or None,
                 "tls_info": tls if tls else None,
                 "tls_expiry": self._parse_tls_expiry(tls),
-                "tls_issuer": tls.get("issuer", {}).get("organization", "")[:500] if tls else None,
+                # httpx's real -tls-grab JSON uses flat issuer_org (a list) and
+                # tls_version keys, not a nested {"issuer": {"organization": ...}}
+                # or bare "version" — those never existed, so tls_issuer/
+                # tls_version silently persisted as empty strings forever.
+                "tls_issuer": tls_issuer[:500] or None,
                 "tls_subject": tls.get("subject_dn", "")[:500] if tls else None,
                 "tls_sans": tls.get("subject_an", []) if tls else [],
-                "tls_version": tls.get("version", "")[:20] if tls else None,
+                "tls_version": (tls.get("tls_version") or "")[:20] or None,
                 "redirect_chain": http_data.get("redirect_chain", []),
                 "http_headers": http_data.get("headers", {}),
                 "last_seen": now,
@@ -1936,7 +1941,7 @@ class DiscoveryWorker(BaseWorker):
                 + crawl_scan_targets
                 + (subdomains or [])
             )
-            scanner_families = ["tls", "dns", "takeover", "cloud", "git_secrets"]
+            scanner_families = ["tls", "dns", "takeover", "cloud", "git_secrets", "eol"]
             async with get_session() as db:
                 for family in scanner_families:
                     await update_scan_phase(
@@ -1948,6 +1953,7 @@ class DiscoveryWorker(BaseWorker):
                             "takeover": "takeover",
                             "cloud": "cloud_exposure",
                             "git_secrets": "git_secrets",
+                            "eol": "eol_check",
                         }[family],
                         "queued",
                         targets_total=len(scanner_targets),

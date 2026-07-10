@@ -81,54 +81,87 @@ export default function IntelPage() {
                 <table className="w-full data-table">
                   <thead>
                     <tr>
+                      <th>Asset</th>
                       <th>Source</th>
-                      <th>Risk Score</th>
-                      <th>Tags</th>
-                      <th>Categories</th>
+                      <th>ASN / ISP</th>
+                      <th>BGP Prefix</th>
+                      <th>Cloud / Hosting</th>
+                      <th>Risk</th>
                       <th>Enriched</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {data.items.map((item: any) => (
-                      <tr key={item.id}>
-                        <td>
-                          <span className="text-sm font-medium text-foreground">{item.source}</span>
-                        </td>
-                        <td>
-                          {item.risk_score != null ? (
-                            <span className={cn(
-                              "text-sm font-bold tabular-nums",
-                              item.risk_score >= 70 ? "text-red-400" :
-                              item.risk_score >= 40 ? "text-yellow-400" : "text-muted-foreground"
-                            )}>
-                              {item.risk_score}
+                    {/* The no-key network_baseline enrichment (see CLAUDE.md) never populates
+                        risk_score/tags/categories — those are reserved for a future intel-feed
+                        source. The columns that are actually populated today live in the `data`
+                        JSONB (asn/isp/bgp_prefix/cloud_provider/is_cdn/is_hosting), so those are
+                        the primary columns here; Risk stays as a compact fallback for whenever a
+                        real-scored source starts writing to this table. */}
+                    {data.items.map((item: any) => {
+                      const d = item.data || {};
+                      const asnLabel = d.asn_org || d.isp || (d.asn ? `AS${d.asn}` : null);
+                      return (
+                        <tr key={item.id}>
+                          <td>
+                            {item.asset_value ? (
+                              <a href={`/dashboard/assets/${item.asset_id}`} className="text-sm font-medium text-foreground hover:text-brand-400 hover:underline">
+                                {item.asset_value}
+                              </a>
+                            ) : <span className="text-xs text-muted-foreground">—</span>}
+                          </td>
+                          <td>
+                            <span className="text-sm text-foreground">{item.source}</span>
+                          </td>
+                          <td>
+                            {asnLabel ? (
+                              <div className="max-w-[220px]">
+                                <p className="text-sm text-foreground truncate" title={asnLabel}>{asnLabel}</p>
+                                {d.asn_country && <p className="text-xs text-muted-foreground">{d.asn_country}</p>}
+                              </div>
+                            ) : <span className="text-xs text-muted-foreground">—</span>}
+                          </td>
+                          <td>
+                            {d.bgp_prefix ? (
+                              <span className="text-xs font-mono text-muted-foreground">{d.bgp_prefix}</span>
+                            ) : <span className="text-xs text-muted-foreground">—</span>}
+                          </td>
+                          <td>
+                            <div className="flex flex-wrap gap-1 max-w-[180px]">
+                              {d.cloud_provider && (
+                                <span className="text-xs bg-brand-500/15 text-brand-400 px-1.5 py-0.5 rounded">{d.cloud_provider}</span>
+                              )}
+                              {d.is_cdn && (
+                                <span className="text-xs bg-surface-700 text-muted-foreground px-1.5 py-0.5 rounded">CDN</span>
+                              )}
+                              {d.is_hosting && (
+                                <span className="text-xs bg-surface-700 text-muted-foreground px-1.5 py-0.5 rounded">Hosting</span>
+                              )}
+                              {!d.cloud_provider && !d.is_cdn && !d.is_hosting && (
+                                <span className="text-xs text-muted-foreground">—</span>
+                              )}
+                            </div>
+                          </td>
+                          <td>
+                            {item.is_malicious ? (
+                              <span className="text-xs font-bold text-red-400">Malicious</span>
+                            ) : item.risk_score != null ? (
+                              <span className={cn(
+                                "text-sm font-bold tabular-nums",
+                                item.risk_score >= 70 ? "text-red-400" :
+                                item.risk_score >= 40 ? "text-yellow-400" : "text-muted-foreground"
+                              )}>
+                                {item.risk_score}
+                              </span>
+                            ) : <span className="text-xs text-muted-foreground">—</span>}
+                          </td>
+                          <td>
+                            <span className="text-xs text-muted-foreground">
+                              {item.enriched_at ? formatDistanceToNow(new Date(item.enriched_at), { addSuffix: true }) : "—"}
                             </span>
-                          ) : <span className="text-xs text-muted-foreground">—</span>}
-                        </td>
-                        <td>
-                          <div className="flex flex-wrap gap-1 max-w-[180px]">
-                            {(item.tags || []).slice(0, 3).map((tag: string) => (
-                              <span key={tag} className="text-xs bg-surface-700 text-muted-foreground px-1.5 py-0.5 rounded">{tag}</span>
-                            ))}
-                            {(item.tags || []).length > 3 && (
-                              <span className="text-xs text-muted-foreground">+{item.tags.length - 3}</span>
-                            )}
-                          </div>
-                        </td>
-                        <td>
-                          <div className="flex flex-wrap gap-1 max-w-[160px]">
-                            {(item.categories || []).slice(0, 2).map((cat: string) => (
-                              <span key={cat} className="text-xs bg-surface-700 text-muted-foreground px-1.5 py-0.5 rounded">{cat}</span>
-                            ))}
-                          </div>
-                        </td>
-                        <td>
-                          <span className="text-xs text-muted-foreground">
-                            {item.enriched_at ? formatDistanceToNow(new Date(item.enriched_at), { addSuffix: true }) : "—"}
-                          </span>
-                        </td>
-                      </tr>
-                    ))}
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>

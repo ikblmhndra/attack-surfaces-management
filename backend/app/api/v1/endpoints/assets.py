@@ -101,6 +101,7 @@ async def list_assets(
     cdn_only: Optional[bool] = Query(None),
     cloud_provider: Optional[str] = Query(None),
     criticality: Optional[int] = Query(None, ge=1, le=5),
+    expand: Optional[str] = Query(None, description="comma-separated: dns — include subdomain.dns_records/security_headers/redirect_chain/tls_info in list results"),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
     sort_by: str = Query("last_seen"),
@@ -205,11 +206,14 @@ async def list_assets(
     )
     finding_counts = {row.asset_id: row.cnt for row in (await db.execute(finding_counts_q)).all()}
 
+    expand_fields = {e.strip() for e in (expand or "").split(",") if e.strip()}
+    detailed = "dns" in expand_fields
+
     items = []
     for asset in assets:
         sub = subdomains_map.get(asset.id)
         ip = ips_map.get(asset.id)
-        item = _asset_to_dict(asset, sub, ip)
+        item = _asset_to_dict(asset, sub, ip, detailed=detailed)
         item["open_findings"] = finding_counts.get(asset.id, 0)
         items.append(item)
 

@@ -604,6 +604,29 @@ class ExploitIntel(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
 
+class EolIntel(Base):
+    """Keyless, publicly-published end-of-life data per product cycle
+    (endoflife.date), cached fetch-once-per-cycle — unlike EPSS (which shifts
+    daily), a cycle's EOL date doesn't change once published, so there's no
+    scheduled refresh; a row is only (re-)fetched when a detected
+    Technology.name/version maps to a cycle not yet cached. Global reference
+    data, not tied to any org/workspace, same shape as ExploitIntel."""
+    __tablename__ = "eol_intel"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    product = Column(String(100), nullable=False, index=True)  # endoflife.date product slug, e.g. "php"
+    cycle = Column(String(50), nullable=False)  # e.g. "7.4", "1.0.2" — see eol_intel.py's per-product rules
+    eol_date = Column(Date, nullable=True)  # null when the cycle isn't EOL yet
+    is_eol = Column(Boolean, nullable=False, default=False)
+    latest_version = Column(String(50), nullable=True)
+    checked_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("product", "cycle", name="uq_eol_intel_product_cycle"),
+    )
+
+
 # ============================================================
 # SCANS
 # ============================================================

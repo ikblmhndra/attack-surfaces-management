@@ -40,14 +40,16 @@ DEFAULT_SCAN_POLICY = {
         "max_hosts": 200,
     },
     "crawl": {
-        "depth": 2,
         "use_gau": True,
-        # Deliberately no "fuzz"/"fuzz_max_targets" key here: this dict is scan-type-
-        # agnostic (merged in before the profile is even resolved, via
-        # _policy_to_config()), so a hardcoded value here would clobber every profile's
-        # own fuzz setting identically — including deep_authorized's fuzz=True. Leave
-        # it unset so SCAN_PROFILES' own default flows through, unless an org
-        # explicitly overrides it via Organization.scan_policy.
+        # Deliberately no "depth"/"fuzz"/"fuzz_max_targets" keys here: this dict is
+        # scan-type-agnostic (merged in before the profile is even resolved, via
+        # _policy_to_config()), so a hardcoded value here would clobber every scan
+        # type's own setting identically. This used to hardcode "depth": 2 — which
+        # meant "quick" scans silently got crawl_depth=2 instead of their own
+        # DEFAULT_SCAN_CONFIG["quick"]["crawl_depth"]=1 (found while tuning
+        # deep_authorized's depth up to 3 and tracing why the change wouldn't have
+        # applied cleanly). Leave unset so each scan type's own default flows
+        # through, unless an org explicitly overrides it via Organization.scan_policy.
     },
     "nuclei": {
         "automatic_scan": True,
@@ -57,8 +59,11 @@ DEFAULT_SCAN_POLICY = {
     },
     "rate_limits": {
         "httpx_threads": 25,
-        "nuclei_concurrency": 6,
-        "nuclei_bulk_size": 6,
+        # Deliberately no "nuclei_concurrency"/"nuclei_bulk_size" here — same
+        # scan-type-agnostic clobbering issue as "depth" above. This used to
+        # hardcode both to 6, silently overriding "quick"'s own concurrency=15/
+        # bulk_size=15 (meant to be fast) down to 6. Leave unset so each scan
+        # type's own DEFAULT_SCAN_CONFIG value flows through.
     },
     "enrichment": {
         "enabled": True,
@@ -83,12 +88,20 @@ DEFAULT_SCAN_CONFIG = {
         "scan_timeout": 900,
         "template_timeout": 8,
         "retries": 0,
-        "concurrency": 6,
-        "bulk_size": 6,
+        # Raised from 6/6 to the CONFIG_LIMITS ceiling (20) — nuclei's own
+        # built-in defaults are 25/25; 6 was well below even that for the
+        # profile meant to be the thorough/authorized option. The per-second
+        # rate-limit flag (not this) is what actually protects the target from
+        # being overwhelmed, so this mainly buys back scan wall-clock time.
+        "concurrency": 20,
+        "bulk_size": 20,
         "automatic_scan": True,
         "use_tech_tags": True,
         "crawl_use_gau": True,
-        "crawl_depth": 2,
+        # Raised from 2 to 3 — katana's own -kf all (known-files discovery:
+        # robots.txt, sitemap.xml, etc.) only activates at depth>=3, so the
+        # "deep" profile was never actually getting it.
+        "crawl_depth": 3,
         "crawl_max_targets": 200,
         "crawl_max_total_urls": 2500,
         "fuzz_max_targets": 25,
@@ -129,8 +142,8 @@ DEFAULT_SCAN_CONFIG = {
         "scan_timeout": 900,
         "template_timeout": 8,
         "retries": 0,
-        "concurrency": 8,
-        "bulk_size": 8,
+        "concurrency": 20,
+        "bulk_size": 20,
         "automatic_scan": True,
         "use_tech_tags": True,
         "enrichment_enabled": False,

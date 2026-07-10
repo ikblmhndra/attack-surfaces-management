@@ -15,11 +15,15 @@ import { cn } from "@/lib/utils";
 
 type ReportType = "executive" | "technical" | "compliance" | "custom";
 
+// "compliance"/"custom" are aliases of the technical report server-side —
+// there's no real PCI-DSS/SOC2/ISO framework mapping or section picker
+// implemented yet (see report_service.py::DETAILED_REPORT_TYPES), so the
+// labels here shouldn't claim capability the backend doesn't have.
 const REPORT_TYPES: { id: ReportType; label: string; description: string }[] = [
   { id: "executive", label: "Executive Summary", description: "High-level overview for management" },
   { id: "technical", label: "Technical Report", description: "Detailed findings with evidence" },
-  { id: "compliance", label: "Compliance Report", description: "PCI-DSS, SOC2, ISO 27001 mapping" },
-  { id: "custom", label: "Custom Report", description: "Select specific sections and data" },
+  { id: "compliance", label: "Compliance Report", description: "Full findings list (same detail as Technical) — no framework mapping yet" },
+  { id: "custom", label: "Custom Report", description: "Full findings list (same detail as Technical) — section selection not built yet" },
 ];
 
 export default function ReportsPage() {
