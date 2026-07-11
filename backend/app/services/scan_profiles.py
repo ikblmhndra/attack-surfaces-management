@@ -174,7 +174,15 @@ SCAN_PROFILES: Dict[str, Dict[str, Any]] = {
         "concurrency": 20,
         "bulk_size": 20,
         "nuclei_batch_size": 8,
-        "crawl_nuclei_max_targets": 25,
+        # Was 25 — *below* the "default" profile's own 30, backwards for the
+        # platform's most-thorough tier. Confirmed against a real scan
+        # (kpi.go.id): 112 crawled endpoints scored high enough to be
+        # eligible, only 25 got a nuclei pass — 87 legitimately interesting
+        # endpoints were crawled but never vuln-scanned. Bumped in proportion
+        # to this profile's other budgets vs. "default" (concurrency/bulk_size
+        # are ~2.5x default's), not to the uncapped code-level fallback (200)
+        # — still bounded to protect scan wall-clock time.
+        "crawl_nuclei_max_targets": 100,
         # See "default" profile above — same fix, same reasoning.
         "crawl_nuclei_batch_size": 8,
         "crawl_nuclei_scan_timeout": 600,
@@ -185,6 +193,17 @@ SCAN_PROFILES: Dict[str, Dict[str, Any]] = {
         # scan_service.py must NOT re-clobber this back to False (see that file).
         "fuzz": True,
         "fuzz_max_targets": 25,
+        # Milestone 19: ffuf was only ever fuzzing one directory level with a
+        # bare wordlist — the literal "depth" tuning the wordlist expansion
+        # earlier this session didn't cover. -recursion (bounded by depth 2,
+        # so it can't run away) lets ffuf descend into directories it finds;
+        # -e widens each wordlist entry with common sensitive-file suffixes
+        # (".bak"/".old"/".zip" etc. catch backup/config files a bare
+        # directory-name wordlist entry alone would miss). Both bounded by
+        # the same -maxtime/-rate budget every other fuzz run already has —
+        # this makes better use of that existing time budget, not a bigger one.
+        "fuzz_recursion_depth": 2,
+        "fuzz_extensions": ".bak,.old,.zip,.tar.gz,.sql,.log,.swp,.orig,.save,.config",
         # JS analysis re-fetches JS files the crawler already discovered (no new
         # targets, no extra crawl surface) to extract hidden endpoints/secrets/
         # subdomains — same read-only-GET posture as everything else this

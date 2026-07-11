@@ -26,18 +26,39 @@ DEFAULT_MODULES = {
 }
 
 DEFAULT_SCAN_POLICY = {
-    "scan_profile": "deep_authorized",
+    # Deliberately no "scan_profile" key here: this dict is scan-type-agnostic
+    # (merged in via _policy_to_config() *before* apply_scan_profile() even
+    # resolves a profile), so a hardcoded value here clobbers every scan
+    # type's own scan_profile identically — the exact same clobbering pattern
+    # already fixed below for "crawl.depth" and "rate_limits.nuclei_concurrency/
+    # bulk_size", just never audited for this key too. Confirmed in real
+    # production data: every "quick" scan's persisted config showed
+    # scan_profile=deep_authorized instead of "safe" — a "quick"/lightweight
+    # scan request was silently running the full authorized/deep profile
+    # (all severities, automatic_scan, network_safe+cloud_exposure+takeover
+    # nuclei profiles, ffuf fuzzing, JS analysis) instead of "safe"'s
+    # deliberately narrower one. Each scan type's own DEFAULT_SCAN_CONFIG
+    # already sets its own correct scan_profile ("full"/"vuln" -> deep_authorized,
+    # "quick" -> safe); scan types without an explicit entry fall through to
+    # resolve_scan_profile()'s own scan_type-keyed defaults. Leave unset here
+    # so both paths flow through unclobbered, unless an org explicitly
+    # overrides scan_profile via Organization.scan_policy.
     "modules": DEFAULT_MODULES["full"],
     "budgets": {
-        "scan_timeout": 900,
+        # Milestone 18: audited every key in this policy dict against every
+        # scan type's own DEFAULT_SCAN_CONFIG and found the *same* clobbering
+        # bug (below, in "crawl"/"rate_limits") also hit "scan_timeout",
+        # "crawl_nuclei_batch_size", "max_endpoints", and "max_hosts" — all
+        # four used to silently override "quick"'s deliberately lower values
+        # (300s/5/1000/100) back up to these numbers, and "vuln" too has its
+        # own "enrichment.enabled" intent overridden below. Removed all of
+        # them from this scan-type-agnostic dict for the same reason "depth"
+        # and "nuclei_concurrency"/"nuclei_bulk_size" were already removed.
         # These feed into apply_scan_profile() as "incoming" overrides, which win
         # over SCAN_PROFILES/PROFILE_RUNTIME_CAPS defaults (profile.update(incoming)) —
         # they must be kept in sync with those, not left at the old batch-size-1 values.
         "nuclei_batch_size": 8,
-        "crawl_nuclei_batch_size": 8,
         "crawl_nuclei_scan_timeout": ENDPOINT_NUCLEI_TIMEOUT_CAP,
-        "max_endpoints": 2500,
-        "max_hosts": 200,
     },
     "crawl": {
         "use_gau": True,
@@ -52,8 +73,10 @@ DEFAULT_SCAN_POLICY = {
         # through, unless an org explicitly overrides it via Organization.scan_policy.
     },
     "nuclei": {
-        "automatic_scan": True,
-        "use_tech_tags": True,
+        # Deliberately no "automatic_scan"/"use_tech_tags" here (Milestone 18) —
+        # same clobbering issue as "depth" above. "quick" wants both False (a
+        # narrower, more predictable template set for a fast/lightweight scan);
+        # this dict's old True/True silently forced both scans back on.
         "template_timeout": 8,
         "exclude_tags": ["dos", "bruteforce", "intrusive"],
     },
@@ -66,7 +89,10 @@ DEFAULT_SCAN_POLICY = {
         # type's own DEFAULT_SCAN_CONFIG value flows through.
     },
     "enrichment": {
-        "enabled": True,
+        # Deliberately no "enabled" here (Milestone 18) — both "quick" and
+        # "vuln" set enrichment_enabled=False (skip asset enrichment: "quick"
+        # for speed, "vuln" because it's a pure vulnerability-confirmation
+        # pass), and this dict's old True clobbered both back on.
         "baseline": True,
         "api_plugins": True,
     },
@@ -272,8 +298,15 @@ def _policy_to_config(policy: Dict[str, Any]) -> Dict[str, Any]:
         "crawl_httpx_threads": rate_limits.get("httpx_threads"),
         "concurrency": rate_limits.get("nuclei_concurrency"),
         "bulk_size": rate_limits.get("nuclei_bulk_size"),
-        "enrichment_enabled": enrichment.get("enabled", True),
-        "enrichment_baseline": enrichment.get("baseline", True),
+        # No ", True" default here (Milestone 18) — every other key in this
+        # dict defaults to None so an unset org policy lets the scan type's
+        # own DEFAULT_SCAN_CONFIG value flow through unclobbered; these two
+        # were the only ones hardcoding a fallback, which silently forced
+        # enrichment back on for "quick"/"vuln" even after removing "enabled"
+        # from DEFAULT_SCAN_POLICY's own "enrichment" dict above — the fallback
+        # here reintroduced the exact same clobber from a different spot.
+        "enrichment_enabled": enrichment.get("enabled"),
+        "enrichment_baseline": enrichment.get("baseline"),
     }
     return {key: value for key, value in config.items() if value is not None}
 

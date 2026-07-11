@@ -57,6 +57,7 @@ CATEGORY_MAP = {
     "default-logins": "default_credentials",
     "takeovers": "subdomain_takeover",
     "technologies": "outdated_software",
+    "eol": "eol_software",
     "exposures": "exposed_api",
     "vulnerabilities": "known_cve",
     "fuzzing": "exposed_service",
@@ -1012,6 +1013,8 @@ class NucleiWorker(BaseWorker):
         # Keyword matching
         if "cve" in template_lower:
             return "known_cve"
+        if any(k in template_lower for k in ["-eol", "eol-", "outdated"]):
+            return "eol_software"
         if any(k in template_lower for k in ["panel", "admin", "login", "dashboard"]):
             return "exposed_admin_panel"
         if any(k in template_lower for k in ["debug", "ignition", "stacktrace", "stack-trace", "trace"]):

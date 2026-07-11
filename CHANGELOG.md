@@ -4,6 +4,383 @@ All notable changes to this project are documented below, sorted newest-first.
 
 ---
 
+## 2026-07-12 — Milestone 21: Version-to-CVE correlation (highest-risk item of the 4-part plan)
+
+Final item of the detection-tuning plan (M18 endpoint-cap → M19 API/GraphQL → M20 ffuf depth → **this**).
+Flagged from the start as the noisiest, most false-positive-prone of the four — a detected version
+falling inside a CVE's published affected range is not proof of exploitability (a vendor can backport a
+fix without bumping the version string) — so this was built last, deliberately, once the lower-risk items
+were already shipped and verified.
+
+### Added: keyless CVE-by-version correlation via cve.circl.lu
+- **New table** `version_cve_cache` (migration `017_version_cve_cache`) caching up to ~20 recent CVEs per
+  product (bounded — `cve.circl.lu` paginates at 10/page and some products have 600+ historical CVEs;
+  recent ones are what a missing nuclei template is most likely to be). Different refresh model from
+  `eol_intel`'s fetch-once-forever: a product's CVE list genuinely grows over time, so a cached entry
+  refreshes if older than 7 days.
+- **New module** `backend/app/services/version_cve_intel.py`: `PRODUCT_VENDOR_MAP` (17 products this
+  platform has actually detected with real version data — Apache, OpenSSL, PHP, Nginx, WordPress, Drupal,
+  etc.), real version-range matching (`version_in_range`) against CIRCL's actual `{"version": "2.4.17",
+  "lessThanOrEqual": "2.4.67", "status": "affected"}` shape (verified against the live API before writing
+  the parser — confirmed `"unaffected"` entries must never match, and CVSS commonly lives in
+  `containers.adp[].metrics[]`, not `containers.cna`, in real records).
+- **New scanner-family check** `_scan_version_cve` in `coverage_worker.py`, wired the same safe way as
+  `_scan_eol` (Technology-table read, no cross-worker race — see M19's GraphQL note for why that
+  distinction matters). Every finding is explicitly framed as "**Potential** CVE-XXXX" in its title, never
+  asserted as confirmed, and carries `confidence_score: 0.3` in `proof` — lower than nuclei's own
+  low-confidence CVE tier (0.5, M7's A2) since there's no template/response confirmation at all here,
+  purely a version comparison. This confidence value feeds `risk_engine.py`'s existing confidence-based
+  penalty dampening (already built for nuclei's own low-confidence matches) — no scoring-engine change
+  needed, just correctly populating a signal it already knows how to use.
+
+### Fixed (prerequisite, found while building this): `cve_ids` silently dropped for every non-nuclei finding
+- **File**: `workers/scanner/scanner_common.py` (`make_finding`, `persist_findings`)
+- `make_finding()` never had a `cve_ids` parameter at all, and `persist_findings()` (used by every
+  `coverage_worker.py` check) separately hardcoded `"cve_ids": []` regardless of what a finding dict
+  contained. Harmless until now — only `nuclei_worker.py` populated `Finding.cve_ids`, through its own,
+  entirely separate persistence path. Version-correlation findings are the first non-nuclei source that
+  needs this populated (so M14's EPSS/KEV case-insensitive lookup and `cve_id`-based finding filtering
+  apply to them too) — added the parameter and made `persist_findings` actually read it.
+
+### Verified against real production data, not just synthetic tests
+- Ran `_scan_version_cve` directly against all 3 previously-validated orgs. Real, plausible matches: e.g.
+  `pu.go.id`'s and `kpi.go.id`'s Apache HTTP Server instances (2.4.41–2.4.62, already known-outdated from
+  M15) matched several real 2026-era CVEs at CVSS 7.3–9.8. Total: **97 findings on `pu.go.id`, 154 on
+  `kpi.go.id`, 535 on `pasarjaya.co.id`** (786 combined) — a large volume, expected given how many
+  subdomains across these orgs run the same outdated Apache line; each is a distinct, individually
+  accurate (asset, CVE) pair, not a duplication bug (spot-checked in the DB).
+- **Confirmed the confidence dampening is real, not cosmetic**: traced `risk_engine.py`'s actual penalty
+  math — `compute_severity_penalty()` multiplies by `confidence` before the result ever reaches a
+  category's total, so each 0.3-confidence finding contributes ~30% of a full-confidence one. Verified
+  this by recomputing risk scores for all 3 orgs after persisting: `pu.go.id` 72→60, `pasarjaya.co.id`
+  score also moved. The drop is real but explainable — `risk_engine.py` has a *separate*, pre-existing
+  global cap (`critical_penalty`/`high_penalty` aggregate thresholds, independent of any one category's
+  floor) that a large volume of even-dampened critical/high findings can still cross in aggregate. This
+  is existing, unchanged scoring architecture working as designed, not a new bug — but it is a real,
+  user-visible effect worth knowing about before treating this feature as "safe to ignore."
+
+### Verification
+- 27 new unit tests in `backend/tests/unit/test_version_cve_intel.py` (version-range matching against the
+  real verified API shape, CVSS extraction from the real `adp` container path, cache-hit vs.
+  cache-stale-triggers-refetch branching via a fake DB) plus 2 in `test_scan_pipeline_state.py`
+  (`make_finding` now threads `cve_ids` through, still defaults to `[]` when omitted).
+  `docker compose exec api pytest tests/unit -q --ignore=tests/unit/test_scan_pipeline_state.py` — 184
+  passed (was 157), 1 skipped, no regressions.
+- Restarted `worker-scanner`/`worker-discovery` (`workers/` bind-mounted read-write, no rebuild needed).
+
+### Not yet decided — flagged for the user, not assumed
+- Whether 786 findings across 3 orgs in one pass is the right volume, or whether this should be scoped
+  down (e.g. `deep_authorized`-only, similar to `fuzz`/`js_analysis_enabled`'s profile gating) or bounded
+  more tightly (`version_cve_max_products`, currently 100). Currently ungated — runs for every scan type
+  that reaches the scanner-family dispatch, matching `_scan_eol`'s own precedent, not specially restricted.
+
+---
+
+## 2026-07-12 — Milestone 20: ffuf content-discovery depth (recursion + extension fuzzing)
+
+Third item of the 4-part detection-tuning plan (M18 endpoint-cap → M19 API/GraphQL → **this** →
+version-to-CVE correlation). The ffuf wordlist itself was already expanded from ~28 to ~200 words earlier
+this session (`workers/fuzz_wordlist.py`, shared between both call sites) — this pass looked at the actual
+`ffuf` invocation flags themselves, since a bigger wordlist alone doesn't add "depth": ffuf was only ever
+fuzzing exactly one directory level, with no extension-widening, in both `web_crawl_worker.py::_run_ffuf`
+and `discovery_worker.py::_fuzz_endpoints`.
+
+### Added: bounded recursion + sensitive-file extension fuzzing, `deep_authorized` only
+- **Files**: `workers/crawler/web_crawl_worker.py`, `workers/scanner/discovery_worker.py`,
+  `backend/app/services/scan_profiles.py`
+- Verified ffuf's real `-recursion`/`-recursion-depth`/`-e` flags directly (`ffuf -h`) before wiring
+  anything, then live-smoke-tested the exact combination against a real target (`pu.go.id`) before
+  shipping: the full 198-word list × 11 variants (bare + 10 extensions) = 2,178 requests completed in 48s,
+  comfortably inside the existing 120s `-maxtime` budget with headroom to spare.
+- `-recursion -recursion-depth 2`: lets ffuf descend into directories it actually finds (bounded to 2
+  levels so it can't run away) — this is the literal "depth" the wordlist expansion alone didn't add.
+  `-e .bak,.old,.zip,.tar.gz,.sql,.log,.swp,.orig,.save,.config`: widens every wordlist entry with common
+  backup/config-file suffixes a bare directory-name guess wouldn't catch on its own (e.g. `config` alone
+  vs. `config.bak`/`config.old`).
+- Both bounded by the *same* existing `-maxtime`/`-rate` budget every fuzz run already had — this makes
+  better use of that existing time budget, not a bigger one. New config keys (`fuzz_recursion_depth`,
+  `fuzz_extensions`) default to off (`0`/`""`) so every other profile's behavior is unchanged; only
+  `deep_authorized` opts in.
+
+### Verification
+- 1 new test in `backend/tests/unit/test_scan_policy.py`, exercising the real end-to-end merge chain
+  (established M18 practice, not `apply_scan_profile()` in isolation): confirms `full` gets both new
+  values and `quick` doesn't inherit either.
+  `docker compose exec api pytest tests/unit -q --ignore=tests/unit/test_scan_pipeline_state.py` — 157
+  passed (was 156), 1 skipped, no regressions.
+- Restarted `api` (profile change), `worker-crawl` and `worker-discovery` (both ffuf call sites).
+
+---
+
+## 2026-07-12 — Milestone 19: API surface coverage — OpenAPI/Swagger spec mining + GraphQL introspection
+
+Second item of a 4-part detection-tuning plan (M18 endpoint-cap → **this** → content-discovery depth →
+version-to-CVE correlation). Investigated what nuclei-templates already covers before building anything:
+confirmed real Swagger/OpenAPI *exposure* templates already run via the existing `http/exposures`/
+`http/misconfiguration` profile dirs (39 real graphql-related templates exist in the checkout, including
+playground/voyager/apollo-sandbox exposure checks), and the crawler already recognizes and prioritizes
+`/graphql`/`/swagger`/`/api-docs`-shaped paths (`API_PATH_RE`/`GRAPHQL_PATH_RE`/`SWAGGER_PATH_RE` in
+`web_crawl_worker.py`, existing +30 score boost). What's genuinely missing: nothing sends a real GraphQL
+`__schema` introspection query (checked — the closest existing template is a weaker
+field-suggestion-from-error-message heuristic), and nothing parses a *found* OpenAPI/Swagger spec's body
+to extract the routes it documents.
+
+### Added: OpenAPI/Swagger spec parsing → new crawl candidates
+- **File**: `workers/crawler/web_crawl_worker.py` (`_analyze_api_specs`)
+- Fetches already-crawled Swagger/OpenAPI-shaped URLs and, **only if the response is a genuine spec
+  document** (has a `"swagger"`/`"openapi"` key, or a non-empty `"paths"` dict — not just a URL that
+  happens to match `/swagger|openapi/`), extracts every documented route as a new crawl candidate. API
+  routes are almost never linked from HTML, so a link-following crawler structurally can't find them any
+  other way; a real spec enumerates them directly. Mirrors `_analyze_js_endpoints`'s established pattern
+  exactly: extracted URLs flow through the same `_validate_urls` → `_persist_endpoints` →
+  `_publish_selected_nuclei` path as every other crawler-discovered endpoint (tagged
+  `source="api_spec_extracted"`), and a `low`-severity `exposed_api` finding is persisted when a real spec
+  is confirmed (already a recognized `risk_engine.py` category — `EXPOSURE_MGMT` — no scoring change
+  needed).
+- **The JSON-validation gate is load-bearing, not a formality**: manually verified against real data first
+  — `pasarjaya.co.id` has 2 already-discovered Swagger-shaped URLs (`/api-docs`, `/api/swagger.json`, both
+  HTTP 200), and both return a generic app-level JSON error (`{"status":400,"message":"Gagal akses ke
+  server.",...}`), not a real spec. Without the structural check, both would have been wrongly flagged as
+  exposed API documentation. Re-ran the real check against these exact two URLs post-build: correctly 0
+  findings, 0 extracted endpoints — confirms the filter holds against the actual production data it was
+  designed around.
+
+### Added: GraphQL introspection query check
+- **File**: `workers/crawler/web_crawl_worker.py` (`_analyze_graphql_endpoints`)
+- Sends a real `query IntrospectionQuery { __schema { types { name } } }` POST to already-crawled
+  `/graphql`-shaped URLs; a `data.__schema.types` array in the response means introspection is
+  unauthenticated-accessible — exposing the entire schema (types/fields/mutations) as a map of the API.
+  Persists a `medium`-severity `exposed_api` finding when confirmed.
+- **Deliberately built inside `web_crawl_worker.py` itself, not as a `coverage_worker.py` scanner-family
+  check** (which is the established pattern for `_scan_eol`/`_scan_tls`/etc.) — caught this during review,
+  before shipping: a discovery-phase scanner-family dispatch and the crawl worker's own `WebEndpoint`
+  persistence are two independently-scheduled, concurrently-published queue consumers (`scan.crawl` and
+  `scan.scanner` are both published from `discovery_worker.py` around the same time, with no ordering
+  guarantee between them). A `graphql` scanner-family check querying `WebEndpoint` rows for
+  `endpoint_type="graphql"` would very likely run before the crawl worker had persisted any — the exact
+  "looks wired but isn't" pattern already found and fixed repeatedly this session (M6 batch-size, M10
+  depth/concurrency, M18 scan_profile), just narrowly avoided here by running the check in the same
+  worker pass that already computed `endpoint_type` in memory, with no cross-worker dependency at all.
+
+### Verification
+- 4 new unit tests in `backend/tests/unit/test_scan_pipeline_state.py`, using a lightweight fake
+  `aiohttp.ClientSession` (no new test dependency): the real false-positive rejection case above, a
+  genuine spec's routes extracted correctly, GraphQL introspection-enabled correctly flagged, and a
+  disabled-introspection response correctly producing no finding. All 17 tests in the file pass (verified
+  via the file's own documented transient-`pytest`-in-`worker-nuclei` method).
+- Re-ran `_analyze_api_specs` directly against `pasarjaya.co.id`'s 2 real Swagger-shaped URLs post-build
+  (not just the unit test) — see above.
+- No real `/graphql`-typed endpoint exists in any org scanned so far, so `_analyze_graphql_endpoints`
+  wasn't re-verified against live production data the way the spec check was — only the unit-tested
+  synthetic cases. Will confirm against a real target if/when one turns up.
+- `docker compose exec api pytest tests/unit -q --ignore=tests/unit/test_scan_pipeline_state.py` — 156
+  passed, 1 skipped, no regressions (this file's tests aren't part of that count).
+- Restarted `worker-crawl` only (both new methods live entirely in that worker; no `coverage_worker.py`/
+  `discovery_worker.py` change survived, per the race-condition finding above).
+
+---
+
+## 2026-07-12 — Milestone 18: "quick"/"vuln" scans have been silently running as deep_authorized
+
+User asked for more/better-tuned detection methods to catch findings that might be slipping through.
+Started narrow (a `deep_authorized` crawl-endpoint cap that was lower than "default"'s) and, while
+verifying the fix through the real merge chain (the established practice since Milestone 6, which is
+exactly what surfaced this), found something far more serious underneath.
+
+### Found and fixed: `crawl_nuclei_max_targets` was backwards for the most-thorough profile
+- **File**: `backend/app/services/scan_profiles.py`
+- `deep_authorized` (the profile behind `full`/`vuln` scans) capped nuclei-scanned crawl endpoints at
+  **25** — *below* the plain `default` profile's **30**. Confirmed against a real scan: `kpi.go.id` had
+  112 crawled endpoints score high enough to be nuclei-eligible; only 25 got scanned, 87 legitimately
+  interesting endpoints were crawled but never vulnerability-checked. Raised to 100 — in proportion to
+  this profile's other budgets vs. "default" (concurrency/bulk_size run ~2.5x default's), not to the
+  code-level uncapped fallback (200), to keep scan wall-clock time bounded.
+
+### Found and fixed (far more severe): `DEFAULT_SCAN_POLICY` hardcoded `scan_profile: "deep_authorized"`
+- **File**: `backend/app/services/scan_service.py`
+- While re-verifying the fix above through `_effective_config()`'s full merge chain, "default" scan type
+  resolved to `crawl_nuclei_max_targets: 100` — deep_authorized's *new* value, not default's own 30. Traced
+  it to `DEFAULT_SCAN_POLICY["scan_profile"] = "deep_authorized"`, sitting in the exact same
+  scan-type-agnostic dict this file already documents fixing for `crawl.depth` (Milestone 9-era) and
+  `rate_limits.nuclei_concurrency`/`nuclei_bulk_size` (Milestone 10) — merged in via `_policy_to_config()`
+  *before* `apply_scan_profile()` ever resolves a profile, so a hardcoded value here wins over every scan
+  type's own intent unconditionally. `scan_profile` itself had never been audited for this same pattern.
+- **Confirmed against real production data, not just the trace**: every persisted `scans.config` for a
+  `quick`-type scan showed `scan_profile: "deep_authorized"`, never `"safe"`. A user requesting a
+  lightweight, narrow-footprint "quick" scan has been silently getting the full authorized/deep profile
+  instead — all severities including info, `automatic_scan` template auto-selection,
+  `network_safe`+`cloud_exposure`+`takeover` nuclei profiles, ffuf content-fuzzing, JS analysis. This is a
+  real operational/authorization-scope concern, not just a config nicety: "safe" mode exists specifically
+  for cases calling for a narrower footprint, and that guarantee has not been holding.
+- **Audited every other key in the same policy dict for the identical pattern** (systematic diff:
+  `_policy_to_config(DEFAULT_SCAN_POLICY)`'s output against every scan type's own `DEFAULT_SCAN_CONFIG`,
+  not a one-off manual check) and found **7 more** silently clobbered `quick`/`vuln` settings:
+  `scan_timeout` (900 forced instead of `quick`'s 300s), `crawl_nuclei_batch_size` (8 instead of 5),
+  `crawl_max_targets`/`crawl_max_total_urls` (200/2500 instead of 100/1000), `automatic_scan`/
+  `use_tech_tags` (forced `True` instead of `quick`'s `False`/`False`), and `enrichment_enabled` (forced
+  `True` instead of both `quick`'s and `vuln`'s own `False`). Removed all 8 keys from `DEFAULT_SCAN_POLICY`
+  the same way `depth`/`nuclei_concurrency`/`nuclei_bulk_size` were already removed — each scan type's own
+  `DEFAULT_SCAN_CONFIG` value now flows through unclobbered unless an org explicitly overrides it via
+  `Organization.scan_policy` (the legitimate use for this layer).
+- **A second, independent instance of the same bug class**: `_policy_to_config()`'s
+  `enrichment_enabled`/`enrichment_baseline` mappings hardcoded a `, True` fallback
+  (`enrichment.get("enabled", True)`) — every *other* key in that function defaults to bare `None` so an
+  unset org policy doesn't clobber anything. Removing `"enabled"` from `DEFAULT_SCAN_POLICY`'s own
+  `enrichment` dict alone wasn't sufficient; the function's own default silently reintroduced identical
+  clobbering from a different spot. Fixed both defaults to bare `None`, matching every other key's pattern.
+
+### Verification
+- Systematic diff script (not spot-checks): compared `_policy_to_config(DEFAULT_SCAN_POLICY)`'s output
+  key-by-key against every scan type's own `DEFAULT_SCAN_CONFIG` entry, confirmed zero remaining conflicts
+  after the fix.
+- 4 new tests in `backend/tests/unit/test_scan_policy.py`, all exercising the real end-to-end
+  `_effective_config()` merge chain (not `apply_scan_profile()` in isolation): the crawl-cap ordering,
+  all 8 previously-clobbered `quick` keys resolving correctly in one assertion pass, `vuln`'s
+  `enrichment_enabled`, and a bare `"default"` scan type resolving to the `"default"` profile.
+  `docker compose exec api pytest tests/unit -q --ignore=tests/unit/test_scan_pipeline_state.py` — 156
+  passed (was 152), 1 skipped, no regressions.
+- Restarted `api` (only container that imports `scan_service.py` — no worker does, scan config is fully
+  resolved at scan-creation time before the first queue message is published).
+- Created a real "quick" scan through the live API against `pu.go.id` (already scanned repeatedly this
+  session, low incremental risk) and confirmed the persisted `scans.config`: `scan_profile: "safe"`,
+  `scan_timeout: 300`, `automatic_scan: false`, `use_tech_tags: false`, `crawl_max_targets: 100`,
+  `enrichment_enabled: false` — every value now matches "safe"'s intent, a complete reversal from what
+  every prior "quick" scan in this database actually persisted.
+
+---
+
+## 2026-07-12 — Milestone 17: Mining already-collected IP/TLS data for uncovered attack surface
+
+User asked whether the platform's already-collected IP asset data could be mined further for uncovered
+attack surface. Investigation found two real, previously-unwired sources of already-collected data, plus
+confirmed one existing "gap" (ASN→CIDR expansion never auto-scanning) is a deliberate, correct safety
+decision that should stay as-is — not a bug to fix.
+
+### Added: TLS certificate SAN mining as a new subdomain-discovery source
+- **File**: `workers/scanner/discovery_worker.py` (`_fetch_known_tls_sans`, `_discover_subdomains_with_sources`)
+- The `subdomains.tls_sans` column (populated by M11.6's TLS fix) was written but never read back for
+  anything. Verified against real data before building: `pu.go.id` had **37 genuine same-root-domain
+  hostnames** sitting in already-fetched certificate SAN data that weren't yet tracked as discovered
+  subdomains (`ciptakarya.pu.go.id`, `lisensijakon.pu.go.id`, `automation.pu.go.id`, etc.) — real,
+  previously-uncovered attack surface, sitting in data the platform already had. Also confirmed the
+  necessary filtering: `pasarjaya.co.id`'s SAN data looked like 75 "new" hostnames at first, but every one
+  was noise from a shared mail-hosting certificate listing unrelated third-party customer domains
+  (`mail.airetalent.com`, `correo.ateneatelecomunicaciones.com`, etc.) — none were genuinely
+  `*.pasarjaya.co.id`.
+- Wired as a new discovery source (`tls_san_mining`) feeding into the exact same candidate pipeline as
+  `dns_bruteforce`/`dns_permutation`/`wayback` — `_add_discovery_candidate`'s existing domain-suffix check
+  is what discards the shared-hosting noise, so SAN-mined candidates get the identical
+  resolve→validate→persist treatment (and the identical scope safety) as every other passive/generated
+  source. No new risk profile: this reads data already sitting in this org's own `subdomains` rows, makes
+  no new requests to anything.
+- Fetched once per scan (not once per root domain) and reused across the domain loop.
+
+### Added: reverse-DNS lookups against this org's own already-confirmed IP assets
+- **File**: `workers/scanner/discovery_worker.py` (`_fetch_known_ip_assets`, `_discover_reverse_dns_targets`)
+- The existing `reverse_dns` discovery source only ever looked at `organizations.ip_ranges` — a manual,
+  opt-in field with a real settings-page UI, but empty for every real org scanned this session (hence
+  `reverse_dns_candidates: 0` in every prior scan's phase_status). Extended it to also PTR-lookup this
+  org's own already-confirmed `Asset` rows of type `ip` (resolved from a validated in-scope host in a
+  prior scan) — no scope expansion at all, since we already have standing to touch these exact IPs; it
+  just extracts more information (potential co-hosted vhosts) from IPs already ours to see.
+  Verified live against `pu.go.id`'s 31 known IPs: got 20 real PTR responses back, correctly all
+  `scope_match: false` — its infrastructure is AWS/GCP/Biznet-hosted without custom reverse-DNS zones, so
+  no same-domain hostnames were discoverable this way for this particular org. Expected, not a bug;
+  confirms the check runs and labels results correctly rather than manufacturing false positives.
+- Kept the existing safety posture unchanged: reverse-DNS discoveries are still `"selected": False` /
+  `skip_reason: "reverse_dns_not_auto_scanned"`, same as before and same as ASN-expansion candidates —
+  deliberately not auto-scanned regardless of source, matching this platform's established
+  authorization-conscious posture.
+
+### Confirmed as correct, deliberately not touched: ASN→CIDR expansion never auto-scans
+- `_expand_asn_targets`'s discovered CIDR prefixes always carry `"selected": False,
+  skip_reason: "asn_prefix_not_auto_scanned"` — this looked like it could be the same "wired but inert"
+  pattern found repeatedly in earlier milestones, but it isn't: an ASN discovered from a target's IP is
+  very often a **hosting provider's** ASN, not a dedicated block the org itself owns — auto-scanning the
+  whole CIDR would touch unrelated third parties sharing that provider. This is a deliberate authorization
+  safeguard, left exactly as-is.
+
+### Caveat surfaced during this work: `DiscoveredAsset` candidates have no review UI at all
+- Confirmed there is no frontend page and no dedicated API endpoint for browsing individual
+  `DiscoveredAsset` candidate rows (only an aggregate count/breakdown via `scans.py`'s
+  `_discovered_asset_summary`, rendered on the Scan Detail page as a `by_type` line item). This means the
+  new `reverse_dns`-sourced candidates (and the pre-existing `asn_expansion`/original `reverse_dns`
+  candidates) will show up as a **count** on the next scan's detail page, but there's no way to actually
+  browse/promote individual candidate hostnames from the product today. Pre-existing gap, not introduced
+  by this change — flagging since it directly limits how useful the reverse-DNS side of this work is until
+  a review UI exists. Not built now (out of scope for what was asked); suggest as a follow-up.
+
+### Verification
+- 4 new unit tests in `backend/tests/unit/test_scan_pipeline_state.py`: SAN-mining domain-filter behavior,
+  `_fetch_known_tls_sans`/`_fetch_known_ip_assets` query-shape contracts (fake DB session, no real
+  network), and reverse-DNS's known-IP merge with a faked `getnameinfo` (patched on the *real* running
+  loop, not by replacing `asyncio.get_running_loop()` itself — the code under test wraps the call in
+  `asyncio.wait_for()`, which needs the genuine loop's timer machinery). All 13 tests in the file pass
+  (verified via the same transient-`pytest`-in-`worker-nuclei` method this file's own docstring documents).
+- Both new functions additionally run-tested directly against real production data (not just mocked) inside
+  `worker-discovery`: SAN mining produced the 37 genuine `pu.go.id` candidates described above; reverse-DNS
+  produced 20 real, correctly-labeled PTR results.
+- `docker compose exec api pytest tests/unit -q --ignore=tests/unit/test_scan_pipeline_state.py` — 152
+  passed, 1 skipped, no regressions (this file's tests aren't part of that count — they live in the
+  workers-dependent file).
+- Restarted `worker-discovery` (`workers/` bind-mounted read-write, no rebuild). Did **not** trigger a new
+  full scan to watch brand-new subdomains land end-to-end — the downstream resolve/validate/persist chain
+  these candidates feed into is unchanged, already-proven code (exercised across every scan validated in
+  Milestones 12-16), so the risk specific to this change is fully contained in candidate generation, which
+  was verified directly. Will confirm end-to-end on whichever real scan the user validates next, per the
+  established workflow.
+
+---
+
+## 2026-07-12 — Milestone 16: Fixed nuclei's own `*-eol` template categorization (M15 follow-up)
+
+Follow-up from Milestone 15: user asked whether nuclei's own generic `*-eol` templates (e.g. `php-eol`,
+seen live on `pasarjaya.co.id`'s Findings page as "PHP End-of-Life - Detect") or the new endoflife.date
+cross-reference should be the primary EOL data source. Recommended endoflife.date as authoritative (exact
+per-cycle dates vs. nuclei's coarse "old version detected" heuristic; broader coverage — works for any
+product in the `technologies` table, not just whatever templates happen to exist), with nuclei's own
+`*-eol` templates kept as a secondary in-scan signal rather than removed. User approved fixing the
+categorization bug flagged in M15's "found but not fixed" note.
+
+### Fixed: `*-eol` nuclei templates fell through to the wrong default category
+- **File**: `workers/scanner/nuclei_worker.py` (`CATEGORY_MAP`, `_map_category`)
+- Confirmed the real template's tags first (`php-eol` carries `["tech", "php", "eol"]`) rather than
+  assuming. `"eol"` wasn't a `CATEGORY_MAP` tag key and `_map_category`'s keyword-matching had no bucket
+  for it either, so every `*-eol` finding fell through to the `cors_misconfiguration` default — the same
+  failure mode M12 fixed for `http-*` templates, just a different unhandled tag.
+- Added `"eol": "eol_software"` to `CATEGORY_MAP` (primary path, via the existing tags loop) and a
+  `["-eol", "eol-", "outdated"]` keyword-matching fallback (for templates that might reference EOL/outdated
+  status without carrying the exact `"eol"` tag) — verified both paths against the real `php-eol` template
+  data and a regression check that M12's `http-*` fix still holds.
+- `eol_software` already resolves correctly in `risk_engine.py`'s `FINDING_CATEGORY_MAP` → `PATCH_HYGIENE`
+  (added in Milestone 15 for the new endoflife.date-based check) — no risk_engine.py change needed; this
+  fix simply lets nuclei's own EOL detections land in the same, already-correct category.
+
+### Backfilled: 27 pre-existing miscategorized findings
+- Recomputed `category` for every `nuclei`-sourced finding from its real `template_id`/`tags` via the fixed
+  `_map_category()` (same method as M12's backfill — only rows that genuinely disagree with the corrected
+  logic are touched). All 27 flipped from `cors_misconfiguration` → `eol_software`: 10 on `pu.go.id`, 17 on
+  `pasarjaya.co.id` — the same two orgs M15's new check had already found real EOL software on.
+- Scoped across all organizations (confirmed via `AskUserQuestion` before running — a cross-org bulk UPDATE
+  needs explicit scope confirmation each time, per the auto-mode classifier, same as M12's precedent).
+- Triggered a fresh `risk.compute` for both orgs afterward: `pu.go.id` 71→72; `pasarjaya.co.id` stayed at
+  50 (moving findings from Misconfiguration's 5% weight to Patch Hygiene's 10% weight roughly canceled out
+  at the rounded-score level — the categorization is what mattered here, not necessarily the aggregate
+  number).
+
+### Verification
+- Added `test_map_category_resolves_eol_templates` to `backend/tests/unit/test_scan_pipeline_state.py`
+  (tag-based match, keyword-fallback match without the tag, a second product name) — verified by installing
+  `pytest` transiently inside `worker-nuclei` per this file's established (documented in its own
+  module-level docstring) collection workaround; all 9 tests in the file pass.
+- `docker compose exec api pytest tests/unit -q --ignore=tests/unit/test_scan_pipeline_state.py` — 152
+  passed, 1 skipped, no regressions (this file doesn't add to that count — its tests live in the
+  workers-dependent file, not `test_eol_intel.py`).
+- Restarted `worker-nuclei` (`workers/` bind-mounted read-write, no rebuild needed) so future scans persist
+  correctly-categorized `*-eol` findings going forward.
+
+---
+
 ## 2026-07-11 — Milestone 15: End-of-Life Software Enrichment (new scanner-family check)
 
 User asked whether already-collected findings/data could be enriched further. Investigation (with the

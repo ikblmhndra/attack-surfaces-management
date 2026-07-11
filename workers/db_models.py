@@ -25,6 +25,7 @@ from app.db.models.models import (
     RiskScore,
     ExploitIntel,
     EolIntel,
+    VersionCveCache,
     Scan,
     ScanFinding,
     ScanPhaseRun,
@@ -42,7 +43,7 @@ from app.db.models.models import (
 __all__ = [
     "Base", "Workspace", "User", "APIKey", "AuditLog",
     "Organization", "Asset", "Subdomain", "IPAddress", "Port",
-    "Technology", "Finding", "RiskScore", "ExploitIntel", "EolIntel", "Scan", "ScanFinding", "ScanPhaseRun",
+    "Technology", "Finding", "RiskScore", "ExploitIntel", "EolIntel", "VersionCveCache", "Scan", "ScanFinding", "ScanPhaseRun",
     "ScanTargetSelection", "DiscoveredAsset", "OutboxEvent",
     "NotificationRule", "Notification", "Screenshot", "ThreatIntel",
     "WebEndpoint", "AssetRelationship",

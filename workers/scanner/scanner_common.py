@@ -104,6 +104,7 @@ def make_finding(
     remediation: str = "",
     references: Optional[List[str]] = None,
     subcategory: Optional[str] = None,
+    cve_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     return {
         "org_id": org_id,
@@ -121,6 +122,7 @@ def make_finding(
         "proof": clean_json(proof or {}),
         "remediation": clean_text(remediation, 5000),
         "references": [clean_text(ref, 1000) for ref in (references or [])[:20]],
+        "cve_ids": [clean_text(cve_id, 100) for cve_id in (cve_ids or [])[:10]],
         "fingerprint": finding_fingerprint(org_id, scanner, check_id, target),
     }
 
@@ -167,7 +169,14 @@ async def persist_findings(db, scan_id: str, findings: Iterable[Dict[str, Any]])
             "source": finding["source"],
             "template_id": finding.get("template_id"),
             "scanner": finding.get("scanner"),
-            "cve_ids": [],
+            # Was hardcoded to [] regardless of what make_finding() actually
+            # produced — never mattered before since no coverage_worker.py
+            # check ever set cve_ids (only nuclei_worker.py's own, separate
+            # persistence path populated it). version_cve_intel-based findings
+            # are the first non-nuclei source that needs this populated (so
+            # M14's EPSS/KEV lookup and cve_id-based filtering apply to them
+            # too), so read it from the finding dict like every other field.
+            "cve_ids": finding.get("cve_ids") or [],
             "cwe_ids": [],
             "affected_url": finding.get("affected_url"),
             "evidence": finding.get("evidence"),

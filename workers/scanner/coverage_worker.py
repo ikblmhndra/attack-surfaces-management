@@ -50,6 +50,7 @@ PHASE_BY_FAMILY = {
     "service": "service_fingerprint",
     "git_secrets": "git_secrets",
     "eol": "eol_check",
+    "version_cve": "version_cve",
 }
 
 RISKY_PORTS = {
@@ -129,6 +130,8 @@ class ScannerCoverageWorker(BaseWorker):
                 findings, summary, selected = await self._scan_git_secrets(org_id, workspace_id, targets, config)
             elif family == "eol":
                 findings, summary, selected = await self._scan_eol(org_id, workspace_id, targets, config)
+            elif family == "version_cve":
+                findings, summary, selected = await self._scan_version_cve(org_id, workspace_id, targets, config)
             else:
                 findings, summary, selected = await self._scan_services(org_id, workspace_id, message.get("services") or [], config)
 
@@ -977,6 +980,85 @@ class ScannerCoverageWorker(BaseWorker):
 
         selected = [{"target": obs["host"], "target_type": "host", "metadata": {"tech": obs["name"], "version": obs["version"]}} for obs in observations]
         summary = {"scanner_family": "eol", "observed": len(observations), "products_checked": len(seen_lookups), "info_observations": observations[:50]}
+        return findings, summary, selected
+
+    async def _scan_version_cve(self, org_id: str, workspace_id: str, targets: List[Any], config: Dict[str, Any]):
+        """Cross-reference already-detected Technology rows against
+        cve.circl.lu's product/version CVE data — catches CVEs nuclei has no
+        template for at all, a broader gap than nuclei_worker.py's own
+        CVE-confidence system (M7's A2), which only scores confidence for
+        CVEs nuclei's own templates already matched. Every finding here is
+        explicitly version-inferred, not confirmed (see version_cve_intel.py's
+        module docstring for why), and carries a low, fixed confidence_score
+        so risk_engine.py's existing confidence-based penalty dampening
+        applies the same way it already does for nuclei's own low-confidence
+        CVE matches. Same safe pattern as _scan_eol: reads an already-
+        populated table (no cross-worker race — Technology rows are written
+        during this same discovery stage, before scanner-family dispatch,
+        unlike WebEndpoint rows which are written by a concurrently-scheduled
+        crawl worker — see web_crawl_worker.py's own GraphQL check for why
+        that distinction mattered)."""
+        from app.services.version_cve_intel import get_matching_cves, VERSION_MATCH_CONFIDENCE, _severity_from_cvss
+
+        max_products = int(config.get("version_cve_max_products", 100))
+        async with get_session() as db:
+            rows = (await db.execute(
+                select(Technology.name, Technology.version, Asset.value)
+                .join(Asset, Asset.id == Technology.asset_id)
+                .where(
+                    Technology.org_id == org_id,
+                    Technology.version.is_not(None),
+                    Technology.version != "",
+                )
+                .limit(max_products)
+            )).all()
+
+        findings: List[Dict[str, Any]] = []
+        observations: List[Dict[str, Any]] = []
+        seen_lookups: Dict[tuple, List[Dict[str, Any]]] = {}
+
+        for name, version, asset_value in rows:
+            lookup_key = (name.strip().lower(), version)
+            if lookup_key not in seen_lookups:
+                async with get_session() as db:
+                    seen_lookups[lookup_key] = await get_matching_cves(db, name, version)
+            matches = seen_lookups[lookup_key]
+            observations.append({"host": asset_value, "name": name, "version": version, "cve_count": len(matches)})
+
+            for cve in matches:
+                findings.append(make_finding(
+                    org_id=org_id,
+                    workspace_id=workspace_id,
+                    scanner="version_cve_correlation",
+                    check_id=f"version_cve_{cve['cve_id'].lower()}",
+                    target=asset_value,
+                    title=f"Potential {cve['cve_id']}: {name} {version} matches a known-affected version range",
+                    severity=_severity_from_cvss(cve.get("cvss_score")),
+                    category="known_cve",
+                    description=(
+                        f"{name} {version}'s version falls within {cve['cve_id']}'s published "
+                        f"affected-version range. This is inferred from version comparison alone — not "
+                        f"a confirmed exploit or template match — the running instance may already carry "
+                        f"a vendor-backported fix without a version-string change. "
+                        f"{cve.get('description', '')[:300]}"
+                    ),
+                    evidence=f"{asset_value} runs {name} {version}, within {cve['cve_id']}'s published affected range.",
+                    proof={
+                        "cve_id": cve["cve_id"],
+                        "cvss_score": cve.get("cvss_score"),
+                        "confidence": "low",
+                        "confidence_score": VERSION_MATCH_CONFIDENCE,
+                        "detection_method": "version_range_correlation",
+                        "detected_version": version,
+                    },
+                    remediation=f"Upgrade {name} past {version}, or confirm via vendor advisory whether "
+                                f"this specific build already carries a backported fix for {cve['cve_id']}.",
+                    references=[f"https://cve.circl.lu/cve/{cve['cve_id']}"],
+                    cve_ids=[cve["cve_id"]],
+                ))
+
+        selected = [{"target": obs["host"], "target_type": "host", "metadata": {"tech": obs["name"], "version": obs["version"]}} for obs in observations]
+        summary = {"scanner_family": "version_cve", "observed": len(observations), "products_checked": len(seen_lookups), "info_observations": observations[:50]}
         return findings, summary, selected
 
     async def _scan_services(self, org_id: str, workspace_id: str, services: List[Dict[str, Any]], config: Dict[str, Any]):

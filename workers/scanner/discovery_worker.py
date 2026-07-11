@@ -236,14 +236,15 @@ class DiscoveryWorker(BaseWorker):
             discovery_evidence: Dict[str, Dict[str, Any]] = {}
             source_health: Dict[str, Dict[str, Any]] = {}
             extra_discoveries: List[Dict[str, Any]] = []
+            known_sans = await self._fetch_known_tls_sans(org_id)
 
             for domain in targets.get("domains", []):
-                subdomains = await self._discover_subdomains_with_sources(domain, tmpdir, config, source_health)
+                subdomains = await self._discover_subdomains_with_sources(domain, tmpdir, config, source_health, known_sans)
                 self._merge_discovery_evidence(discovery_evidence, subdomains)
                 log.info("subdomains_discovered", domain=domain, count=len(subdomains))
 
             extra_discoveries.extend(await self._expand_asn_targets(targets.get("asns", []), config, source_health))
-            extra_discoveries.extend(await self._discover_reverse_dns_targets(targets, config, source_health))
+            extra_discoveries.extend(await self._discover_reverse_dns_targets(org_id, targets, config, source_health))
             extra_discoveries.extend(await self._discover_cloud_storage(targets, config, source_health))
 
             all_subdomains: Set[str] = set(discovery_evidence)
@@ -406,6 +407,7 @@ class DiscoveryWorker(BaseWorker):
         tmpdir: Path,
         config: Dict,
         source_health: Dict[str, Dict[str, Any]],
+        known_sans: Optional[List[str]] = None,
     ) -> Dict[str, Dict[str, Any]]:
         """Run passive/generated discovery and keep per-host source evidence."""
         candidates: Dict[str, Dict[str, Any]] = {}
@@ -476,7 +478,49 @@ class DiscoveryWorker(BaseWorker):
                     evidence={"source": "dns_permutation", "strategy": "env_affix"},
                 )
 
+        if config.get("tls_san_mining", True) and known_sans:
+            # SAN values already sitting in this org's own subdomains.tls_sans
+            # column (collected earlier from certs served by already-in-scope
+            # hosts — no new network requests here). _add_discovery_candidate's
+            # own domain-suffix check discards anything not actually a subdomain
+            # of this root domain, which matters: a shared-hosting cert's SAN
+            # list can carry hundreds of unrelated third-party mail-server
+            # hostnames alongside the org's own — verified against real data
+            # before wiring this (see Milestone 17 CHANGELOG entry).
+            matched = sum(1 for san in known_sans if self._in_domain(san, domain))
+            self._record_source_health(source_health, "tls_san_mining", domain, "ok", count=matched)
+            for san in known_sans:
+                self._add_discovery_candidate(
+                    candidates,
+                    san,
+                    domain,
+                    "tls_san_mining",
+                    generated=False,
+                    evidence={"source": "tls_san_mining"},
+                )
+
         return candidates
+
+    async def _fetch_known_tls_sans(self, org_id: str) -> List[str]:
+        """Every SAN value already collected on this org's Subdomain rows —
+        fetched once per scan and reused across all of the org's root domains,
+        rather than re-querying per domain."""
+        from sqlalchemy import select
+        from workers.db_models import Subdomain
+
+        async with get_session() as db:
+            rows = (await db.execute(
+                select(Subdomain.tls_sans).where(
+                    Subdomain.org_id == org_id,
+                    Subdomain.tls_sans.is_not(None),
+                )
+            )).scalars().all()
+        sans: Set[str] = set()
+        for san_list in rows:
+            for san in (san_list or []):
+                if san:
+                    sans.add(str(san).strip())
+        return sorted(sans)
 
     def _add_discovery_candidate(
         self,
@@ -735,15 +779,35 @@ class DiscoveryWorker(BaseWorker):
             self._record_source_health(source_health, "asn_expansion", source_key, "ok", count=len(prefixes))
         return candidates
 
+    async def _fetch_known_ip_assets(self, org_id: str) -> List[str]:
+        """Already-confirmed IP Asset rows for this org (resolved from a
+        validated in-scope host in a prior scan, per port_worker.py's
+        _persist_ip_assets). Reverse-DNS on these doesn't expand scope at
+        all — it's the same IPs we already have standing to touch — it just
+        extracts more info (co-hosted vhosts not found via forward
+        subdomain enumeration) from data we're already authorized to see."""
+        from sqlalchemy import select
+        from workers.db_models import Asset
+
+        async with get_session() as db:
+            rows = (await db.execute(
+                select(Asset.value).where(
+                    Asset.org_id == org_id, Asset.asset_type == "ip", Asset.status == "active"
+                )
+            )).scalars().all()
+        return [str(v) for v in rows if v]
+
     async def _discover_reverse_dns_targets(
         self,
+        org_id: str,
         targets: Dict[str, Any],
         config: Dict,
         source_health: Dict[str, Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
         if not config.get("reverse_dns_discovery", True):
             return []
-        ip_ranges = targets.get("ip_ranges") or []
+        known_ips = await self._fetch_known_ip_assets(org_id) if config.get("reverse_dns_known_ips", True) else []
+        ip_ranges = list(targets.get("ip_ranges") or []) + known_ips
         if not ip_ranges:
             self._record_source_health(source_health, "reverse_dns", "ip_ranges", "skipped", error="no_ip_ranges")
             return []
@@ -1256,6 +1320,8 @@ class DiscoveryWorker(BaseWorker):
 
         rate = config.get("fuzz_rate", 50)
         timeout = config.get("fuzz_timeout", 10)
+        recursion_depth = int(config.get("fuzz_recursion_depth", 0))
+        extensions = str(config.get("fuzz_extensions", "") or "")
 
         for url in urls[:50]:  # Limit to 50 URLs max to avoid runaway
             parsed = url.rstrip("/")
@@ -1278,6 +1344,12 @@ class DiscoveryWorker(BaseWorker):
                 "-ac",  # Auto-calibrate filtering
                 "-ach",
             ]
+            # See web_crawl_worker.py::_run_ffuf for why these are separate,
+            # bounded, off-by-default flags — same reasoning applies here.
+            if recursion_depth > 0:
+                cmd.extend(["-recursion", "-recursion-depth", str(recursion_depth)])
+            if extensions:
+                cmd.extend(["-e", extensions])
 
             log.info("ffuf_fuzz_started", url=parsed)
             try:
@@ -1941,7 +2013,7 @@ class DiscoveryWorker(BaseWorker):
                 + crawl_scan_targets
                 + (subdomains or [])
             )
-            scanner_families = ["tls", "dns", "takeover", "cloud", "git_secrets", "eol"]
+            scanner_families = ["tls", "dns", "takeover", "cloud", "git_secrets", "eol", "version_cve"]
             async with get_session() as db:
                 for family in scanner_families:
                     await update_scan_phase(
@@ -1954,6 +2026,7 @@ class DiscoveryWorker(BaseWorker):
                             "cloud": "cloud_exposure",
                             "git_secrets": "git_secrets",
                             "eol": "eol_check",
+                            "version_cve": "version_cve",
                         }[family],
                         "queued",
                         targets_total=len(scanner_targets),

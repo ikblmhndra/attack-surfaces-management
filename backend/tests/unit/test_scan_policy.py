@@ -200,6 +200,84 @@ def test_full_scan_effective_config_enables_fuzz_and_js_analysis():
     assert config["crawl_nuclei_batch_size"] == 8
 
 
+def test_full_scan_ffuf_recursion_and_extensions_enabled():
+    """Milestone 19: ffuf was only ever fuzzing one directory level with a bare
+    wordlist. deep_authorized should get bounded recursion + sensitive-file
+    extensions; "quick"/"safe" must not (fuzz is off there entirely already,
+    but confirm these new keys don't leak in regardless)."""
+    full_config = _effective_config("full")
+    quick_config = _effective_config("quick")
+
+    assert full_config["fuzz_recursion_depth"] == 2
+    assert ".bak" in full_config["fuzz_extensions"]
+    assert quick_config.get("fuzz_recursion_depth") is None
+
+
+def test_full_scan_crawl_nuclei_max_targets_exceeds_default_profile():
+    """Milestone 18: deep_authorized's crawl_nuclei_max_targets was 25 — below
+    the "default" profile's own 30, backwards for the platform's most-thorough
+    tier. A real scan (kpi.go.id) had 112 crawled endpoints eligible for a
+    nuclei pass but only 25 got one. Assert the real end-to-end merge chain
+    (not just the profile dict in isolation) actually resolves higher than
+    "default" for a real "full" scan."""
+    full_config = _effective_config("full")
+    default_config = _effective_config("default")
+
+    assert full_config["crawl_nuclei_max_targets"] > default_config["crawl_nuclei_max_targets"]
+    assert full_config["crawl_nuclei_max_targets"] == 100
+
+
+def test_quick_scan_actually_resolves_to_safe_profile_not_deep_authorized():
+    """Milestone 18, most severe finding in this pass: DEFAULT_SCAN_POLICY
+    hardcoded scan_profile="deep_authorized" (plus 7 more keys across
+    budgets/nuclei/enrichment — scan_timeout, crawl_nuclei_batch_size,
+    max_endpoints, max_hosts, automatic_scan, use_tech_tags, enrichment.enabled)
+    — the exact scan-type-agnostic clobbering pattern this same file already
+    documents fixing for crawl.depth and rate_limits.nuclei_concurrency/
+    bulk_size, just never audited for these. Confirmed against real production
+    data: every persisted "quick" scan's config showed scan_profile=
+    deep_authorized, not "safe". A "quick"/lightweight scan request was
+    silently running the full authorized/deep profile (all severities,
+    automatic_scan, network_safe+cloud_exposure+takeover nuclei profiles,
+    900s timeout instead of 300s, 200/2500 crawl budgets instead of 100/1000,
+    enrichment forced back on) instead of "safe"'s deliberately narrower,
+    lower-footprint one — a real operational/authorization-scope concern, not
+    just a config nicety. Assert every one of those 8 keys resolves to
+    "quick"'s own intended value through the real end-to-end merge chain."""
+    config = _effective_config("quick")
+
+    assert config["scan_profile"] == "safe"
+    assert config["scan_timeout"] == 300
+    assert config["automatic_scan"] is False
+    assert config["use_tech_tags"] is False
+    assert config["crawl_max_targets"] == 100
+    assert config["crawl_max_total_urls"] == 1000
+    assert config["crawl_nuclei_batch_size"] == 5
+    assert config["enrichment_enabled"] is False
+    assert config["severities"] == ["critical", "high"]
+    assert "network_safe" not in config["nuclei_profiles"]
+    assert "cloud_exposure" not in config["nuclei_profiles"]
+
+
+def test_vuln_scan_enrichment_disabled_not_clobbered():
+    """Same bug hit "vuln" too: enrichment.enabled=True in the policy dict
+    silently overrode vuln's own enrichment_enabled=False (a pure
+    vulnerability-confirmation pass has no reason to also run asset
+    enrichment)."""
+    config = _effective_config("vuln")
+
+    assert config["enrichment_enabled"] is False
+    assert config["scan_profile"] == "deep_authorized"
+
+
+def test_default_scan_type_resolves_to_default_profile():
+    """Same bug, different scan type: a bare "default" scan_type used to also
+    resolve to deep_authorized via the same policy-layer clobber."""
+    config = _effective_config("default")
+
+    assert config["scan_profile"] == "default"
+
+
 def test_quick_scan_effective_config_leaves_fuzz_disabled():
     """The "safe" profile behind "quick" scans must not be affected by
     deep_authorized's fuzz=True default — each profile's own value should win,

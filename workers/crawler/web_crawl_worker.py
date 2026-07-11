@@ -265,6 +265,16 @@ class WebCrawlWorker(BaseWorker):
                     endpoint["source"] = "js_extracted"
                 validated.extend(js_validated)
 
+            api_spec_result = await self._analyze_api_specs(validated, org_id, workspace_id, config)
+            if api_spec_result["extracted_endpoints"]:
+                api_validated = await self._validate_urls(api_spec_result["extracted_endpoints"], tmpdir, config)
+                for endpoint in api_validated:
+                    endpoint["sources"] = ["api_spec_extracted"]
+                    endpoint["source"] = "api_spec_extracted"
+                validated.extend(api_validated)
+
+            graphql_result = await self._analyze_graphql_endpoints(validated, org_id, workspace_id, config)
+
         async with get_session() as db:
             if not await should_process_scan(db, scan_id):
                 log.info("crawl_results_skipped_inactive_scan", scan_id=scan_id)
@@ -279,6 +289,10 @@ class WebCrawlWorker(BaseWorker):
             )
             if js_result["findings"]:
                 await persist_findings(db, scan_id, js_result["findings"])
+            if api_spec_result["findings"]:
+                await persist_findings(db, scan_id, api_spec_result["findings"])
+            if graphql_result["findings"]:
+                await persist_findings(db, scan_id, graphql_result["findings"])
             await record_target_selections(
                 db,
                 scan_id=scan_id,
@@ -296,6 +310,9 @@ class WebCrawlWorker(BaseWorker):
                 selected_for_nuclei=len(selected_records),
                 js_files_analyzed=js_result["js_files_analyzed"],
                 js_extracted_candidate_subdomains=js_result["extracted_subdomains"],
+                api_specs_analyzed=api_spec_result["specs_analyzed"],
+                api_spec_extracted_endpoints=len(api_spec_result["extracted_endpoints"]),
+                graphql_endpoints_tested=graphql_result["endpoints_tested"],
                 **endpoint_summary,
             )
 
@@ -392,6 +409,8 @@ class WebCrawlWorker(BaseWorker):
         timeout = int(config.get("fuzz_timeout", 10))
         max_time = int(config.get("fuzz_max_time", 120))
         threads = int(config.get("fuzz_threads", 20))
+        recursion_depth = int(config.get("fuzz_recursion_depth", 0))
+        extensions = str(config.get("fuzz_extensions", "") or "")
         semaphore = asyncio.Semaphore(max(1, min(int(config.get("fuzz_concurrency", 3)), 10)))
 
         async def run_target(url: str) -> List[str]:
@@ -413,6 +432,16 @@ class WebCrawlWorker(BaseWorker):
                 "-ac",
                 "-ach",
             ]
+            # "Depth" here means two independent things ffuf supports natively:
+            # descending into discovered directories (-recursion, bounded by
+            # -recursion-depth so it can't run away) and widening each
+            # wordlist entry with common sensitive-file suffixes (-e) — both
+            # off by default (0 / "") so this doesn't change behavior for any
+            # profile that hasn't opted in via scan_profiles.py.
+            if recursion_depth > 0:
+                cmd.extend(["-recursion", "-recursion-depth", str(recursion_depth)])
+            if extensions:
+                cmd.extend(["-e", extensions])
             async with semaphore:
                 await self._run_command(cmd, timeout=max_time + 60, label="ffuf")
 
@@ -571,6 +600,193 @@ class WebCrawlWorker(BaseWorker):
             root = f"{ext.domain}.{ext.suffix}" if ext.domain and ext.suffix else host
             roots.add(root)
         return roots
+
+    async def _analyze_graphql_endpoints(
+        self,
+        validated: List[Dict[str, Any]],
+        org_id: str,
+        workspace_id: str,
+        config: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """GraphQL introspection query test against already-crawled
+        graphql-shaped URLs. Nuclei has no template for this — checked the
+        real nuclei-templates checkout: 39 graphql-related templates exist
+        (playground/voyager/apollo-sandbox exposure, per-implementation
+        fingerprinting), but none send an actual __schema introspection
+        query, so this is genuinely new coverage. Runs in this same worker
+        (not as a separate scanner-family dispatch) deliberately: a
+        discovery-phase scanner-family message and the crawl worker's own
+        endpoint persistence are two independently-scheduled, concurrently-
+        published queue consumers with no ordering guarantee between them —
+        querying WebEndpoint rows for endpoint_type="graphql" from a
+        different worker would race against this worker's own not-yet-
+        committed persistence. Using the endpoint_type this worker just
+        computed in memory for the same crawl pass avoids that entirely."""
+        empty = {"findings": [], "endpoints_tested": 0}
+        if not config.get("graphql_introspection_enabled", True):
+            return empty
+
+        max_targets = int(config.get("graphql_max_targets", 20))
+        graphql_urls: List[str] = []
+        for entry in validated:
+            url = entry.get("url", "")
+            status_class = entry.get("status_class") or _status_class(entry.get("http_status"))
+            if status_class not in {"ok", "redirect"}:
+                continue
+            if not GRAPHQL_PATH_RE.search(urlsplit(url).path):
+                continue
+            graphql_urls.append(url)
+            if len(graphql_urls) >= max_targets:
+                break
+
+        if not graphql_urls:
+            return empty
+
+        introspection_query = {"query": "query IntrospectionQuery { __schema { types { name } } }"}
+        findings: List[Dict[str, Any]] = []
+        timeout = aiohttp.ClientTimeout(total=int(config.get("graphql_timeout", 10)))
+
+        async def probe(session: aiohttp.ClientSession, url: str) -> None:
+            try:
+                async with session.post(
+                    url, json=introspection_query,
+                    headers={"Content-Type": "application/json"}, ssl=False,
+                ) as response:
+                    body = await response.json(content_type=None)
+            except Exception:
+                return
+
+            types = None
+            if isinstance(body, dict):
+                schema = (body.get("data") or {}).get("__schema") if isinstance(body.get("data"), dict) else None
+                types = schema.get("types") if isinstance(schema, dict) else None
+            if not (isinstance(types, list) and types):
+                return
+
+            type_names = [t.get("name") for t in types if isinstance(t, dict) and t.get("name")]
+            findings.append(make_finding(
+                org_id=org_id,
+                workspace_id=workspace_id,
+                scanner="graphql_scanner",
+                check_id="graphql_introspection_enabled",
+                target=url,
+                title="GraphQL introspection enabled",
+                severity="medium",
+                category="exposed_api",
+                description="The GraphQL endpoint responds to a standard introspection query, exposing "
+                            "the full schema (types, fields, mutations) to unauthenticated clients — an "
+                            "attacker-friendly map of the entire API surface.",
+                evidence=f"{url} returned {len(types)} schema types in response to a __schema "
+                         f"introspection query.",
+                proof={"type_count": len(types), "sample_types": type_names[:15]},
+                remediation="Disable introspection in production GraphQL deployments, or require "
+                            "authentication before allowing introspection queries.",
+            ))
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            await asyncio.gather(*(probe(session, url) for url in graphql_urls))
+
+        return {"findings": findings, "endpoints_tested": len(graphql_urls)}
+
+    async def _analyze_api_specs(
+        self,
+        validated: List[Dict[str, Any]],
+        org_id: str,
+        workspace_id: str,
+        config: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Fetch already-crawled Swagger/OpenAPI-shaped URLs and, if the
+        response is a genuine spec document (verified via real JSON structure
+        — a "swagger"/"openapi" or non-empty "paths" key — not just a URL
+        that happens to match /swagger|openapi/: a real target returned a
+        generic app-level JSON error at exactly that path shape during manual
+        verification, so URL pattern alone isn't proof), extract every
+        documented route as a new crawl candidate. API routes are almost never
+        linked from HTML, so a link-following crawler structurally can't find
+        them any other way — a real spec enumerates them directly. Extracted
+        endpoints flow through the same _validate_urls -> _persist_endpoints
+        -> _publish_selected_nuclei path as every other crawler-discovered
+        endpoint (tagged source="api_spec_extracted"), mirroring
+        _analyze_js_endpoints's own established pattern below."""
+        empty = {"findings": [], "extracted_endpoints": [], "specs_analyzed": 0}
+        if not config.get("api_spec_analysis_enabled", True):
+            return empty
+
+        max_specs = int(config.get("api_spec_analysis_max_specs", 10))
+        spec_urls: List[str] = []
+        for entry in validated:
+            url = entry.get("url", "")
+            status_class = entry.get("status_class") or _status_class(entry.get("http_status"))
+            if status_class not in {"ok", "redirect"}:
+                continue
+            if not SWAGGER_PATH_RE.search(urlsplit(url).path):
+                continue
+            spec_urls.append(url)
+            if len(spec_urls) >= max_specs:
+                break
+
+        if not spec_urls:
+            return empty
+
+        findings: List[Dict[str, Any]] = []
+        extracted_endpoints: List[str] = []
+        max_body_bytes = int(config.get("api_spec_analysis_max_bytes", 1_000_000))
+        semaphore = asyncio.Semaphore(int(config.get("api_spec_analysis_concurrency", 5)))
+        timeout = aiohttp.ClientTimeout(total=int(config.get("api_spec_analysis_timeout", 8)))
+
+        async def analyze_one(session: aiohttp.ClientSession, url: str) -> None:
+            async with semaphore:
+                try:
+                    async with session.get(url, allow_redirects=True) as response:
+                        body = await response.content.read(max_body_bytes)
+                except Exception:
+                    return
+
+            try:
+                spec = json.loads(body)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return
+            if not isinstance(spec, dict):
+                return
+            paths = spec.get("paths") if isinstance(spec.get("paths"), dict) else {}
+            is_spec = "swagger" in spec or "openapi" in spec or bool(paths)
+            if not is_spec:
+                return
+
+            base = urlsplit(url)
+            base_path = spec.get("basePath") if isinstance(spec.get("basePath"), str) else ""
+            for route in list(paths.keys())[:200]:
+                if not isinstance(route, str) or not route.startswith("/"):
+                    continue
+                full_path = f"{base_path.rstrip('/')}{route}" if base_path else route
+                extracted_endpoints.append(urlunsplit((base.scheme, base.netloc, full_path, "", "")))
+
+            findings.append(make_finding(
+                org_id=org_id,
+                workspace_id=workspace_id,
+                scanner="api_spec_analysis",
+                check_id="exposed_api_specification",
+                target=url,
+                title="Publicly accessible API specification",
+                severity="low",
+                category="exposed_api",
+                description="A machine-readable API specification (Swagger/OpenAPI) is publicly "
+                            "accessible, enumerating the application's full API surface including "
+                            "routes not otherwise discoverable by crawling.",
+                evidence=f"{url} returned a valid OpenAPI/Swagger document listing {len(paths)} route(s).",
+                proof={"spec_url": url, "route_count": len(paths), "routes_sample": list(paths.keys())[:20]},
+                remediation="Restrict access to API documentation in production, or confirm every "
+                            "listed route is intentionally public.",
+            ))
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            await asyncio.gather(*(analyze_one(session, url) for url in spec_urls))
+
+        return {
+            "findings": findings,
+            "extracted_endpoints": list(dict.fromkeys(extracted_endpoints))[:200],
+            "specs_analyzed": len(spec_urls),
+        }
 
     async def _analyze_js_endpoints(
         self,

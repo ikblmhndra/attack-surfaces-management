@@ -627,6 +627,29 @@ class EolIntel(Base):
     )
 
 
+class VersionCveCache(Base):
+    """Keyless CVE-by-product cache (cve.circl.lu), refreshed if stale rather
+    than fetched-once-forever (unlike EolIntel) — a product's CVE list
+    genuinely grows over time, unlike a cycle's fixed EOL date. Caches the
+    ~20 most recent CVEs per product (bounded — cve.circl.lu paginates at 10
+    per page and some products have 600+ historical CVEs; recent ones are
+    what a nuclei-template gap is most likely to be). See
+    version_cve_intel.py for the version-range matching against a specific
+    detected Technology.version. Global reference data, not tied to any
+    org/workspace, same shape as EolIntel/ExploitIntel."""
+    __tablename__ = "version_cve_cache"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    product = Column(String(100), nullable=False)  # "vendor/product", e.g. "apache/http_server"
+    cves = Column(JSONB, nullable=False, default=list)
+    cached_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("product", name="uq_version_cve_cache_product"),
+    )
+
+
 # ============================================================
 # SCANS
 # ============================================================
