@@ -21,7 +21,9 @@ for path in (ROOT, ROOT / "backend"):
         sys.path.insert(0, str(path))
 
 from workers import scan_state
+from workers.asset_criticality import infer_asset_criticality
 from workers.crawler.web_crawl_worker import WebCrawlWorker
+from workers.scanner.coverage_worker import ScannerCoverageWorker
 from workers.scanner.discovery_worker import DiscoveryWorker, normalize_technology
 from workers.scanner.nuclei_worker import NucleiWorker
 from workers.scanner.port_worker import PortWorker
@@ -491,3 +493,195 @@ def test_make_finding_defaults_cve_ids_to_empty_list():
         description="d", evidence="e",
     )
     assert finding["cve_ids"] == []
+
+
+def test_make_finding_threads_cvss_through():
+    # Stage 2: make_finding() had no cvss_score/cvss_vector parameter at all
+    # until this stage — coverage_worker.py's _scan_version_cve already knew
+    # a matched CVE's cvss_score but had nowhere to put it, leaving
+    # Finding.cvss_score NULL for all 822 real version_cve_correlation
+    # findings and silently disabling risk_engine.py's existing CVSS-blending
+    # code for every one of them.
+    finding = make_finding(
+        org_id="org-1", workspace_id="ws-1", scanner="version_cve_correlation",
+        check_id="version_cve_cve-2026-44631", target="host.example",
+        title="t", severity="critical", category="known_cve",
+        description="d", evidence="e",
+        cvss_score=9.8, cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+    )
+    assert finding["cvss_score"] == 9.8
+    assert finding["cvss_vector"] == "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+
+
+def test_make_finding_defaults_cvss_to_none():
+    finding = make_finding(
+        org_id="org-1", workspace_id="ws-1", scanner="eol_scanner",
+        check_id="eol_php_7.4", target="host.example",
+        title="t", severity="high", category="eol_software",
+        description="d", evidence="e",
+    )
+    assert finding["cvss_score"] is None
+    assert finding["cvss_vector"] is None
+
+
+def test_nuclei_parse_finding_extracts_cvss_vector():
+    # Stage 2: nuclei_worker.py already read classification.cvss-score but
+    # never its sibling cvss-metrics (the vector string) — same dict, same
+    # template, real templates carry both side by side.
+    worker = NucleiWorker()
+    raw = {
+        "template-id": "CVE-2021-44228",
+        "matched-at": "https://host.example/",
+        "info": {
+            "name": "Log4Shell",
+            "severity": "critical",
+            "tags": ["cve", "cve2021", "rce", "vuln"],
+            "classification": {
+                "cve-id": ["CVE-2021-44228"],
+                "cvss-score": 10.0,
+                "cvss-metrics": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H",
+            },
+        },
+    }
+    finding = worker._parse_finding(raw, org_id="org-1", workspace_id="ws-1", scan_id="scan-1")
+    assert finding["cvss_score"] == 10.0
+    assert finding["cvss_vector"] == "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H"
+
+
+def test_nuclei_parse_finding_defaults_cvss_vector_to_none():
+    worker = NucleiWorker()
+    raw = {
+        "template-id": "generic-misconfig",
+        "matched-at": "https://host.example/",
+        "info": {"name": "Generic", "severity": "low", "tags": ["misconfig"], "classification": {}},
+    }
+    finding = worker._parse_finding(raw, org_id="org-1", workspace_id="ws-1", scan_id="scan-1")
+    assert finding["cvss_score"] is None
+    assert finding["cvss_vector"] is None
+
+
+# ── infer_asset_criticality (Stage 1 of the NIST/OWASP risk-engine redesign) ──
+
+def test_infer_asset_criticality_low_value_beats_high_value_keyword():
+    # A staging/dev payment box is still disposable infrastructure — the
+    # environment keyword must dominate the functional keyword, not the
+    # reverse. Real-world case found during backfill dry-run testing.
+    criticality, reason = infer_asset_criticality("api-staging.foo.com", org_criticality=3)
+    assert (criticality, reason) == (2, "low_value_keyword")
+
+
+def test_infer_asset_criticality_high_value_keyword_escalates():
+    criticality, reason = infer_asset_criticality("payment.foo.com", org_criticality=3)
+    assert (criticality, reason) == (4, "high_value_keyword")
+
+
+def test_infer_asset_criticality_root_domain_escalates():
+    criticality, reason = infer_asset_criticality("foo.com", is_root_domain=True, org_criticality=3)
+    assert (criticality, reason) == (4, "root_domain")
+
+
+def test_infer_asset_criticality_prod_keyword_escalates():
+    criticality, reason = infer_asset_criticality("www.foo.com", org_criticality=3)
+    assert (criticality, reason) == (4, "prod_keyword")
+
+
+def test_infer_asset_criticality_plain_subdomain_falls_back_to_org_baseline():
+    criticality, reason = infer_asset_criticality("random.foo.com", org_criticality=3)
+    assert (criticality, reason) == (3, "org_default")
+
+
+def test_infer_asset_criticality_org_baseline_clamped_to_1_5():
+    _, reason = infer_asset_criticality("random.foo.com", org_criticality=99)
+    assert infer_asset_criticality("random.foo.com", org_criticality=99)[0] == 5
+    assert infer_asset_criticality("random.foo.com", org_criticality=-5)[0] == 1
+    assert reason == "org_default"
+
+
+def test_infer_asset_criticality_no_org_criticality_defaults_to_three():
+    criticality, reason = infer_asset_criticality("random.foo.com", org_criticality=None)
+    assert (criticality, reason) == (3, "org_default")
+
+
+def test_infer_asset_criticality_low_value_still_capped_by_high_org_baseline():
+    # min(baseline, 2) — a dev host under an already-critical org still gets
+    # de-prioritized relative to that org's other assets, never escalated.
+    criticality, _ = infer_asset_criticality("dev.foo.com", org_criticality=5)
+    assert criticality == 2
+
+
+def test_infer_asset_criticality_high_value_escalates_above_low_org_baseline():
+    # max(baseline, 4) — a payment-adjacent host still escalates even under a
+    # low-criticality org, since the functional signal is a stronger prior
+    # than an org default nobody has reviewed asset-by-asset yet.
+    criticality, _ = infer_asset_criticality("payment.foo.com", org_criticality=1)
+    assert criticality == 4
+
+
+# ── _scan_version_cve SSVC threading (Stage 3 of the risk-engine redesign) ──
+
+@pytest.mark.asyncio
+async def test_scan_version_cve_threads_ssvc_into_proof(monkeypatch):
+    from contextlib import asynccontextmanager
+
+    worker = ScannerCoverageWorker.__new__(ScannerCoverageWorker)
+
+    tech_rows = [("Apache HTTP Server", "2.4.49", "host.example")]
+    fake_db = _FakeSessionDB(tech_rows)
+
+    @asynccontextmanager
+    async def _fake_get_session():
+        yield fake_db
+
+    monkeypatch.setattr("workers.scanner.coverage_worker.get_session", _fake_get_session)
+
+    async def fake_get_matching_cves(db, name, version):
+        return [{
+            "cve_id": "CVE-2026-49975",
+            "cvss_score": 7.5,
+            "ssvc_exploitation": "poc",
+            "ssvc_automatable": "yes",
+            "description": "test",
+        }]
+    monkeypatch.setattr(
+        "app.services.version_cve_intel.get_matching_cves", fake_get_matching_cves
+    )
+
+    findings, summary, selected = await worker._scan_version_cve(
+        org_id="org-1", workspace_id="ws-1", targets=[], config={},
+    )
+
+    assert len(findings) == 1
+    assert findings[0]["proof"]["ssvc_exploitation"] == "poc"
+    assert findings[0]["proof"]["ssvc_automatable"] == "yes"
+    assert findings[0]["proof"]["cvss_score"] == 7.5
+
+
+@pytest.mark.asyncio
+async def test_scan_version_cve_defaults_ssvc_to_none_when_absent(monkeypatch):
+    from contextlib import asynccontextmanager
+
+    worker = ScannerCoverageWorker.__new__(ScannerCoverageWorker)
+
+    tech_rows = [("PHP", "7.4.33", "host2.example")]
+    fake_db = _FakeSessionDB(tech_rows)
+
+    @asynccontextmanager
+    async def _fake_get_session():
+        yield fake_db
+
+    monkeypatch.setattr("workers.scanner.coverage_worker.get_session", _fake_get_session)
+
+    async def fake_get_matching_cves(db, name, version):
+        # Simulates a stale pre-Stage-3 cache row missing the new keys.
+        return [{"cve_id": "CVE-2026-11111", "cvss_score": 5.0, "description": "test"}]
+    monkeypatch.setattr(
+        "app.services.version_cve_intel.get_matching_cves", fake_get_matching_cves
+    )
+
+    findings, summary, selected = await worker._scan_version_cve(
+        org_id="org-1", workspace_id="ws-1", targets=[], config={},
+    )
+
+    assert len(findings) == 1
+    assert findings[0]["proof"]["ssvc_exploitation"] is None
+    assert findings[0]["proof"]["ssvc_automatable"] is None

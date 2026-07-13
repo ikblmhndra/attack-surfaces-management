@@ -8,11 +8,15 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from app.services.version_cve_intel import (
+    SSVC_AUTOMATABLE_BOOST,
+    SSVC_POC_BOOST,
     VERSION_MATCH_CONFIDENCE,
     _compare_versions,
     _extract_cvss,
+    _extract_ssvc,
     _parse_version_tuple,
     _severity_from_cvss,
+    compute_ssvc_boost,
     get_matching_cves,
     resolve_vendor_product,
     version_in_range,
@@ -126,6 +130,97 @@ class TestExtractCvss:
     def test_no_cvss_anywhere_returns_none(self):
         record = {"containers": {"cna": {"metrics": []}, "adp": []}}
         assert _extract_cvss(record) is None
+
+
+class TestExtractSsvc:
+    """Stage 3: CISA ADP Vulnrichment's SSVC assessment lives in the same
+    containers.adp[].metrics[] list _extract_cvss() walks, under an "other"
+    key shaped {"type": "ssvc", "content": {"options": [...]}} — verified
+    against 3 real cve.circl.lu records before writing this."""
+
+    def test_extracts_from_real_shaped_record(self):
+        record = {
+            "containers": {
+                "cna": {"metrics": []},
+                "adp": [
+                    {"title": "CVE Program Container", "metrics": [{"cvssV3_1": {"baseScore": 7.5}}]},
+                    {"title": "CISA ADP Vulnrichment", "metrics": [
+                        {"other": {"type": "ssvc", "content": {
+                            "timestamp": "2026-01-01", "id": "CVE-2026-49975",
+                            "options": [
+                                {"Exploitation": "poc"},
+                                {"Automatable": "yes"},
+                                {"Technical Impact": "partial"},
+                            ],
+                            "role": "CISA Coordinator", "version": "2.0.3",
+                        }}}
+                    ]},
+                ],
+            }
+        }
+        assert _extract_ssvc(record) == ("poc", "yes")
+
+    def test_active_and_no_pass_through_unmodified(self):
+        record = {
+            "containers": {"adp": [{"metrics": [
+                {"other": {"type": "ssvc", "content": {
+                    "options": [{"Exploitation": "active"}, {"Automatable": "no"}],
+                }}}
+            ]}]}
+        }
+        # Extraction must surface "active" even though scoring ignores it —
+        # observability shouldn't silently drop a real CISA-assessed value.
+        assert _extract_ssvc(record) == ("active", "no")
+
+    def test_no_ssvc_metric_returns_none_none(self):
+        record = {"containers": {"adp": [{"metrics": [{"cvssV3_1": {"baseScore": 7.5}}]}]}}
+        assert _extract_ssvc(record) == (None, None)
+
+    def test_non_ssvc_other_metric_ignored(self):
+        record = {"containers": {"adp": [{"metrics": [{"other": {"type": "not-ssvc", "content": {}}}]}]}}
+        assert _extract_ssvc(record) == (None, None)
+
+    def test_malformed_options_fails_closed(self):
+        record = {
+            "containers": {"adp": [{"metrics": [
+                {"other": {"type": "ssvc", "content": {"options": "not-a-list"}}}
+            ]}]}
+        }
+        assert _extract_ssvc(record) == (None, None)
+
+    def test_missing_containers_returns_none_none(self):
+        assert _extract_ssvc({}) == (None, None)
+        assert _extract_ssvc({"containers": {}}) == (None, None)
+
+
+class TestComputeSsvcBoost:
+    def test_automatable_yes_escalates(self):
+        assert compute_ssvc_boost(exploitation=None, automatable="yes") == SSVC_AUTOMATABLE_BOOST
+
+    def test_exploitation_poc_escalates(self):
+        assert compute_ssvc_boost(exploitation="poc", automatable=None) == SSVC_POC_BOOST
+
+    def test_both_present_takes_max_not_sum(self):
+        assert compute_ssvc_boost(exploitation="poc", automatable="yes") == max(SSVC_POC_BOOST, SSVC_AUTOMATABLE_BOOST)
+
+    def test_exploitation_active_contributes_nothing(self):
+        """Regression guard: CISA KEV already represents "confirmed active
+        exploitation" for the same real-world fact — escalating separately on
+        SSVC's Exploitation=active would risk double-counting KEV's own
+        signal (see CHANGELOG.md). Must stay a deliberate no-op."""
+        assert compute_ssvc_boost(exploitation="active", automatable=None) == 1.0
+        assert compute_ssvc_boost(exploitation="active", automatable="no") == 1.0
+
+    def test_none_or_garbage_defaults_to_neutral(self):
+        assert compute_ssvc_boost(None, None) == 1.0
+        assert compute_ssvc_boost("garbage", "garbage") == 1.0
+
+    def test_boost_ordering_below_kev(self):
+        # KEV_BOOST/KEV_RANSOMWARE_BOOST live in exploit_intel.py (1.5/1.75) —
+        # a CISA-confirmed KEV entry must never lose to an SSVC-only status.
+        from app.services.exploit_intel import KEV_BOOST
+        assert SSVC_POC_BOOST < KEV_BOOST
+        assert SSVC_AUTOMATABLE_BOOST < KEV_BOOST
 
 
 class _FakeCacheRow:

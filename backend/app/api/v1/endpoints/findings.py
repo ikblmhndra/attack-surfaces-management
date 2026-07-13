@@ -9,7 +9,8 @@ from uuid import UUID
 import structlog
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, func, or_, select, text, update
+from sqlalchemy import and_, case, cast, func, or_, select, text, update
+from sqlalchemy import String as SAString
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.dependencies.auth import (
@@ -19,6 +20,7 @@ from app.core.redis_client import cache
 from app.db.models.models import Asset, Finding, Organization, ScanFinding, User
 from app.services.audit_service import audit_log
 from app.services.exploit_intel import get_exploit_intel
+from app.services.finding_grouping import _group_heading
 
 log = structlog.get_logger()
 router = APIRouter()
@@ -124,20 +126,7 @@ async def list_findings(
     total = (await db.execute(count_q)).scalar_one()
 
     # ── Severity counts for stats bar ─────────────────────────
-    sev_counts_q = (
-        select(Finding.severity, func.count(Finding.id).label("cnt"))
-        .where(Finding.workspace_id == workspace_id, Finding.deleted_at.is_(None))
-    )
-    if org_id:
-        sev_counts_q = sev_counts_q.where(Finding.org_id == org_id)
-    if status:
-        sev_counts_q = sev_counts_q.where(Finding.status.in_([s.strip() for s in status.split(",")]))
-    else:
-        sev_counts_q = sev_counts_q.where(Finding.status == "open")
-
-    sev_counts_q = sev_counts_q.group_by(Finding.severity)
-    sev_rows = (await db.execute(sev_counts_q)).all()
-    severity_counts = {row.severity: row.cnt for row in sev_rows}
+    severity_counts = await _compute_severity_counts(db, workspace_id, org_id, status)
 
     # ── Sort ──────────────────────────────────────────────────
     sort_map = {
@@ -152,7 +141,6 @@ async def list_findings(
     sort_col = sort_map.get(sort_by, Finding.severity)
     if sort_by == "severity":
         # Custom severity ordering
-        from sqlalchemy import case
         sort_col = case(
             {sev: i for i, sev in enumerate(["critical", "high", "medium", "low", "info"])},
             value=Finding.severity,
@@ -173,13 +161,202 @@ async def list_findings(
         "page": page,
         "page_size": page_size,
         "pages": max(1, (total + page_size - 1) // page_size),
-        "severity_counts": {
-            "critical": severity_counts.get("critical", 0),
-            "high": severity_counts.get("high", 0),
-            "medium": severity_counts.get("medium", 0),
-            "low": severity_counts.get("low", 0),
-            "info": severity_counts.get("info", 0),
-        },
+        "severity_counts": severity_counts,
+    }
+
+
+async def _compute_severity_counts(
+    db: AsyncSession,
+    workspace_id: UUID,
+    org_id: Optional[UUID] = None,
+    status: Optional[str] = None,
+) -> dict:
+    """Shared by list_findings and list_findings_grouped so the severity stat
+    tiles report byte-identical numbers regardless of which view is active."""
+    sev_counts_q = (
+        select(Finding.severity, func.count(Finding.id).label("cnt"))
+        .where(Finding.workspace_id == workspace_id, Finding.deleted_at.is_(None))
+    )
+    if org_id:
+        sev_counts_q = sev_counts_q.where(Finding.org_id == org_id)
+    if status:
+        sev_counts_q = sev_counts_q.where(Finding.status.in_([s.strip() for s in status.split(",")]))
+    else:
+        sev_counts_q = sev_counts_q.where(Finding.status == "open")
+
+    sev_counts_q = sev_counts_q.group_by(Finding.severity)
+    sev_rows = (await db.execute(sev_counts_q)).all()
+    severity_counts = {row.severity: row.cnt for row in sev_rows}
+    return {
+        "critical": severity_counts.get("critical", 0),
+        "high": severity_counts.get("high", 0),
+        "medium": severity_counts.get("medium", 0),
+        "low": severity_counts.get("low", 0),
+        "info": severity_counts.get("info", 0),
+    }
+
+
+@router.get("/grouped")
+async def list_findings_grouped(
+    org_id: Optional[UUID] = Query(None),
+    severity: Optional[str] = Query(None),
+    status: Optional[str] = Query(None, description="open,resolved,false_positive,accepted"),
+    category: Optional[str] = Query(None),
+    asset_id: Optional[UUID] = Query(None),
+    search: Optional[str] = Query(None),
+    has_cve: Optional[bool] = Query(None),
+    min_cvss: Optional[float] = Query(None, ge=0, le=10),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=500),
+    sort_by: str = Query("severity", description="severity,count,last_seen"),
+    sort_dir: str = Query("asc"),
+    workspace_id: UUID = Depends(get_workspace_id),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Findings collapsed by template_id — one row per underlying issue
+    instead of one row per affected host (e.g. one CVE matched on 25 hosts
+    running the same outdated version becomes a single group of 25).
+    Display-only aggregation: every Finding row is untouched, this only
+    changes how they're presented. See finding_grouping.py for the heading
+    rule and why raw `title` isn't safe to group/display at the group level."""
+    # 3 real findings have scanner=''/template_id IS NULL (manually-seeded,
+    # non-scanner rows) — COALESCE makes each its own singleton group instead
+    # of colliding into one bucket or breaking the GROUP BY.
+    group_key = func.coalesce(Finding.template_id, func.concat("finding-", cast(Finding.id, SAString)))
+
+    # ── Filters (same surface as list_findings, minus template_id/cve_id —
+    # pre-filtering to one template before grouping trivially yields one group) ──
+    filters = [Finding.workspace_id == workspace_id, Finding.deleted_at.is_(None)]
+    if org_id:
+        filters.append(Finding.org_id == org_id)
+    if asset_id:
+        filters.append(Finding.asset_id == asset_id)
+    if severity:
+        filters.append(Finding.severity.in_([s.strip() for s in severity.split(",")]))
+    if status:
+        filters.append(Finding.status.in_([s.strip() for s in status.split(",")]))
+    else:
+        filters.append(Finding.status == "open")
+    if category:
+        filters.append(Finding.category == category)
+    if has_cve is True:
+        filters.append(Finding.cve_ids != [])
+    elif has_cve is False:
+        filters.append(or_(Finding.cve_ids == [], Finding.cve_ids.is_(None)))
+    if min_cvss is not None:
+        filters.append(Finding.cvss_score >= min_cvss)
+    if search:
+        search_term = f"%{search}%"
+        filters.append(or_(
+            Finding.title.ilike(search_term),
+            Finding.description.ilike(search_term),
+            Finding.affected_url.ilike(search_term),
+            Finding.template_id.ilike(search_term),
+        ))
+
+    # ── Counts ────────────────────────────────────────────────
+    total_groups = (await db.execute(
+        select(func.count(func.distinct(group_key))).where(*filters)
+    )).scalar_one()
+    total_findings = (await db.execute(
+        select(func.count(Finding.id)).where(*filters)
+    )).scalar_one()
+    severity_counts = await _compute_severity_counts(db, workspace_id, org_id, status)
+
+    # ── Group aggregate ───────────────────────────────────────
+    # category/severity are confirmed uniform per template_id in real data,
+    # so grouping by them directly (not aggregating) is safe.
+    severity_rank = case(
+        {sev: i for i, sev in enumerate(["critical", "high", "medium", "low", "info"])},
+        value=Finding.severity,
+        else_=99,
+    )
+    group_q = (
+        select(
+            group_key.label("group_key"),
+            Finding.category.label("category"),
+            Finding.severity.label("severity"),
+            severity_rank.label("severity_rank"),
+            func.count(Finding.id).label("finding_count"),
+            func.count(func.distinct(Finding.asset_id)).label("asset_count"),
+            func.count(func.distinct(Finding.affected_url)).label("url_count"),
+            func.max(Finding.cvss_score).label("max_cvss"),
+            func.min(Finding.first_seen).label("first_seen"),
+            func.max(Finding.last_seen).label("last_seen"),
+        )
+        .where(*filters)
+        .group_by(group_key, Finding.category, Finding.severity)
+    )
+
+    if sort_by == "count":
+        order_col = func.count(Finding.id)
+    elif sort_by == "last_seen":
+        order_col = func.max(Finding.last_seen)
+    else:
+        order_col = severity_rank
+    group_q = group_q.order_by(
+        order_col.asc() if sort_dir == "asc" else order_col.desc(),
+        func.count(Finding.id).desc(),  # tie-break: bigger groups surface first
+    ).offset((page - 1) * page_size).limit(page_size)
+
+    group_rows = (await db.execute(group_q)).all()
+    keys_on_page = [r.group_key for r in group_rows]
+
+    # ── Representative finding per group, for heading/click-to-modal ──
+    # Postgres DISTINCT ON, scoped to only this page's group keys.
+    rep_by_key = {}
+    if keys_on_page:
+        rep_q = (
+            select(
+                group_key.label("group_key"),
+                Finding.id.label("sample_finding_id"),
+                Finding.title.label("sample_title"),
+                Finding.template_id.label("template_id"),
+                Finding.template_url.label("template_url"),
+                Finding.affected_url.label("sample_affected_url"),
+                Finding.status.label("sample_status"),
+                Finding.cve_ids.label("cve_ids"),
+            )
+            .where(*filters, group_key.in_(keys_on_page))
+            .distinct(group_key)
+            .order_by(group_key, Finding.last_seen.desc(), Finding.id.desc())
+        )
+        rep_by_key = {r.group_key: r for r in (await db.execute(rep_q)).all()}
+
+    groups = []
+    for r in group_rows:
+        rep = rep_by_key.get(r.group_key)
+        if rep is None:
+            continue
+        heading = _group_heading(rep.sample_title, rep.cve_ids or [], rep.template_id, r.finding_count)
+        groups.append({
+            "group_key": r.group_key,
+            "template_id": rep.template_id,
+            "cve_ids": rep.cve_ids or [],
+            "severity": r.severity,
+            "category": r.category,
+            "finding_count": r.finding_count,
+            "asset_count": r.asset_count,
+            "url_count": r.url_count,
+            "max_cvss": r.max_cvss,
+            "first_seen": r.first_seen.isoformat() if r.first_seen else None,
+            "last_seen": r.last_seen.isoformat() if r.last_seen else None,
+            "sample_finding_id": str(rep.sample_finding_id),
+            "sample_status": rep.sample_status,
+            "sample_affected_url": rep.sample_affected_url,
+            "sample_title": rep.sample_title,
+            **heading,
+        })
+
+    return {
+        "groups": groups,
+        "total": total_groups,
+        "total_findings": total_findings,
+        "page": page,
+        "page_size": page_size,
+        "pages": max(1, (total_groups + page_size - 1) // page_size),
+        "severity_counts": severity_counts,
     }
 
 

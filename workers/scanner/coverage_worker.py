@@ -1035,6 +1035,7 @@ class ScannerCoverageWorker(BaseWorker):
                     title=f"Potential {cve['cve_id']}: {name} {version} matches a known-affected version range",
                     severity=_severity_from_cvss(cve.get("cvss_score")),
                     category="known_cve",
+                    cvss_score=cve.get("cvss_score"),
                     description=(
                         f"{name} {version}'s version falls within {cve['cve_id']}'s published "
                         f"affected-version range. This is inferred from version comparison alone — not "
@@ -1046,6 +1047,8 @@ class ScannerCoverageWorker(BaseWorker):
                     proof={
                         "cve_id": cve["cve_id"],
                         "cvss_score": cve.get("cvss_score"),
+                        "ssvc_exploitation": cve.get("ssvc_exploitation"),
+                        "ssvc_automatable": cve.get("ssvc_automatable"),
                         "confidence": "low",
                         "confidence_score": VERSION_MATCH_CONFIDENCE,
                         "detection_method": "version_range_correlation",

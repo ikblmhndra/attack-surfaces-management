@@ -98,11 +98,14 @@ class RiskWorker(BaseWorker):
 
     async def _load_findings(self, db, org_id: str) -> list:
         """Load all non-excluded findings for scoring."""
-        from workers.db_models import Finding
+        from workers.db_models import Asset, Finding, Organization
         from app.services.exploit_intel import compute_exploit_boost, get_exploit_intel
+        from app.services.risk_engine import combine_criticality
+        from app.services.version_cve_intel import compute_ssvc_boost
 
+        # Finding.asset_id is NOT NULL, so an inner join never drops a finding.
         result = await db.execute(
-            select(Finding).where(
+            select(Finding, Asset.criticality).join(Asset, Asset.id == Finding.asset_id).where(
                 Finding.org_id == org_id,
                 Finding.deleted_at.is_(None),
                 Finding.is_false_positive == False,
@@ -110,7 +113,13 @@ class RiskWorker(BaseWorker):
                 Finding.status.notin_(["resolved", "false_positive"]),
             )
         )
-        findings = result.scalars().all()
+        rows = result.all()
+        findings = [row[0] for row in rows]
+        asset_criticality_by_finding = {row[0].id: row[1] for row in rows}
+
+        org_criticality = (await db.execute(
+            select(Organization.criticality).where(Organization.id == org_id)
+        )).scalar_one_or_none()
 
         all_cve_ids = sorted({cve for f in findings for cve in (f.cve_ids or [])})
         intel_by_cve = await get_exploit_intel(db, all_cve_ids)
@@ -122,12 +131,20 @@ class RiskWorker(BaseWorker):
                 "severity": f.severity,
                 "status": f.status,
                 "confidence": float((f.proof or {}).get("confidence_score", 1.0)),
-                "exploit_boost": compute_exploit_boost(intel_by_cve, f.cve_ids or []),
+                "exploit_boost": max(
+                    compute_exploit_boost(intel_by_cve, f.cve_ids or []),
+                    compute_ssvc_boost(
+                        (f.proof or {}).get("ssvc_exploitation"),
+                        (f.proof or {}).get("ssvc_automatable"),
+                    ),
+                ),
                 "first_seen": f.first_seen,
                 "last_seen": f.last_seen,
                 "is_false_positive": f.is_false_positive,
                 "is_risk_accepted": f.is_risk_accepted,
                 "cvss_score": f.cvss_score,
+                "cvss_vector": f.cvss_vector,
+                "criticality": combine_criticality(asset_criticality_by_finding.get(f.id), org_criticality),
             }
             for f in findings
         ]

@@ -42,6 +42,18 @@ MAX_PAGES_PER_PRODUCT = 2  # ~20 most recent CVEs — bounded; recent CVEs are
                             # not a product's full multi-hundred-CVE history.
 CACHE_MAX_AGE_DAYS = 7
 
+# SSVC (CISA ADP Vulnrichment) escalation — same escalation-only, max()-combined
+# pattern as exploit_intel.py's KEV_BOOST/HIGH_EPSS_BOOST, deliberately ranked
+# below KEV_BOOST (1.5): KEV is *confirmed* real-world exploitation, strictly
+# stronger evidence than either SSVC signal below. Exploitation="active" is
+# deliberately NOT a boost here — CISA KEV already represents "confirmed active
+# exploitation" for the same underlying fact, and the two are not empirically
+# verified to correlate on this platform's real CVE population; escalating on
+# it would risk double-counting KEV's own signal (see CHANGELOG.md).
+SSVC_POC_BOOST = 1.25          # between HIGH_EPSS_BOOST (1.2) and KEV_BOOST (1.5)
+SSVC_AUTOMATABLE_BOOST = 1.3   # scriptable-at-scale ranks above PoC-exists alone,
+                                # but still below KEV_BOOST
+
 # Technology.name (lowercased) -> (vendor, product) for cve.circl.lu's URL path.
 # Deliberately narrow: only products this platform has actually detected with
 # real version data, not an attempt to cover every product in the CVE corpus.
@@ -147,6 +159,45 @@ def _extract_cvss(record: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+def _extract_ssvc(record: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    """CISA ADP Vulnrichment's SSVC assessment lives in the same
+    containers.adp[].metrics[] list _extract_cvss() already walks, under an
+    "other" key (not "cvssvX") whose value is {"type": "ssvc", "content":
+    {"options": [...]}}. options is a LIST of single-key dicts, not a flat
+    dict — verified against real cve.circl.lu records. Extracts raw values
+    as-is (lowercased), no allow-list validation, so a future CISA vocabulary
+    change doesn't silently vanish rather than surface."""
+    containers = record.get("containers", {}) if isinstance(record, dict) else {}
+    for adp in containers.get("adp", []) or []:
+        for metric in adp.get("metrics", []) or []:
+            other = metric.get("other")
+            if not isinstance(other, dict) or other.get("type") != "ssvc":
+                continue
+            options = ((other.get("content") or {}).get("options")) or []
+            flat = {k.lower(): v for d in options if isinstance(d, dict) for k, v in d.items()}
+            exploitation = flat.get("exploitation")
+            automatable = flat.get("automatable")
+            return (
+                exploitation.lower() if isinstance(exploitation, str) else None,
+                automatable.lower() if isinstance(automatable, str) else None,
+            )
+    return (None, None)
+
+
+def compute_ssvc_boost(exploitation: Optional[str], automatable: Optional[str]) -> float:
+    """Escalation-only, floor 1.0, meant to be combined via max() with
+    exploit_intel.py's own EPSS/KEV exploit_boost by the caller — same
+    established pattern as KEV vs. EPSS, not a new mechanism.
+    Exploitation="active" deliberately contributes nothing here (see
+    SSVC_POC_BOOST's module-level comment for why)."""
+    boost = 1.0
+    if automatable == "yes":
+        boost = max(boost, SSVC_AUTOMATABLE_BOOST)
+    if exploitation == "poc":
+        boost = max(boost, SSVC_POC_BOOST)
+    return boost
+
+
 def _severity_from_cvss(score: Optional[float]) -> str:
     if score is None:
         return "medium"
@@ -178,10 +229,13 @@ def _extract_record(cve_id: str, record: Dict[str, Any]) -> Optional[Dict[str, A
             description = str(d["value"])[:1000]
             break
 
+    ssvc_exploitation, ssvc_automatable = _extract_ssvc(record)
     return {
         "cve_id": str(cve_id).upper(),
         "description": description,
         "cvss_score": _extract_cvss(record),
+        "ssvc_exploitation": ssvc_exploitation,  # "none" | "poc" | "active" | None
+        "ssvc_automatable": ssvc_automatable,    # "yes" | "no" | None
         "versions": versions,
     }
 

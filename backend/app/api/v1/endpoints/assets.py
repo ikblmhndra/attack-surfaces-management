@@ -7,12 +7,13 @@ from typing import List, Optional
 from uuid import UUID
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.dependencies.auth import get_current_user, get_db, get_workspace_id, RequireRole
+from app.services.audit_service import audit_log
 from app.db.models.models import (
     Asset, AssetRelationship, Finding, IPAddress, Port,
     Screenshot, Subdomain, Technology, ThreatIntel, User, WebEndpoint,
@@ -34,6 +35,11 @@ class AssetReviewRequest(BaseModel):
         if normalized not in {"approve", "reject", "needs_review"}:
             raise ValueError("decision must be one of: approve, reject, needs_review")
         return normalized
+
+
+class AssetUpdateRequest(BaseModel):
+    criticality: Optional[int] = Field(default=None, ge=1, le=5)
+    environment: Optional[str] = Field(default=None, max_length=50)
 
 
 def _classify_http_status(status_code: Optional[int]) -> str:
@@ -300,6 +306,52 @@ async def get_asset(
     })
 
     return result
+
+
+@router.patch("/{asset_id:uuid}")
+async def update_asset(
+    asset_id: UUID,
+    request: AssetUpdateRequest,
+    bg: BackgroundTasks,
+    workspace_id: UUID = Depends(get_workspace_id),
+    current_user: User = Depends(require_analyst),
+    db: AsyncSession = Depends(get_db),
+):
+    """Manually set an asset's criticality/environment. Risk scoring reads
+    Asset.criticality as a penalty multiplier (see risk_engine.py); until this
+    endpoint existed, every asset was stuck at the schema default of 3
+    forever (see workers/asset_criticality.py for the auto-inferred default
+    new assets get instead). Stamping criticality_source="manual" here is
+    what stops discovery's auto-inference and the one-off backfill script
+    from ever overwriting a human's explicit choice."""
+    asset = await _get_asset_or_404(db, asset_id, workspace_id)
+
+    changes = {}
+    updates = request.model_dump(exclude_none=True)
+    for field, value in updates.items():
+        if getattr(asset, field) != value:
+            changes[field] = {"old": getattr(asset, field), "new": value}
+            setattr(asset, field, value)
+
+    if "criticality" in updates:
+        asset.labels = {**(asset.labels or {}), "criticality_source": "manual"}
+
+    await db.commit()
+    await db.refresh(asset)
+
+    bg.add_task(
+        audit_log,
+        workspace_id=str(workspace_id),
+        user_id=str(current_user.id),
+        action="asset.update",
+        resource_type="asset",
+        resource_id=str(asset_id),
+        changes=changes,
+    )
+
+    sub = (await db.execute(select(Subdomain).where(Subdomain.asset_id == asset_id))).scalar_one_or_none()
+    ip = (await db.execute(select(IPAddress).where(IPAddress.asset_id == asset_id))).scalar_one_or_none()
+    return _asset_to_dict(asset, sub, ip, detailed=True)
 
 
 @router.post("/{asset_id:uuid}/review")

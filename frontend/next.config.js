@@ -42,17 +42,18 @@ const nextConfig = {
     ];
   },
 
-  // Rewrites for development proxy
+  // Rewrites for development proxy. WebSocket connections (useRealtimeEvents.ts,
+  // lib/api.ts) always `new WebSocket(NEXT_PUBLIC_WS_URL)` directly from the
+  // browser, bypassing Next's server-side rewrite proxy entirely — a `/ws/:path*`
+  // rewrite here was unused dead code, and its `ws://` destination isn't a
+  // protocol Next's rewrite validator accepts anyway (only `/`, `http://`,
+  // `https://`), which broke `next dev` startup outright.
   async rewrites() {
     if (process.env.NODE_ENV === "development") {
       return [
         {
           source: "/api/:path*",
           destination: `${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api"}/:path*`,
-        },
-        {
-          source: "/ws/:path*",
-          destination: `${process.env.NEXT_PUBLIC_WS_URL?.replace("wss:", "ws:") || "ws://localhost:8000/ws"}/:path*`,
         },
       ];
     }

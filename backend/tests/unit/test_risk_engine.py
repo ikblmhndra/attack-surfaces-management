@@ -9,13 +9,23 @@ import pytest
 
 from app.services.risk_engine import (
     CategoryScore,
+    CvssImpactMetrics,
     FindingInput,
+    ImpactLevel,
+    LikelihoodLevel,
+    MatrixRating,
     RiskScoringEngine,
     ScoreCategory,
     Severity,
+    combine_criticality,
+    compute_criticality_multiplier,
     compute_decay_factor,
+    compute_impact_level,
+    compute_likelihood_level,
+    compute_matrix_rating,
     compute_org_score,
     compute_severity_penalty,
+    parse_cvss_vector,
     score_to_grade,
 )
 
@@ -131,6 +141,211 @@ class TestSeverityPenalty:
         with_low_boost = compute_severity_penalty("high", confidence=1.0, decay=1.0, exploit_boost=0.3)
         assert with_low_boost == pytest.approx(baseline)
 
+    def test_criticality_multiplier_scales_penalty_up(self):
+        """Stage 1 of the NIST/OWASP risk-engine redesign: a finding on a
+        criticality-5 asset must hurt more than the identical finding on a
+        criticality-3 (default) asset."""
+        baseline = compute_severity_penalty("high", confidence=1.0, decay=1.0, criticality_multiplier=1.0)
+        escalated = compute_severity_penalty("high", confidence=1.0, decay=1.0, criticality_multiplier=1.30)
+        assert escalated == pytest.approx(baseline * 1.30)
+
+    def test_criticality_multiplier_scales_penalty_down(self):
+        """Unlike exploit_boost, criticality_multiplier is NOT floor-clamped at
+        1.0 — a low-criticality (disposable dev/staging) asset must actually
+        see its findings' contribution shrink."""
+        baseline = compute_severity_penalty("high", confidence=1.0, decay=1.0, criticality_multiplier=1.0)
+        deescalated = compute_severity_penalty("high", confidence=1.0, decay=1.0, criticality_multiplier=0.70)
+        assert deescalated == pytest.approx(baseline * 0.70)
+        assert deescalated < baseline
+
+
+class TestCriticalityMultiplier:
+    """Stage 1: Asset/Organization.criticality (1-5) -> scoring multiplier."""
+
+    @pytest.mark.parametrize("criticality,expected", [
+        (1, 0.70), (2, 0.85), (3, 1.00), (4, 1.15), (5, 1.30),
+    ])
+    def test_multiplier_table(self, criticality, expected):
+        assert compute_criticality_multiplier(criticality) == pytest.approx(expected)
+
+    def test_none_defaults_to_neutral(self):
+        assert compute_criticality_multiplier(None) == pytest.approx(1.0)
+
+    def test_out_of_range_defaults_to_neutral(self):
+        assert compute_criticality_multiplier(0) == pytest.approx(1.0)
+        assert compute_criticality_multiplier(6) == pytest.approx(1.0)
+        assert compute_criticality_multiplier(-1) == pytest.approx(1.0)
+
+
+class TestCombineCriticality:
+    """max(asset, org) — an unclassified asset (default 3) falls back to the
+    org's setting; a specifically-flagged asset can still escalate above an
+    otherwise-default org."""
+
+    def test_asset_wins_when_higher(self):
+        assert combine_criticality(asset_criticality=5, org_criticality=3) == 5
+
+    def test_org_wins_when_higher(self):
+        assert combine_criticality(asset_criticality=3, org_criticality=5) == 5
+
+    def test_both_default_falls_back_to_three(self):
+        assert combine_criticality(asset_criticality=None, org_criticality=None) == 3
+
+    def test_asset_none_falls_back_to_org(self):
+        assert combine_criticality(asset_criticality=None, org_criticality=5) == 5
+
+    def test_org_none_falls_back_to_asset(self):
+        assert combine_criticality(asset_criticality=5, org_criticality=None) == 5
+
+    def test_low_asset_does_not_drag_down_high_org(self):
+        """max(), not average — a not-yet-classified low asset shouldn't mute
+        an org the platform already knows is critical."""
+        assert combine_criticality(asset_criticality=1, org_criticality=5) == 5
+
+
+class TestParseCvssVector:
+    """Stage 2: CVSS 3.x vector -> C/I/A/Scope, observability only (no
+    scoring-formula effect this stage — see TestCvssVectorNoScoringEffect)."""
+
+    def test_parses_valid_3_1_vector(self):
+        result = parse_cvss_vector("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")
+        assert result == CvssImpactMetrics(confidentiality="H", integrity="H", availability="H", scope_changed=False)
+
+    def test_parses_valid_3_0_vector(self):
+        result = parse_cvss_vector("CVSS:3.0/AV:N/AC:L/PR:N/UI:N/S:C/C:L/I:L/A:N")
+        assert result == CvssImpactMetrics(confidentiality="L", integrity="L", availability="N", scope_changed=True)
+
+    def test_scope_changed_true_only_for_c(self):
+        assert parse_cvss_vector("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:N/I:N/A:N").scope_changed is True
+        assert parse_cvss_vector("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N").scope_changed is False
+
+    def test_cvss_2_0_rejected(self):
+        # Different C/I/A encoding entirely (N/P/C, not N/L/H) — must not be
+        # misinterpreted as 3.x.
+        assert parse_cvss_vector("CVSS:2.0/AV:N/AC:L/Au:N/C:P/I:P/A:P") is None
+
+    def test_cvss_4_0_rejected(self):
+        # Different structure (VC/VI/VA + SC/SI/SA, no bare C/I/A keys at all).
+        assert parse_cvss_vector("CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N") is None
+
+    def test_missing_prefix_rejected(self):
+        assert parse_cvss_vector("AV:N/AC:L/Au:N/C:P/I:P/A:P") is None
+
+    def test_quoted_vector_still_parses(self):
+        # A handful of real nuclei templates wrap the vector in stray quotes.
+        result = parse_cvss_vector('"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"')
+        assert result == CvssImpactMetrics(confidentiality="H", integrity="H", availability="H", scope_changed=False)
+
+    def test_none_input_returns_none(self):
+        assert parse_cvss_vector(None) is None
+
+    def test_empty_string_returns_none(self):
+        assert parse_cvss_vector("") is None
+
+    def test_non_string_input_returns_none(self):
+        assert parse_cvss_vector(12345) is None  # type: ignore[arg-type]
+
+
+class TestComputeImpactLevel:
+    """Stage 4: CVSS-driven (NVD's own Qualitative Severity Rating Scale
+    boundaries), severity-label fallback when no CVSS, shifted by
+    criticality_multiplier."""
+
+    def test_cvss_boundary_critical(self):
+        assert compute_impact_level("info", 9.0, 1.0) == ImpactLevel.CRITICAL
+        assert compute_impact_level("info", 10.0, 1.0) == ImpactLevel.CRITICAL
+
+    def test_cvss_boundary_just_below_critical(self):
+        assert compute_impact_level("info", 8.9, 1.0) == ImpactLevel.HIGH
+
+    def test_cvss_boundary_high(self):
+        assert compute_impact_level("info", 7.0, 1.0) == ImpactLevel.HIGH
+
+    def test_cvss_boundary_just_below_high(self):
+        assert compute_impact_level("info", 6.9, 1.0) == ImpactLevel.MEDIUM
+
+    def test_cvss_boundary_medium(self):
+        assert compute_impact_level("info", 4.0, 1.0) == ImpactLevel.MEDIUM
+
+    def test_cvss_boundary_just_below_medium(self):
+        assert compute_impact_level("info", 3.9, 1.0) == ImpactLevel.LOW
+
+    def test_no_cvss_falls_back_to_severity(self):
+        assert compute_impact_level("critical", None, 1.0) == ImpactLevel.CRITICAL
+        assert compute_impact_level("high", None, 1.0) == ImpactLevel.HIGH
+        assert compute_impact_level("medium", None, 1.0) == ImpactLevel.MEDIUM
+        assert compute_impact_level("low", None, 1.0) == ImpactLevel.LOW
+        assert compute_impact_level("info", None, 1.0) == ImpactLevel.LOW
+
+    def test_unknown_severity_with_no_cvss_defaults_low(self):
+        assert compute_impact_level("unknown_sev", None, 1.0) == ImpactLevel.LOW
+
+    def test_criticality_shifts_impact_up(self):
+        # criticality_multiplier >= 1.15 (asset/org criticality 4 or 5)
+        assert compute_impact_level("medium", None, 1.15) == ImpactLevel.HIGH
+        assert compute_impact_level("high", None, 1.30) == ImpactLevel.CRITICAL
+
+    def test_criticality_shift_ceilings_at_critical(self):
+        # Already-critical impact must not overflow past the top tier.
+        assert compute_impact_level("critical", None, 1.30) == ImpactLevel.CRITICAL
+
+    def test_criticality_shifts_impact_down(self):
+        # criticality_multiplier <= 0.85 (asset/org criticality 1 or 2)
+        assert compute_impact_level("high", None, 0.85) == ImpactLevel.MEDIUM
+        assert compute_impact_level("medium", None, 0.70) == ImpactLevel.LOW
+
+    def test_criticality_shift_floors_at_low(self):
+        assert compute_impact_level("low", None, 0.70) == ImpactLevel.LOW
+
+    def test_default_criticality_does_not_shift(self):
+        assert compute_impact_level("high", None, 1.00) == ImpactLevel.HIGH
+
+
+class TestComputeLikelihoodLevel:
+    """Stage 4: driven by exploit_boost's 6 real possible values
+    ({1.0, 1.2, 1.25, 1.3, 1.5, 1.75} from exploit_intel.py/version_cve_intel.py's
+    max()-combination in risk_worker.py). Confidence is deliberately not a
+    parameter here at all — see module-level docstring for why."""
+
+    def test_no_signal_is_low(self):
+        assert compute_likelihood_level(1.0) == LikelihoodLevel.LOW
+
+    def test_high_epss_is_medium(self):
+        assert compute_likelihood_level(1.2) == LikelihoodLevel.MEDIUM
+
+    def test_ssvc_poc_is_medium(self):
+        assert compute_likelihood_level(1.25) == LikelihoodLevel.MEDIUM
+
+    def test_ssvc_automatable_is_medium(self):
+        assert compute_likelihood_level(1.3) == LikelihoodLevel.MEDIUM
+
+    def test_kev_is_high(self):
+        assert compute_likelihood_level(1.5) == LikelihoodLevel.HIGH
+
+    def test_kev_ransomware_is_high(self):
+        assert compute_likelihood_level(1.75) == LikelihoodLevel.HIGH
+
+
+class TestRiskMatrix:
+    """Literal test of the OWASP-style lookup table — one assertion per cell."""
+
+    @pytest.mark.parametrize("likelihood,impact,expected", [
+        (LikelihoodLevel.LOW, ImpactLevel.LOW, MatrixRating.NOTE),
+        (LikelihoodLevel.LOW, ImpactLevel.MEDIUM, MatrixRating.LOW),
+        (LikelihoodLevel.LOW, ImpactLevel.HIGH, MatrixRating.MEDIUM),
+        (LikelihoodLevel.LOW, ImpactLevel.CRITICAL, MatrixRating.HIGH),
+        (LikelihoodLevel.MEDIUM, ImpactLevel.LOW, MatrixRating.LOW),
+        (LikelihoodLevel.MEDIUM, ImpactLevel.MEDIUM, MatrixRating.MEDIUM),
+        (LikelihoodLevel.MEDIUM, ImpactLevel.HIGH, MatrixRating.HIGH),
+        (LikelihoodLevel.MEDIUM, ImpactLevel.CRITICAL, MatrixRating.CRITICAL),
+        (LikelihoodLevel.HIGH, ImpactLevel.LOW, MatrixRating.MEDIUM),
+        (LikelihoodLevel.HIGH, ImpactLevel.MEDIUM, MatrixRating.HIGH),
+        (LikelihoodLevel.HIGH, ImpactLevel.HIGH, MatrixRating.CRITICAL),
+        (LikelihoodLevel.HIGH, ImpactLevel.CRITICAL, MatrixRating.CRITICAL),
+    ])
+    def test_matrix_cell(self, likelihood, impact, expected):
+        assert compute_matrix_rating(likelihood, impact) == expected
+
 
 # ── Scoring engine ────────────────────────────────────────────
 
@@ -142,7 +357,8 @@ class TestRiskScoringEngine:
         self.now = datetime.now(timezone.utc)
 
     def _make_finding(self, severity="high", category="open_port", status="open",
-                      confidence=1.0, exploit_boost=1.0, days_ago=0):
+                      confidence=1.0, exploit_boost=1.0, days_ago=0, criticality=3,
+                      cvss_vector=None, cvss_score=None):
         last_seen = self.now - timedelta(days=days_ago)
         return FindingInput(
             id="test-id",
@@ -152,6 +368,9 @@ class TestRiskScoringEngine:
             confidence=confidence,
             exploit_boost=exploit_boost,
             last_seen=last_seen,
+            criticality=criticality,
+            cvss_vector=cvss_vector,
+            cvss_score=cvss_score,
         )
 
     def test_no_findings_perfect_score(self):
@@ -172,7 +391,10 @@ class TestRiskScoringEngine:
             self._make_finding("critical", "exposed_storage"),
         ]
         result = self.engine.compute("org-1", findings, now=self.now)
-        assert result.overall_score <= 60
+        # Stage 4: 4 default-criticality criticals (no CVSS, no exploit intel)
+        # -> Impact=CRITICAL (severity fallback), Likelihood=LOW (exploit_boost
+        # 1.0) -> matrix rating HIGH -> cap 74 (was 60 under the old ad-hoc cap).
+        assert result.overall_score <= 74
 
     def test_false_positives_excluded(self):
         fp = FindingInput(
@@ -199,13 +421,24 @@ class TestRiskScoringEngine:
         assert result.overall_score == 100
 
     def test_old_finding_decays(self):
+        """Stage 4: a single "critical" finding's Likelihood x Impact matrix
+        rating is driven by severity/cvss/exploit_boost/criticality only —
+        deliberately NOT by decay (a stale, still-open Critical-rated
+        vulnerability isn't less risky for having sat open 90 days). So the
+        new cap applies identically to both variants here, masking decay's
+        effect on overall_score exactly the way test_exploit_boost_shifts_
+        category_score_through_full_pipeline and test_criticality_shifts_
+        category_score_through_full_pipeline above already document for their
+        own signals — assert on the (unaffected) category score instead,
+        same established technique."""
         recent_finding = [self._make_finding("critical", "open_port", days_ago=0)]
         old_finding    = [self._make_finding("critical", "open_port", days_ago=90)]
 
         recent_score = self.engine.compute("org-1", recent_finding, now=self.now)
         old_score    = self.engine.compute("org-1", old_finding,    now=self.now)
 
-        assert old_score.overall_score > recent_score.overall_score
+        network_security = ScoreCategory.NETWORK_SECURITY.value
+        assert old_score.score_breakdown[network_security]["score"] > recent_score.score_breakdown[network_security]["score"]
 
     def test_category_scores_populated(self):
         findings = [self._make_finding("high", "missing_spf")]  # DNS category
@@ -231,7 +464,11 @@ class TestRiskScoringEngine:
         high_conf_score = high_conf_result.score_breakdown[patch_hygiene]["score"]
         low_conf_score = low_conf_result.score_breakdown[patch_hygiene]["score"]
         assert low_conf_score > high_conf_score
-        assert low_conf_result.overall_score > high_conf_result.overall_score
+        # Stage 4: a single "high" finding's matrix rating (like the network_security
+        # case above) is driven by severity/cvss/exploit_boost/criticality, not
+        # confidence, so both variants here hit the identical cap — this
+        # docstring's own stated purpose ("shifts a *category* score") is what
+        # the assertion above already proves; no overall_score assertion needed.
 
     def test_exploit_boost_shifts_category_score_through_full_pipeline(self):
         """Milestone 8: a KEV-boosted CVE finding must hurt its category score
@@ -366,7 +603,10 @@ class TestRiskScoringEngine:
     def test_single_high_finding_cannot_reach_grade_a(self):
         findings = [self._make_finding("high", "known_cve")]
         result = self.engine.compute("org-1", findings, now=self.now)
-        assert result.overall_score <= 84
+        # Stage 4: default-criticality high, no CVSS, no exploit intel ->
+        # Impact=HIGH (severity fallback), Likelihood=LOW -> matrix rating
+        # MEDIUM -> cap 89 (was 84 under the old ad-hoc cap).
+        assert result.overall_score <= 89
         assert result.grade != "A"
 
     def test_mediums_only_unaffected_by_high_penalty_cap(self):
@@ -374,6 +614,78 @@ class TestRiskScoringEngine:
         findings = [self._make_finding("medium", "missing_dmarc")]
         result = self.engine.compute("org-1", findings, now=self.now)
         assert result.grade == "A"
+
+    def test_criticality_shifts_category_score_through_full_pipeline(self):
+        """Stage 1: identical findings differing only in criticality (1 vs 5)
+        must produce different category/overall scores in the expected
+        direction, proven through the full compute() pipeline, not just
+        compute_severity_penalty in isolation. "medium"/two findings in the
+        highest-weighted category (exposure_mgmt, 0.18) used deliberately: a
+        single "high" finding always trips the high_penalty>=15 aggregate cap
+        (base penalty is exactly 15.0) regardless of criticality, which would
+        mask the multiplier's effect on overall_score — confirmed via a first
+        draft of this test that tied at the same capped value."""
+        low_criticality = [
+            self._make_finding("medium", "exposed_api", criticality=1),
+            self._make_finding("medium", "exposed_api", criticality=1),
+        ]
+        high_criticality = [
+            self._make_finding("medium", "exposed_api", criticality=5),
+            self._make_finding("medium", "exposed_api", criticality=5),
+        ]
+
+        low_result = self.engine.compute("org-1", low_criticality, now=self.now)
+        high_result = self.engine.compute("org-1", high_criticality, now=self.now)
+
+        exposure_mgmt = ScoreCategory.EXPOSURE_MGMT.value
+        low_score = low_result.score_breakdown[exposure_mgmt]["score"]
+        high_score = high_result.score_breakdown[exposure_mgmt]["score"]
+        assert low_score > high_score
+        assert low_result.overall_score > high_result.overall_score
+
+    def test_default_criticality_matches_pre_stage1_score(self):
+        """A finding with no criticality signal (default 3 -> multiplier 1.0)
+        must score identically to how it did before criticality existed."""
+        finding = [self._make_finding("high", "known_cve", criticality=3)]
+        result = self.engine.compute("org-1", finding, now=self.now)
+        patch_hygiene = result.score_breakdown[ScoreCategory.PATCH_HYGIENE.value]
+        assert patch_hygiene["score"] == 100 - 15  # SEVERITY_PENALTIES["high"], multiplier 1.0
+
+    def test_compute_org_score_passes_through_criticality(self):
+        """The dict->FindingInput convenience wrapper must read a
+        'criticality' key from raw finding dicts (workers/risk/risk_worker.py's
+        _load_findings supplies this via combine_criticality()). Two findings
+        in exposure_mgmt (see test above for why one "high" finding or a
+        smaller-weight category isn't enough to move the rounded overall_score)."""
+        base = {
+            "id": "f1", "category": "exposed_api", "severity": "medium", "status": "open",
+            "confidence": 1.0, "first_seen": self.now, "last_seen": self.now,
+            "is_false_positive": False, "is_risk_accepted": False, "cvss_score": None,
+        }
+        low = compute_org_score("org-test", [{**base, "criticality": 1}, {**base, "id": "f2", "criticality": 1}], total_assets=5)
+        high = compute_org_score("org-test", [{**base, "criticality": 5}, {**base, "id": "f2", "criticality": 5}], total_assets=5)
+        assert low.overall_score > high.overall_score
+
+    def test_cvss_vector_presence_has_zero_scoring_effect(self):
+        """Stage 2: parse_cvss_vector()'s output is stashed into the per-finding
+        penalties audit dict for observability only — compute_severity_penalty()
+        takes no cvss_vector-derived parameter at all this stage. Prove it,
+        don't just assume it: an otherwise-identical finding with vs. without a
+        populated cvss_vector must produce a byte-identical score, including
+        one with Scope Changed (S:C) and full C:H/I:H/A:H impact — the
+        "worst case" vector that a future stage's formula change would most
+        plausibly escalate on."""
+        with_vector = [self._make_finding(
+            "high", "known_cve",
+            cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H",
+        )]
+        without_vector = [self._make_finding("high", "known_cve", cvss_vector=None)]
+
+        with_result = self.engine.compute("org-1", with_vector, now=self.now)
+        without_result = self.engine.compute("org-1", without_vector, now=self.now)
+
+        assert with_result.overall_score == without_result.overall_score
+        assert with_result.score_breakdown == without_result.score_breakdown
 
     def test_different_categories_score_independently(self):
         """Finding in DNS category shouldn't affect network security score."""
@@ -385,6 +697,43 @@ class TestRiskScoringEngine:
 
         assert dns_score     < 100   # DNS affected
         assert network_score == 100  # Network unaffected
+
+    def test_matrix_critical_rating_caps_at_59(self):
+        """Stage 4: a confirmed-KEV (Likelihood=HIGH), CVSS>=9 (Impact=CRITICAL)
+        finding in a low-weight category (misconfiguration, 0.05) — without a
+        cap, weighted_total would land near 100; the matrix-driven cap must
+        still force it down to 59, proving the CRITICAL tier fires on its own,
+        not just alongside the MEDIUM/HIGH tiers below it."""
+        findings = [self._make_finding(
+            "critical", "cors_misconfiguration", cvss_score=9.8, exploit_boost=1.5,
+        )]
+        result = self.engine.compute("org-1", findings, now=self.now)
+        assert result.overall_score <= 59
+
+    def test_matrix_high_rating_caps_at_74(self):
+        """Likelihood=MEDIUM (high EPSS, exploit_boost=1.2) x Impact=HIGH
+        (severity fallback, no CVSS) -> matrix HIGH -> cap 74, distinct from
+        the CRITICAL (59) and MEDIUM (89) tiers."""
+        findings = [self._make_finding("high", "cors_misconfiguration", exploit_boost=1.2)]
+        result = self.engine.compute("org-1", findings, now=self.now)
+        assert result.overall_score <= 74
+
+    def test_matrix_low_rating_does_not_cap(self):
+        """Likelihood=LOW x Impact=MEDIUM -> matrix LOW, which is not in
+        _RATING_CAPS at all -> no cap applied, org can still reach grade A."""
+        findings = [self._make_finding("medium", "missing_dmarc")]
+        result = self.engine.compute("org-1", findings, now=self.now)
+        assert result.grade == "A"
+
+    def test_penalties_dict_includes_matrix_fields(self):
+        findings = [self._make_finding("high", "known_cve", exploit_boost=1.5)]
+        result = self.engine.compute("org-1", findings, now=self.now)
+        cat = result.category_scores[ScoreCategory.PATCH_HYGIENE.value]
+        assert len(cat.penalties) == 1
+        p = cat.penalties[0]
+        assert p["impact"] == ImpactLevel.HIGH.value
+        assert p["likelihood"] == LikelihoodLevel.HIGH.value
+        assert p["matrix_rating"] == MatrixRating.CRITICAL.value
 
 
 # ── Edge cases ────────────────────────────────────────────────

@@ -682,6 +682,7 @@ async def get_score_history(
                 "critical": s.critical_count,
                 "high": s.high_count,
                 "medium": s.medium_count,
+                "score_version": s.score_version,
             }
             for s in scores
         ],

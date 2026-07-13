@@ -57,6 +57,20 @@ SEVERITY_PENALTIES: Dict[Severity, float] = {
     Severity.INFO: 1.0,
 }
 
+# Asset/org criticality (1-5, same scale as Asset.criticality/Organization.criticality)
+# -> penalty multiplier. 3 (the schema default for both) maps to 1.0 so a
+# finding with no criticality signal scores exactly as it did before this
+# field existed. Symmetric around 1.0, not just an escalation floor like
+# exploit_boost — a genuinely low-value asset (e.g. a disposable dev/staging
+# host) should see its findings' contribution shrink, not merely fail to grow.
+CRITICALITY_MULTIPLIERS: Dict[int, float] = {
+    1: 0.70,
+    2: 0.85,
+    3: 1.00,
+    4: 1.15,
+    5: 1.30,
+}
+
 # Finding category → score category mapping
 FINDING_CATEGORY_MAP: Dict[str, ScoreCategory] = {
     # Network
@@ -143,6 +157,20 @@ class FindingInput:
     is_false_positive: bool = False
     is_risk_accepted: bool = False
     cvss_score: Optional[float] = None
+    # combine_criticality(asset.criticality, org.criticality) — unlike
+    # exploit_boost this axis can legitimately reduce a penalty (a low-value
+    # asset should be de-prioritized, not just a high-value one escalated),
+    # so it's applied unclamped in compute_severity_penalty(). Defaults to 3
+    # (CRITICALITY_MULTIPLIERS[3] == 1.0), matching Asset.criticality's own
+    # schema default — a finding with no criticality data behaves exactly as
+    # it did before this field existed.
+    criticality: int = 3
+    # Stage 2 of the redesign: raw CVSS 3.x vector string, parsed for
+    # observability via parse_cvss_vector() below. Not read by
+    # compute_severity_penalty() — the base cvss_score above is already
+    # blended into the penalty; storing the parsed C/I/A/Scope breakdown here
+    # only feeds the per-finding penalties audit dict, no formula effect yet.
+    cvss_vector: Optional[str] = None
 
 
 @dataclass
@@ -179,7 +207,17 @@ class OrgRiskScore:
     score_breakdown: Dict[str, Any]
     score_factors: List[Dict[str, Any]]
     computed_at: datetime
-    score_version: str = "1.0"
+    # 1.0 -> 1.1: added asset/org criticality as a scoring multiplier (Stage 1).
+    # 1.1 -> 1.2: SSVC Automatable/Exploitation=poc escalation (Stage 3;
+    # Stage 2 made no formula change, so no bump).
+    # 1.2 -> 1.3: ad-hoc critical_penalty/high_penalty global cap replaced by
+    # an explicit Likelihood x Impact matrix rating (Stage 4, final stage).
+    # Forensic marker for "which formula produced this row," not surfaced in
+    # any API response or chart annotation by itself — score_version is now
+    # additionally exposed in /scores/history and /{org_id}/score-history so
+    # at least the raw value is queryable, though still no visual chart
+    # annotation (see CHANGELOG.md).
+    score_version: str = "1.3"
 
 
 def score_to_grade(score: int) -> str:
@@ -215,8 +253,183 @@ def compute_decay_factor(last_seen: Optional[datetime], now: Optional[datetime] 
     return math.exp(-DECAY_LAMBDA * days_old)
 
 
+def compute_criticality_multiplier(criticality: Optional[int]) -> float:
+    """Asset/org criticality -> penalty multiplier. Falls back to the neutral
+    3 (-> 1.0) for anything outside 1-5, rather than raising, since this reads
+    a value that ultimately comes from user input (Asset/Organization.criticality)."""
+    c = criticality if criticality in CRITICALITY_MULTIPLIERS else 3
+    return CRITICALITY_MULTIPLIERS[c]
+
+
+def combine_criticality(asset_criticality: Optional[int], org_criticality: Optional[int]) -> int:
+    """Asset.criticality defaults to 3 until manually set or auto-inferred, so
+    max() naturally falls back to the org's own setting for a not-yet-
+    classified asset, while still letting a specifically-flagged critical
+    asset escalate above an otherwise-default org, and an org-wide bump raise
+    every asset's floor."""
+    return max(asset_criticality or 3, org_criticality or 3)
+
+
+@dataclass
+class CvssImpactMetrics:
+    """Parsed Confidentiality/Integrity/Availability impact + Scope from a
+    CVSS 3.x vector string. Observability only for now (Stage 2 of the
+    redesign) — not yet read by compute_severity_penalty(); the base CVSS
+    score is already blended into the penalty below, and a separate
+    Scope-Changed escalation was deliberately deferred (CVSS's own base-score
+    formula already partially reflects Scope, so adding another multiplier
+    from it would re-emphasize an already-partially-counted signal rather
+    than add genuinely new information)."""
+    confidentiality: str  # "N" / "L" / "H"
+    integrity: str
+    availability: str
+    scope_changed: bool
+
+
+def parse_cvss_vector(vector: Optional[str]) -> Optional[CvssImpactMetrics]:
+    """CVSS 3.0/3.1 only — covers ~95% of real nuclei template vectors. CVSS
+    2.0 (different C/I/A encoding: N/P/C) and CVSS 4.0 (separate VC/VI/VA +
+    SC/SI/SA structure) are a different schema entirely and are explicitly
+    out of scope: this fails closed (returns None) rather than misparse them.
+    Also tolerates a stray wrapping quote character and rejects a vector
+    missing the "CVSS:3.x/" prefix outright — both real, if rare, shapes seen
+    in the actual nuclei-templates corpus."""
+    if not vector or not isinstance(vector, str):
+        return None
+    v = vector.strip().strip('"').strip("'")
+    if not (v.startswith("CVSS:3.0/") or v.startswith("CVSS:3.1/")):
+        return None
+    parts = dict(seg.partition(":")[::2] for seg in v.split("/")[1:] if ":" in seg)
+    c, i, a, s = parts.get("C"), parts.get("I"), parts.get("A"), parts.get("S")
+    if c not in ("N", "L", "H") or i not in ("N", "L", "H") or a not in ("N", "L", "H"):
+        return None
+    return CvssImpactMetrics(confidentiality=c, integrity=i, availability=a, scope_changed=(s == "C"))
+
+
+class ImpactLevel(str, Enum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+
+class LikelihoodLevel(str, Enum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+class MatrixRating(str, Enum):
+    NOTE = "note"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+
+_IMPACT_ORDER = [ImpactLevel.LOW, ImpactLevel.MEDIUM, ImpactLevel.HIGH, ImpactLevel.CRITICAL]
+
+# Stage 4 of the redesign: OWASP's own published Risk Rating Methodology 3x3
+# table (Low/Medium/High Likelihood x Low/Medium/High Impact -> Note/Low/
+# Medium/High/Critical), extended by one Impact column the same monotonic way
+# OWASP's own docs describe for a 4th impact tier — each step right/down
+# escalates one level, saturating at Critical in the worst corner.
+_RISK_MATRIX: Dict[Tuple[LikelihoodLevel, ImpactLevel], MatrixRating] = {
+    (LikelihoodLevel.LOW, ImpactLevel.LOW): MatrixRating.NOTE,
+    (LikelihoodLevel.LOW, ImpactLevel.MEDIUM): MatrixRating.LOW,
+    (LikelihoodLevel.LOW, ImpactLevel.HIGH): MatrixRating.MEDIUM,
+    (LikelihoodLevel.LOW, ImpactLevel.CRITICAL): MatrixRating.HIGH,
+    (LikelihoodLevel.MEDIUM, ImpactLevel.LOW): MatrixRating.LOW,
+    (LikelihoodLevel.MEDIUM, ImpactLevel.MEDIUM): MatrixRating.MEDIUM,
+    (LikelihoodLevel.MEDIUM, ImpactLevel.HIGH): MatrixRating.HIGH,
+    (LikelihoodLevel.MEDIUM, ImpactLevel.CRITICAL): MatrixRating.CRITICAL,
+    (LikelihoodLevel.HIGH, ImpactLevel.LOW): MatrixRating.MEDIUM,
+    (LikelihoodLevel.HIGH, ImpactLevel.MEDIUM): MatrixRating.HIGH,
+    (LikelihoodLevel.HIGH, ImpactLevel.HIGH): MatrixRating.CRITICAL,
+    (LikelihoodLevel.HIGH, ImpactLevel.CRITICAL): MatrixRating.CRITICAL,
+}
+
+# score_to_grade's own existing boundaries (90/75/60), minus one — not fresh
+# hand-picked numbers like the ad-hoc cap they replace.
+_RATING_CAPS: Dict[MatrixRating, int] = {
+    MatrixRating.CRITICAL: 59,
+    MatrixRating.HIGH: 74,
+    MatrixRating.MEDIUM: 89,
+}
+
+
+def compute_impact_level(
+    severity: str,
+    cvss: Optional[float],
+    criticality_multiplier: float = 1.0,
+) -> ImpactLevel:
+    """CVSS-driven (NVD's own published Qualitative Severity Rating Scale
+    boundaries), falling back to severity label when no CVSS score exists
+    (43.6% of real findings — non-CVE nuclei/tls/eol checks). Shifted by
+    asset/org criticality: a finding on a criticality>=4 asset escalates one
+    tier (ceiling Critical), criticality<=2 de-escalates one tier (floor Low)
+    — confirmed via real data this correctly rates confirmed-KEV
+    medium-severity findings as Critical, at the accepted cost that an
+    ordinary high-severity/no-exploit-intel finding on a criticality>=4 asset
+    now caps slightly harsher than before this stage (see CHANGELOG.md)."""
+    if cvss is not None and 0 <= cvss <= 10:
+        if cvss >= 9.0:
+            impact = ImpactLevel.CRITICAL
+        elif cvss >= 7.0:
+            impact = ImpactLevel.HIGH
+        elif cvss >= 4.0:
+            impact = ImpactLevel.MEDIUM
+        else:
+            impact = ImpactLevel.LOW
+    else:
+        try:
+            sev = Severity(severity.lower())
+        except ValueError:
+            sev = Severity.INFO
+        impact = {
+            Severity.CRITICAL: ImpactLevel.CRITICAL,
+            Severity.HIGH: ImpactLevel.HIGH,
+            Severity.MEDIUM: ImpactLevel.MEDIUM,
+            Severity.LOW: ImpactLevel.LOW,
+            Severity.INFO: ImpactLevel.LOW,
+        }[sev]
+
+    idx = _IMPACT_ORDER.index(impact)
+    if criticality_multiplier >= 1.15:
+        idx = min(idx + 1, len(_IMPACT_ORDER) - 1)
+    elif criticality_multiplier <= 0.85:
+        idx = max(idx - 1, 0)
+    return _IMPACT_ORDER[idx]
+
+
+def compute_likelihood_level(exploit_boost: float) -> LikelihoodLevel:
+    """Driven by exploit_boost, which can only take one of 6 discrete values
+    today: {1.0, 1.2, 1.25, 1.3, 1.5, 1.75} from exploit_intel.py's KEV/EPSS
+    boost and version_cve_intel.py's SSVC boost, max()-combined in
+    risk_worker.py. Confidence is deliberately NOT a factor here — a real-data
+    check found VERSION_MATCH_CONFIDENCE=0.3 is a fixed per-detection-method
+    constant applied to 69% of real non-KEV high-EPSS findings, so a naive
+    "low confidence demotes Likelihood" rule would have silently suppressed
+    exactly the population Stage 3's exploit-intel work exists to elevate.
+    Confidence keeps its existing, separate role in compute_severity_penalty()."""
+    if exploit_boost >= 1.5:
+        return LikelihoodLevel.HIGH
+    if exploit_boost > 1.0:
+        return LikelihoodLevel.MEDIUM
+    return LikelihoodLevel.LOW
+
+
+def compute_matrix_rating(likelihood: LikelihoodLevel, impact: ImpactLevel) -> MatrixRating:
+    return _RISK_MATRIX[(likelihood, impact)]
+
+
 def compute_severity_penalty(
-    severity: str, confidence: float, decay: float, cvss: Optional[float] = None, exploit_boost: float = 1.0
+    severity: str,
+    confidence: float,
+    decay: float,
+    cvss: Optional[float] = None,
+    exploit_boost: float = 1.0,
+    criticality_multiplier: float = 1.0,
 ) -> float:
     """
     Compute penalty points for a single finding.
@@ -234,7 +447,11 @@ def compute_severity_penalty(
         cvss_penalty = (cvss / 10.0) * SEVERITY_PENALTIES[Severity.CRITICAL]
         base_penalty = (base_penalty + cvss_penalty) / 2
 
-    return base_penalty * confidence * decay * max(1.0, exploit_boost)
+    # criticality_multiplier is deliberately NOT floor-clamped like
+    # max(1.0, exploit_boost) below — it must be able to go below 1.0 so a
+    # low-criticality asset's findings are actually de-prioritized, not just
+    # prevented from being escalated further.
+    return base_penalty * confidence * decay * max(1.0, exploit_boost) * criticality_multiplier
 
 
 class RiskScoringEngine:
@@ -329,18 +546,19 @@ class RiskScoringEngine:
             weighted_total += cat_score.weighted_score
             category_scores[cat.value] = cat_score
 
-        critical_penalty = sum(
-            penalty["penalty"]
-            for cat_score in category_scores.values()
-            for penalty in cat_score.penalties
-            if penalty["severity"].lower() == Severity.CRITICAL.value
-        )
-        high_penalty = sum(
-            penalty["penalty"]
-            for cat_score in category_scores.values()
-            for penalty in cat_score.penalties
-            if penalty["severity"].lower() == Severity.HIGH.value
-        )
+        # Stage 4 of the redesign: per-category weighting alone lets a handful
+        # of real severe findings spread across otherwise-clean categories
+        # average out near 100 — cap the score so that doesn't happen. Driven
+        # by the single worst Likelihood x Impact matrix rating across every
+        # finding org-wide (an explicit OWASP-style classification, not the
+        # ad-hoc critical_penalty/high_penalty sum thresholds this replaced).
+        worst_rating: Optional[MatrixRating] = None
+        rating_order = [MatrixRating.NOTE, MatrixRating.LOW, MatrixRating.MEDIUM, MatrixRating.HIGH, MatrixRating.CRITICAL]
+        for cat_score in category_scores.values():
+            for penalty in cat_score.penalties:
+                rating = MatrixRating(penalty["matrix_rating"])
+                if worst_rating is None or rating_order.index(rating) > rating_order.index(worst_rating):
+                    worst_rating = rating
 
         # Apply bonus for assets with no findings (healthy org)
         if total_assets > 0 and len(active_findings) == 0:
@@ -348,17 +566,8 @@ class RiskScoringEngine:
             weighted_total = min(100, weighted_total + bonus)
 
         overall_score = max(0, min(100, round(weighted_total)))
-        # Per-category weighting alone lets a handful of real HIGH-severity exposures
-        # spread across otherwise-clean categories average out near 100 — cap the grade
-        # so that doesn't happen, same idea as the CRITICAL cap below but softer.
-        if critical_penalty >= 75:
-            overall_score = min(overall_score, 60)
-        elif critical_penalty >= 20:
-            overall_score = min(overall_score, 79)
-        elif high_penalty >= 45:
-            overall_score = min(overall_score, 69)
-        elif high_penalty >= 15:
-            overall_score = min(overall_score, 84)
+        if worst_rating in _RATING_CAPS:
+            overall_score = min(overall_score, _RATING_CAPS[worst_rating])
         grade = score_to_grade(overall_score)
 
         # Build score factors (human-readable impact statements)
@@ -425,14 +634,20 @@ class RiskScoringEngine:
 
         for f in findings:
             decay = compute_decay_factor(f.last_seen, now)
+            criticality_multiplier = compute_criticality_multiplier(f.criticality)
             penalty = compute_severity_penalty(
                 f.severity,
                 f.confidence,
                 decay,
                 f.cvss_score,
                 f.exploit_boost,
+                criticality_multiplier,
             )
             total_penalty += penalty
+            cvss_impact = parse_cvss_vector(f.cvss_vector)
+            impact_level = compute_impact_level(f.severity, f.cvss_score, criticality_multiplier)
+            likelihood_level = compute_likelihood_level(f.exploit_boost)
+            matrix_rating = compute_matrix_rating(likelihood_level, impact_level)
             penalties.append({
                 "finding_id": f.id,
                 "severity": f.severity,
@@ -440,6 +655,21 @@ class RiskScoringEngine:
                 "decay": round(decay, 3),
                 "confidence": f.confidence,
                 "exploit_boost": f.exploit_boost,
+                "criticality": f.criticality,
+                "criticality_multiplier": criticality_multiplier,
+                "cvss_impact": (
+                    {
+                        "confidentiality": cvss_impact.confidentiality,
+                        "integrity": cvss_impact.integrity,
+                        "availability": cvss_impact.availability,
+                        "scope_changed": cvss_impact.scope_changed,
+                    }
+                    if cvss_impact
+                    else None
+                ),
+                "impact": impact_level.value,
+                "likelihood": likelihood_level.value,
+                "matrix_rating": matrix_rating.value,
             })
 
         # Cap total penalty
@@ -552,6 +782,8 @@ def compute_org_score(
             is_false_positive=bool(f.get("is_false_positive", False)),
             is_risk_accepted=bool(f.get("is_risk_accepted", False)),
             cvss_score=f.get("cvss_score"),
+            criticality=int(f.get("criticality", 3)),
+            cvss_vector=f.get("cvss_vector"),
         ))
 
     return engine.compute(org_id, finding_inputs, total_assets)

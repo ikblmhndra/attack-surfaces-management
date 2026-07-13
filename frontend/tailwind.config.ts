@@ -92,6 +92,8 @@ const config: Config = {
         "pulse-slow": "pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite",
         "scan-line": "scanLine 2s linear infinite",
         "counter": "counter 1s ease-out forwards",
+        "collapsible-down": "collapsibleDown 0.15s ease-out",
+        "collapsible-up": "collapsibleUp 0.15s ease-out",
       },
       keyframes: {
         fadeIn: {
@@ -105,6 +107,14 @@ const config: Config = {
         scanLine: {
           "0%": { top: "0%" },
           "100%": { top: "100%" },
+        },
+        collapsibleDown: {
+          from: { height: "0" },
+          to: { height: "var(--radix-collapsible-content-height)" },
+        },
+        collapsibleUp: {
+          from: { height: "var(--radix-collapsible-content-height)" },
+          to: { height: "0" },
         },
       },
       backgroundImage: {

@@ -105,6 +105,8 @@ def make_finding(
     references: Optional[List[str]] = None,
     subcategory: Optional[str] = None,
     cve_ids: Optional[List[str]] = None,
+    cvss_score: Optional[float] = None,
+    cvss_vector: Optional[str] = None,
 ) -> Dict[str, Any]:
     return {
         "org_id": org_id,
@@ -123,6 +125,8 @@ def make_finding(
         "remediation": clean_text(remediation, 5000),
         "references": [clean_text(ref, 1000) for ref in (references or [])[:20]],
         "cve_ids": [clean_text(cve_id, 100) for cve_id in (cve_ids or [])[:10]],
+        "cvss_score": cvss_score,
+        "cvss_vector": cvss_vector,
         "fingerprint": finding_fingerprint(org_id, scanner, check_id, target),
     }
 
@@ -178,6 +182,8 @@ async def persist_findings(db, scan_id: str, findings: Iterable[Dict[str, Any]])
             # too), so read it from the finding dict like every other field.
             "cve_ids": finding.get("cve_ids") or [],
             "cwe_ids": [],
+            "cvss_score": finding.get("cvss_score"),
+            "cvss_vector": finding.get("cvss_vector"),
             "affected_url": finding.get("affected_url"),
             "evidence": finding.get("evidence"),
             "proof": finding.get("proof") or {},
@@ -193,6 +199,7 @@ async def persist_findings(db, scan_id: str, findings: Iterable[Dict[str, Any]])
                 **content_refresh_updates(stmt, [
                     "title", "description", "severity", "category", "subcategory",
                     "affected_url", "evidence", "proof", "remediation", "references",
+                    "cvss_score", "cvss_vector",
                 ]),
             },
         ).returning(Finding.__table__.c.id, Finding.__table__.c.first_seen)

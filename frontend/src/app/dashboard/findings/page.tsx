@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
 import {
   useReactTable,
   getCoreRowModel,
@@ -15,7 +15,7 @@ import {
 import {
   AlertTriangle, ChevronUp, ChevronDown, ChevronsUpDown,
   Filter, Download, ExternalLink, CheckCircle, XCircle,
-  ChevronLeft, ChevronRight, Search, RefreshCw, Eye
+  ChevronLeft, ChevronRight, Search, RefreshCw, Eye, Layers, List
 } from "lucide-react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { formatDistanceToNow, format } from "date-fns";
@@ -25,6 +25,9 @@ import { apiClient } from "@/lib/api";
 import { useWorkspaceStore } from "@/store/workspace";
 import { SeverityBadge, KEVBadge, EPSSBadge, ConfidenceIndicator } from "@/components/ui/SeverityBadge";
 import { FindingDetailModal } from "@/components/modals/FindingDetailModal";
+import { GroupedFindingRow } from "@/components/tables/GroupedFindingRow";
+
+type ViewMode = "grouped" | "flat";
 
 const columnHelper = createColumnHelper<any>();
 
@@ -47,6 +50,20 @@ export default function FindingsPage() {
   const [globalFilter, setGlobalFilter] = useState("");
   const [selectedFinding, setSelectedFinding] = useState<any>(null);
 
+  // Grouped/Flat view toggle — defaults to grouped (a real scan can produce
+  // hundreds of individually-true findings that are really a handful of
+  // underlying issues repeated across many hosts; see finding_grouping.py),
+  // persisted so it's a one-time choice per browser rather than reset every visit.
+  const [viewMode, setViewMode] = useState<ViewMode>("grouped");
+  useEffect(() => {
+    const stored = localStorage.getItem("findings-view-mode");
+    if (stored === "grouped" || stored === "flat") setViewMode(stored);
+  }, []);
+  useEffect(() => {
+    localStorage.setItem("findings-view-mode", viewMode);
+    setPage(1); // group count and finding count differ, avoid landing out-of-range
+  }, [viewMode]);
+
   // Filter state
   const [severityFilter, setSeverityFilter] = useState<string[]>([]);
   const [statusFilter, setStatusFilter] = useState<string>("open");
@@ -68,10 +85,29 @@ export default function FindingsPage() {
     return params.toString();
   }, [page, statusFilter, severityFilter, categoryFilter, globalFilter, activeOrg?.id]);
 
+  // Same active filters, without page/page_size — reused by GroupedFindingRow
+  // to fetch a group's members via the existing, unmodified /findings endpoint.
+  const memberFilterParams = useMemo(() => {
+    const params = new URLSearchParams({ status: statusFilter || "open" });
+    if (activeOrg?.id) params.set("org_id", activeOrg.id);
+    if (severityFilter.length) params.set("severity", severityFilter.join(","));
+    if (categoryFilter) params.set("category", categoryFilter);
+    if (globalFilter) params.set("search", globalFilter);
+    return params.toString();
+  }, [statusFilter, severityFilter, categoryFilter, globalFilter, activeOrg?.id]);
+
   const { data, isLoading, refetch } = useQuery({
     queryKey: ["findings", queryParams],
     queryFn: () => apiClient.get(`/findings?${queryParams}`).then(r => r.data),
     refetchInterval: 30_000,
+    enabled: viewMode === "flat",
+  });
+
+  const { data: groupedData, isLoading: isGroupedLoading, refetch: refetchGrouped } = useQuery({
+    queryKey: ["findings-grouped", queryParams],
+    queryFn: () => apiClient.get(`/findings/grouped?${queryParams}`).then(r => r.data),
+    refetchInterval: 30_000,
+    enabled: viewMode === "grouped",
   });
 
   const exportFindings = async () => {
@@ -267,6 +303,14 @@ export default function FindingsPage() {
     pageCount: data?.pages ?? 1,
   });
 
+  // Unify the two response shapes for the bits shared across both view modes
+  // (severity tiles, pagination) — severity_counts is designed to be
+  // byte-identical between /findings and /findings/grouped.
+  const isGrouped = viewMode === "grouped";
+  const activeSeverityCounts = isGrouped ? groupedData?.severity_counts : data?.severity_counts;
+  const activePages = isGrouped ? groupedData?.pages : data?.pages;
+  const activeTotal = isGrouped ? groupedData?.total : data?.total;
+
   return (
     <div className="p-6 space-y-5">
       {/* Header */}
@@ -274,12 +318,34 @@ export default function FindingsPage() {
         <div>
           <h1 className="text-xl font-semibold text-foreground">Findings</h1>
           <p className="text-sm text-muted-foreground">
-            {data?.total?.toLocaleString() ?? 0} findings · {activeOrg?.name || "All organizations"}
+            {isGrouped
+              ? `${groupedData?.total?.toLocaleString() ?? 0} issues (${groupedData?.total_findings?.toLocaleString() ?? 0} findings)`
+              : `${data?.total?.toLocaleString() ?? 0} findings`} · {activeOrg?.name || "All organizations"}
           </p>
         </div>
         <div className="flex items-center gap-2">
+          <div className="flex items-center bg-surface-800 border border-border rounded-lg p-0.5">
+            <button
+              onClick={() => setViewMode("grouped")}
+              className={cn(
+                "flex items-center gap-1.5 px-2.5 py-1 text-xs rounded-md transition-colors",
+                isGrouped ? "bg-brand-600 text-white" : "text-muted-foreground hover:text-foreground"
+              )}
+            >
+              <Layers className="w-3 h-3" /> Grouped
+            </button>
+            <button
+              onClick={() => setViewMode("flat")}
+              className={cn(
+                "flex items-center gap-1.5 px-2.5 py-1 text-xs rounded-md transition-colors",
+                !isGrouped ? "bg-brand-600 text-white" : "text-muted-foreground hover:text-foreground"
+              )}
+            >
+              <List className="w-3 h-3" /> Flat
+            </button>
+          </div>
           <button
-            onClick={() => refetch()}
+            onClick={() => (isGrouped ? refetchGrouped() : refetch())}
             className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg bg-surface-700 hover:bg-surface-600 border border-surface-600 text-foreground"
           >
             <RefreshCw className="w-3 h-3" /> Refresh
@@ -296,11 +362,11 @@ export default function FindingsPage() {
       {/* Stats bar */}
       <div className="grid grid-cols-5 gap-3">
         {[
-          { label: "Critical", count: data?.severity_counts?.critical ?? 0, color: "#ef4444", sev: "critical" },
-          { label: "High", count: data?.severity_counts?.high ?? 0, color: "#f97316", sev: "high" },
-          { label: "Medium", count: data?.severity_counts?.medium ?? 0, color: "#eab308", sev: "medium" },
-          { label: "Low", count: data?.severity_counts?.low ?? 0, color: "#3b82f6", sev: "low" },
-          { label: "Info", count: data?.severity_counts?.info ?? 0, color: "#6b7280", sev: "info" },
+          { label: "Critical", count: activeSeverityCounts?.critical ?? 0, color: "#ef4444", sev: "critical" },
+          { label: "High", count: activeSeverityCounts?.high ?? 0, color: "#f97316", sev: "high" },
+          { label: "Medium", count: activeSeverityCounts?.medium ?? 0, color: "#eab308", sev: "medium" },
+          { label: "Low", count: activeSeverityCounts?.low ?? 0, color: "#3b82f6", sev: "low" },
+          { label: "Info", count: activeSeverityCounts?.info ?? 0, color: "#6b7280", sev: "info" },
         ].map((s) => (
           <button
             key={s.sev}
@@ -325,7 +391,13 @@ export default function FindingsPage() {
               <div
                 className="h-full rounded-full"
                 style={{
-                  width: `${data?.total ? (s.count / data.total) * 100 : 0}%`,
+                  // severity_counts always counts individual findings (not
+                  // groups), so the bar denominator uses total_findings in
+                  // grouped mode, not the group count.
+                  width: `${(() => {
+                    const denom = isGrouped ? groupedData?.total_findings : data?.total;
+                    return denom ? (s.count / denom) * 100 : 0;
+                  })()}%`,
                   backgroundColor: s.color,
                   opacity: 0.7,
                 }}
@@ -391,80 +463,113 @@ export default function FindingsPage() {
 
       {/* Table */}
       <div className="glass-card overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full data-table">
-            <thead>
-              {table.getHeaderGroups().map((headerGroup) => (
-                <tr key={headerGroup.id}>
-                  {headerGroup.headers.map((header) => (
-                    <th
-                      key={header.id}
-                      style={{ width: header.column.getSize() }}
-                      className={cn(header.column.getCanSort() && "cursor-pointer select-none")}
-                      onClick={header.column.getToggleSortingHandler()}
-                    >
-                      <div className="flex items-center gap-1">
-                        {flexRender(header.column.columnDef.header, header.getContext())}
-                        {header.column.getCanSort() && (
-                          <span className="text-muted-foreground">
-                            {header.column.getIsSorted() === "asc" ? (
-                              <ChevronUp className="w-3 h-3" />
-                            ) : header.column.getIsSorted() === "desc" ? (
-                              <ChevronDown className="w-3 h-3" />
-                            ) : (
-                              <ChevronsUpDown className="w-3 h-3 opacity-40" />
-                            )}
-                          </span>
-                        )}
-                      </div>
-                    </th>
-                  ))}
-                </tr>
-              ))}
-            </thead>
-            <tbody>
-              {isLoading ? (
-                Array.from({ length: 10 }).map((_, i) => (
-                  <tr key={i}>
-                    {columns.map((_, j) => (
-                      <td key={j}>
-                        <div className="skeleton h-4 rounded" style={{ width: `${60 + Math.random() * 40}%` }} />
-                      </td>
+        {isGrouped ? (
+          <div className="divide-y divide-border/50">
+            <div className="flex items-center gap-3 px-4 py-2 text-xs font-medium text-muted-foreground bg-surface-800/40">
+              <span className="w-4 shrink-0" />
+              <span className="w-[70px] shrink-0">Severity</span>
+              <span className="flex-1">Issue</span>
+              <span className="w-40 shrink-0">Findings / Hosts</span>
+              <span className="w-28 shrink-0 text-right">Last Seen</span>
+            </div>
+            {isGroupedLoading ? (
+              Array.from({ length: 10 }).map((_, i) => (
+                <div key={i} className="px-4 py-3">
+                  <div className="skeleton h-4 rounded" style={{ width: `${60 + Math.random() * 40}%` }} />
+                </div>
+              ))
+            ) : (groupedData?.groups ?? []).length === 0 ? (
+              <div className="text-center py-16 text-muted-foreground">
+                <AlertTriangle className="w-8 h-8 mx-auto mb-2 opacity-30" />
+                <p className="text-sm">No findings match your filters</p>
+              </div>
+            ) : (
+              groupedData.groups.map((g: any) => (
+                <GroupedFindingRow
+                  key={g.group_key}
+                  group={g}
+                  filterParams={memberFilterParams}
+                  onSelectFinding={setSelectedFinding}
+                />
+              ))
+            )}
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full data-table">
+              <thead>
+                {table.getHeaderGroups().map((headerGroup) => (
+                  <tr key={headerGroup.id}>
+                    {headerGroup.headers.map((header) => (
+                      <th
+                        key={header.id}
+                        style={{ width: header.column.getSize() }}
+                        className={cn(header.column.getCanSort() && "cursor-pointer select-none")}
+                        onClick={header.column.getToggleSortingHandler()}
+                      >
+                        <div className="flex items-center gap-1">
+                          {flexRender(header.column.columnDef.header, header.getContext())}
+                          {header.column.getCanSort() && (
+                            <span className="text-muted-foreground">
+                              {header.column.getIsSorted() === "asc" ? (
+                                <ChevronUp className="w-3 h-3" />
+                              ) : header.column.getIsSorted() === "desc" ? (
+                                <ChevronDown className="w-3 h-3" />
+                              ) : (
+                                <ChevronsUpDown className="w-3 h-3 opacity-40" />
+                              )}
+                            </span>
+                          )}
+                        </div>
+                      </th>
                     ))}
                   </tr>
-                ))
-              ) : table.getRowModel().rows.length === 0 ? (
-                <tr>
-                  <td colSpan={columns.length} className="text-center py-16 text-muted-foreground">
-                    <AlertTriangle className="w-8 h-8 mx-auto mb-2 opacity-30" />
-                    <p className="text-sm">No findings match your filters</p>
-                  </td>
-                </tr>
-              ) : (
-                table.getRowModel().rows.map((row) => (
-                  <motion.tr
-                    key={row.id}
-                    className="group cursor-pointer"
-                    onClick={() => setSelectedFinding(row.original)}
-                    whileHover={{ backgroundColor: "rgba(30,41,59,0.4)" }}
-                  >
-                    {row.getVisibleCells().map((cell) => (
-                      <td key={cell.id}>
-                        {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                      </td>
-                    ))}
-                  </motion.tr>
-                ))
-              )}
-            </tbody>
-          </table>
-        </div>
+                ))}
+              </thead>
+              <tbody>
+                {isLoading ? (
+                  Array.from({ length: 10 }).map((_, i) => (
+                    <tr key={i}>
+                      {columns.map((_, j) => (
+                        <td key={j}>
+                          <div className="skeleton h-4 rounded" style={{ width: `${60 + Math.random() * 40}%` }} />
+                        </td>
+                      ))}
+                    </tr>
+                  ))
+                ) : table.getRowModel().rows.length === 0 ? (
+                  <tr>
+                    <td colSpan={columns.length} className="text-center py-16 text-muted-foreground">
+                      <AlertTriangle className="w-8 h-8 mx-auto mb-2 opacity-30" />
+                      <p className="text-sm">No findings match your filters</p>
+                    </td>
+                  </tr>
+                ) : (
+                  table.getRowModel().rows.map((row) => (
+                    <motion.tr
+                      key={row.id}
+                      className="group cursor-pointer"
+                      onClick={() => setSelectedFinding(row.original)}
+                      whileHover={{ backgroundColor: "rgba(30,41,59,0.4)" }}
+                    >
+                      {row.getVisibleCells().map((cell) => (
+                        <td key={cell.id}>
+                          {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                        </td>
+                      ))}
+                    </motion.tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        )}
 
         {/* Pagination */}
-        {data && data.pages > 1 && (
+        {activePages && activePages > 1 && (
           <div className="flex items-center justify-between px-4 py-3 border-t border-border">
             <span className="text-xs text-muted-foreground">
-              Page {page} of {data.pages} · {data.total.toLocaleString()} total
+              Page {page} of {activePages} · {(activeTotal ?? 0).toLocaleString()} total
             </span>
             <div className="flex items-center gap-1.5">
               <button
@@ -474,8 +579,8 @@ export default function FindingsPage() {
               >
                 <ChevronLeft className="w-4 h-4" />
               </button>
-              {Array.from({ length: Math.min(5, data.pages) }, (_, i) => {
-                const pageNum = Math.max(1, Math.min(page - 2, data.pages - 4)) + i;
+              {Array.from({ length: Math.min(5, activePages) }, (_, i) => {
+                const pageNum = Math.max(1, Math.min(page - 2, activePages - 4)) + i;
                 return (
                   <button
                     key={pageNum}
@@ -492,8 +597,8 @@ export default function FindingsPage() {
                 );
               })}
               <button
-                onClick={() => setPage(p => Math.min(data.pages, p + 1))}
-                disabled={page === data.pages}
+                onClick={() => setPage(p => Math.min(activePages, p + 1))}
+                disabled={page === activePages}
                 className="p-1.5 rounded hover:bg-surface-700 disabled:opacity-40 text-muted-foreground hover:text-foreground"
               >
                 <ChevronRight className="w-4 h-4" />

@@ -33,7 +33,7 @@ async def score_history(org_id: Optional[UUID] = Query(None), days: int = Query(
     if org_id:
         query = query.where(RiskScore.org_id == org_id)
     scores = (await db.execute(query.order_by(RiskScore.computed_at.asc()))).scalars().all()
-    return {"history": [{"date": s.computed_at.isoformat(), "score": s.overall_score, "grade": s.grade, "org_id": str(s.org_id)} for s in scores]}
+    return {"history": [{"date": s.computed_at.isoformat(), "score": s.overall_score, "grade": s.grade, "org_id": str(s.org_id), "score_version": s.score_version} for s in scores]}
 
 @router.get("/breakdown")
 async def score_breakdown(org_id: UUID = Query(...),

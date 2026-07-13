@@ -4,6 +4,484 @@ All notable changes to this project are documented below, sorted newest-first.
 
 ---
 
+## 2026-07-13 — Grouped/deduplicated findings view
+
+A real end-to-end validation scan (fresh `pasarjaya.co.id` org, run right after the risk-engine redesign
+finished) surfaced a concrete triage problem: 536 `version_cve_correlation` findings, but only 41 distinct
+CVEs behind them — each CVE repeats ~13-25x because the same outdated software version runs on many hosts.
+Not a false-positive/accuracy problem (every row is a real, individually-true finding on a specific host) —
+a display/triage volume problem. Added an opt-out-able grouped view that collapses repeats of the same
+underlying issue into one row, expandable to the individual findings, without touching detection logic.
+
+### Added
+- **`GET /findings/grouped`** (`backend/app/api/v1/endpoints/findings.py`) — new endpoint, same filter
+  surface as the existing `GET /findings` (org_id/severity/status/category/search/has_cve/min_cvss), groups
+  by `Finding.template_id` (already indexed; confirmed universal and safe across every scanner, not just
+  version_cve_correlation — category/severity are confirmed uniform per template_id in real data). The 3
+  real `scanner=''`/`template_id IS NULL` rows (manually-seeded, non-scanner findings) get
+  `COALESCE`'d into their own singleton groups rather than colliding into one bucket. Returns per-group
+  `finding_count`/`asset_count`/`max_cvss`/`first_seen`/`last_seen` plus a representative sample finding
+  (Postgres `DISTINCT ON`, most-recently-seen member) used for the heading. Extracted the existing
+  severity-counts block out of `list_findings` into a shared `_compute_severity_counts()` helper so the
+  severity stat tiles report byte-identical numbers in both views.
+- **`backend/app/services/finding_grouping.py`** (new) — `_group_heading()`: raw `title` is unsafe as a
+  group-level label for CVE-bearing groups (it embeds the matched version string, varies per host —
+  confirmed one real CVE's template_id spans 8 distinct title variants), so CVE groups head with the
+  uppercased CVE ID instead (stable across all members), with the sample title shown as an explicit
+  "e.g., ..." example rather than implied-canonical. Non-CVE groups (confirmed single-variant per
+  template_id in real data) show the raw title verbatim.
+- **Frontend**: new Grouped/Flat toggle on the Findings page (`frontend/src/app/dashboard/findings/page.tsx`),
+  **defaults to Grouped** (confirmed with the user — directly serves the motivating problem; accepted
+  trade-off that per-row bulk actions now need a group expanded first), persisted per-browser via
+  `localStorage`. New `GroupedFindingRow.tsx` (`components/tables/`) renders each group as a `Collapsible`
+  row (severity/CVE badge, heading/subheading, finding+host counts, last-seen), lazily fetching a group's
+  members on expand via the *existing, unmodified* `GET /findings?template_id=...` (zero new backend code
+  needed for this — that endpoint already supported `template_id` filtering). New
+  `components/ui/Collapsible.tsx` wraps `@radix-ui/react-collapsible` — confirmed already an installed
+  dependency with zero usages anywhere in the app before this (first radix-based primitive in the
+  frontend); added matching keyframes to `tailwind.config.ts`.
+- **Tests**: `backend/tests/unit/test_finding_grouping.py` (7 cases — CVE heading uppercasing, singular vs
+  plural subheading framing, non-CVE verbatim-title path, the singleton-fallback no-scanner-row case, a
+  defensive empty-input case). Full suite: **267 passed, 1 skipped** (was 260).
+
+### Fixed (prerequisite, found while verifying this in a browser)
+- **`frontend/next.config.js`**: the dev-mode `/ws/:path*` rewrite crashed `next dev` outright (Next's
+  rewrite validator rejects `ws://` destinations — only `/`, `http://`, `https://` are accepted). Confirmed
+  via grep this rewrite was also dead code regardless: both real WebSocket call sites
+  (`lib/useRealtimeEvents.ts`, `lib/api.ts`) always `new WebSocket(NEXT_PUBLIC_WS_URL)` directly from the
+  browser, bypassing Next's server-side rewrite proxy entirely — removed the rewrite rather than trying to
+  fix its destination.
+
+### Verified against real production data
+- Hit `GET /findings/grouped` directly against the fresh `pasarjaya.co.id` org: **68 groups, 645 total
+  findings** — cross-checked against a direct `SELECT COUNT(DISTINCT COALESCE(template_id, 'finding-'||
+  id::text))` / `COUNT(*)` query, exact match.
+- Verified the lazy-expansion path for a real 25-member CVE group
+  (`GET /findings?template_id=version_cve_cve-2026-42535`): returned exactly 25 items, matching the
+  group's `finding_count` exactly.
+- `npx tsc --noEmit` clean, `npm run lint` clean (only pre-existing warnings in unrelated files).
+- Dev server verified to build and serve the Findings page with zero compile/runtime errors (1518 modules)
+  after the `next.config.js` fix above.
+- **Honest limitation**: no browser-automation tooling is available in this environment, so the actual
+  rendered toggle/expand/collapse interaction was not visually click-tested — verification stopped at
+  confirmed-correct API responses, a clean type-check/lint, and a successfully-serving dev build. A quick
+  manual look at `localhost:3000/dashboard/findings` is recommended before considering this fully done.
+
+### Explicitly not in scope
+Any change to detection logic or finding volume — display-only aggregation. Bulk actions operating on a
+whole group at once (a reasonable follow-up, needs a new bulk-update endpoint). A DB-backed integration
+test harness for the new endpoint (would be the first one in the repo; the GROUP BY/DISTINCT ON SQL
+correctness was verified against real data manually instead, matching this session's established practice).
+
+---
+
+## 2026-07-12 — Risk Engine Redesign, Stage 4 (final): Likelihood × Impact matrix
+
+Fourth and final stage of the NIST/OWASP-aligned risk-engine redesign (Stage 1: asset/org criticality
+multiplier; Stage 2: CVSS score/vector data flow; Stage 3: SSVC escalation). Stage 4's originally-stated
+goal: "Full restructure to an explicit Likelihood × Impact matrix, replacing the ad-hoc
+`critical_penalty`/`high_penalty` global score-cap heuristic."
+
+### Investigation before implementation (2 Explore agents + a Plan agent, all grounded in live code/DB)
+- **A large hidden blast-radius constraint**: `RiskScore`'s ORM has 9 dedicated integer columns
+  (`network_security_score`, etc.) *in addition to* the JSONB `score_breakdown` — `risk_worker.py`
+  writes them via hardcoded lookups, and `report_service.py` reads them **directly by column name**,
+  never touching the JSONB. A genuine "full restructure" of category scoring would require a migration
+  and touch report generation — a materially bigger, riskier change than anything Stages 1-3 did.
+- **Real signal distributions overturned the naive design**: across 1,335 real open findings on the 3
+  target orgs, critical+high severity = 45.6% of everything (not a small minority — severity alone
+  barely discriminates). `Asset.criticality` is 98.1% constant at 5 for these orgs (Stage 1's own
+  org-ceiling finding recurring). SSVC fields are still 100% NULL on every real persisted finding (Stage
+  3's code is correct, but no rescan has touched these rows yet). The only signal that actually
+  discriminates today is exploit intelligence (KEV/EPSS) and, secondarily, CVSS score.
+
+### Decision: scope kept to a "narrow" replacement, not a full restructure
+Kept the entire 9-category weighted-sum scoring, `CATEGORY_WEIGHTS`, the `RiskScore` DB schema, and
+`report_service.py` completely untouched — zero migration, zero blast radius there. Replaced **only** the
+ad-hoc global cap block with a principled per-finding Likelihood×Impact classification, whose worst
+org-wide rating drives a new, still-simple cap. A "full" restructure (rewriting category-scoring math,
+requiring a schema migration) was designed and rejected as disproportionate for stage 4 of 4 given Stages
+1-3's established size/risk cadence — left as a possible future Stage 4a (schema/report decoupling) /
+Stage 4b (math rewrite) split, not attempted now.
+
+Two more decisions confirmed via AskUserQuestion before implementation:
+1. **Keep an asset/org-criticality shift on the Impact axis.** Verified this correctly rates all 8 real
+   CISA-KEV-confirmed findings on `kpi.go.id` as Critical (2 of them are only medium-severity, CVSS
+   5.4-6.1, but are confirmed actively exploited — getting this right matters more). **Accepted, stated
+   trade-off**: an ordinary high-severity finding with zero exploit intelligence on a criticality≥4 asset
+   (the dominant ~98% case in real data) now caps 10 points harsher than before this stage (74 vs. 84).
+2. **Confidence excluded from the Likelihood axis.** Live data showed `VERSION_MATCH_CONFIDENCE=0.3` is a
+   fixed per-detection-method constant applied to 69% of real non-KEV high-EPSS findings; a naive "low
+   confidence demotes Likelihood" rule would have silently suppressed exactly the population Stage 3
+   exists to elevate. Confidence keeps its existing, separate multiplicative role in
+   `compute_severity_penalty()` — not removed, just not double-applied here.
+
+### Added
+- **Impact axis** (`ImpactLevel`, `compute_impact_level()`): CVSS-driven using NVD's own published
+  Qualitative Severity Rating Scale boundaries (≥9.0 Critical, 7.0-9.0 High, 4.0-7.0 Medium, <4.0 Low),
+  falling back to severity label when no CVSS exists (43.6% of real findings), then shifted one tier by
+  `criticality_multiplier` per decision 1 above.
+- **Likelihood axis** (`LikelihoodLevel`, `compute_likelihood_level()`): driven by `exploit_boost`, which
+  can only take one of 6 discrete real values (`{1.0, 1.2, 1.25, 1.3, 1.5, 1.75}` from
+  `exploit_intel.py`/`version_cve_intel.py`'s `max()`-combination) — cleanly partitioned at `>=1.5` (High,
+  KEV) and `>1.0` (Medium, EPSS/SSVC).
+- **`MatrixRating` + `_RISK_MATRIX`**: OWASP's own published Risk Rating Methodology 3×3 table, extended by
+  one Impact column the same monotonic way OWASP's docs describe for a 4th tier — an explicit lookup
+  table, not a formula.
+- **Replaced the 4-branch ad-hoc cap** (`critical_penalty >= 75 → 60`, etc.) with a scan over every
+  finding's matrix rating org-wide, capping at thresholds derived from `score_to_grade`'s own existing
+  boundaries (`_RATING_CAPS = {CRITICAL: 59, HIGH: 74, MEDIUM: 89}` — one less than the grade cutoffs
+  90/75/60, not fresh hand-picked numbers).
+- Per-finding `impact`/`likelihood`/`matrix_rating` added to the existing (never-persisted) `penalties`
+  audit dict — same transparency precedent Stages 2-3 already established, no `score_breakdown` shape
+  change (that dict is iterated generically by 3 frontend components; a new non-category key would render
+  as a bogus category row).
+- `OrgRiskScore.score_version` bumped `"1.2"` → `"1.3"`.
+- **`score_version` now exposed in both `/scores/history` and `/{org_id}/score-history` API responses** —
+  purely additive JSON keys, zero shape change, no frontend touch required. Stages 1-3's formula bumps
+  were completely invisible to any frontend/API code before this; a full visual chart annotation for the
+  methodology discontinuity remains a named, separate follow-up (needs frontend sign-off per this
+  project's own convention, not done here).
+- **Tests**: 35 new cases in `test_risk_engine.py` (`TestComputeImpactLevel`'s boundary/fallback/shift
+  coverage, `TestComputeLikelihoodLevel`'s 6-value coverage, `TestRiskMatrix`'s 12-cell literal coverage,
+  cap-tier-in-isolation tests, a penalties-dict shape test). Two existing tests updated for the new cap
+  values (`test_single_high_finding_cannot_reach_grade_a` 84→89, `test_multiple_criticals_approach_f`
+  60→74). **Two more existing tests required a real fix, not just a number bump**: `test_old_finding_decays`
+  and `test_low_confidence_finding_shifts_category_score_less_than_high_confidence` asserted that decay/
+  confidence always move `overall_score` — but the new matrix rating is deliberately driven only by
+  severity/CVSS/exploit-intel/criticality, not decay or confidence, so a cap that fires identically for
+  both variants now masks that difference at the overall-score level (the underlying category score still
+  differs correctly, proven by keeping/adding category-level assertions). This is judged correct, not a
+  regression: an OWASP-style risk rating for "how bad is this vulnerability" isn't supposed to fade with
+  time the way a decaying penalty sum does — a stale, still-open Critical-rated finding isn't safer for
+  having sat open 90 days. Full suite: **260 passed, 1 skipped** (was 225 before this stage).
+
+### Verified against real production data
+- Baseline: `kpi.go.id` 60/C, `pasarjaya.co.id` 44/D, `pu.go.id` 45/D (all `score_version 1.2`).
+- **All 8 real CISA-KEV-confirmed findings on `kpi.go.id` classify `MatrixRating.CRITICAL`** — including
+  the 2 medium-severity/CVSS-5.4-6.1 ones, via the criticality-shift escalating Impact from Medium→High,
+  combined with Likelihood=High (KEV) — the exact scenario decision 1 above was made to get right.
+- **Contrast case, real data**: a genuine ordinary high-severity/no-CVSS/criticality-5/no-exploit-intel
+  finding on `kpi.go.id` (the dominant ~98% real case) classifies `MatrixRating.HIGH`, not `CRITICAL` —
+  concrete proof this design differentiates confirmed-exploited findings from ordinary ones instead of
+  just relabeling severity.
+- Published a real `risk.compute` for all 3 orgs — predicted movement matched exactly: `kpi.go.id`
+  **60/C → 59/D** (a real, small, fully explainable grade-boundary crossing); `pasarjaya.co.id`/`pu.go.id`
+  unaffected at 44/D and 45/D (category-weighting saturation already dominates before any cap applies,
+  same pattern Stage 2/3 documented). `score_version` confirmed `"1.3"` in the DB and in both API
+  responses (`/scores/history` and `/organizations/{id}/score-history`).
+- Full regression suite: **260 passed, 1 skipped**, no regressions. Deployed by restarting `api` and
+  `worker-risk`.
+
+### Explicitly not in scope for this stage
+Any change to the 9-category weighted-sum scoring mechanics, `CATEGORY_WEIGHTS`, `RiskScore`'s DB schema,
+or `report_service.py` (the rejected "full restructure" option). A frontend chart annotation/visual marker
+for the score-methodology discontinuity. **This is the last of the originally-planned 4 stages** — no
+Stage 5 implied by this entry; any further risk-engine work (e.g. a future Stage 4a/4b split, or acting on
+SSVC `Exploitation=active` once real coverage data exists) would be a new, separately-scoped effort.
+
+---
+
+## 2026-07-12 — Risk Engine Redesign, Stage 3: SSVC (Exploitation/Automatable) escalation
+
+Third of the 4-stage NIST/OWASP-aligned risk-engine redesign (Stage 1: asset/org criticality multiplier;
+Stage 2: CVSS score/vector data flow, no formula change). Stage 3's goal: integrate SSVC (Stakeholder-
+Specific Vulnerability Categorization, CISA's framework) into scoring.
+
+### The gap found before writing this stage's plan
+CISA publishes an SSVC assessment (`Exploitation`: none/poc/active, `Automatable`: yes/no) inside a
+`"CISA ADP Vulnrichment"` container in `cve.circl.lu`'s `containers.adp[]` array — the SAME array
+`version_cve_intel.py::_extract_cvss()` already walks for CVSS data. Confirmed live for real CVE IDs this
+platform's `version_cve_correlation` feature (M21) already flags. `_extract_cvss()`'s `key.lower().
+startswith("cvssv")` filter walked right past this data and silently discarded it — fetched, not merely
+unfetched. SSVC only ever applies to `version_cve_correlation` findings (nuclei templates carry EPSS, a
+separate signal, but nothing SSVC-shaped).
+
+### Decision (via AskUserQuestion, before implementation)
+Unlike Stage 2 (which deferred its only candidate formula change — a Scope-Changed multiplier — because
+CVSS's own base score already partially counts Scope), this stage ships a real, small escalation
+multiplier: `Automatable=yes` and `Exploitation=poc`. `Exploitation=active` deliberately contributes
+nothing — CISA's own KEV catalog already represents "confirmed active exploitation" for the same
+real-world fact (`exploit_intel.py`'s `KEV_BOOST`, already the dominant 1.5-1.75x signal), and escalating
+on both would double-count. The difference in verdict from Stage 2 reflects a real difference in the
+underlying facts: `Automatable` has zero existing analog anywhere in the codebase (confirmed via grep) —
+genuinely new information, not a re-emphasis.
+
+### Added
+- **`_extract_ssvc()`** (`backend/app/services/version_cve_intel.py`) — parses CISA's
+  `{"other": {"type": "ssvc", "content": {"options": [{"Exploitation": "poc"}, {"Automatable": "yes"}, ...]}}}`
+  shape (`options` is a list of single-key dicts, not a flat dict). `_extract_record()` gains two keys
+  (`ssvc_exploitation`, `ssvc_automatable`), same pass-through pattern as `cvss_score`. No migration —
+  `VersionCveCache.cves` is schemaless JSONB.
+- **`SSVC_POC_BOOST = 1.25`, `SSVC_AUTOMATABLE_BOOST = 1.3`, `compute_ssvc_boost()`** — escalation-only,
+  floor 1.0, ordered below `KEV_BOOST` (1.5) so a CISA-confirmed KEV entry never loses to an SSVC-only
+  status. Combined via `max()` with the existing EPSS/KEV `exploit_boost` in
+  `workers/risk/risk_worker.py::_load_findings()` — same established mechanism as KEV-vs-EPSS, not a new
+  one. `compute_severity_penalty()`/`FindingInput`/`risk_engine.py` untouched this stage.
+- SSVC data stored in each finding's `proof` JSONB (`coverage_worker.py::_scan_version_cve`), not a new
+  `Finding` column — mirrors the existing `confidence_score` precedent (arguably the most load-bearing
+  per-finding scoring input in the engine, and it's never had its own column either). No changes needed to
+  `make_finding()`, `persist_findings()`, or `content_refresh_updates()` as a result.
+- `OrgRiskScore.score_version` bumped `"1.1"` → `"1.2"` (a real formula change this time; Stage 2 correctly
+  didn't bump it since it made none).
+- **Tests**: 12 new cases in `test_version_cve_intel.py` (`TestExtractSsvc`'s real-shaped/malformed/absent
+  coverage, `TestComputeSsvcBoost`'s escalation/ordering/regression-guard-on-`active` coverage) and 2 new
+  cases in `test_scan_pipeline_state.py` (`_scan_version_cve` proof-threading, with-data and
+  missing-data-defaults-to-None). Full suite: **225 passed, 1 skipped** (was 213 before this stage).
+
+### Verified against real production data
+- Forced a live cache refresh (deleted the 6 already-cached products' rows, re-ran `_scan_version_cve` for
+  all 3 real orgs) rather than waiting out the 7-day staleness window — confirmed real, fresh CIRCL fetches
+  in the logs and in the cache table, including the exact `CVE-2026-49975` → Exploitation=poc/Automatable=yes
+  values hand-verified during planning.
+- **Real coverage**: of 54 cached CVEs across the 3 orgs' 6 products, 50 (93%) had SSVC data at all — 2
+  `poc`, 1 `active`, 47 `none`; 24 `Automatable=yes`.
+- **The empirical KEV-overlap cross-check that justified excluding `Exploitation=active`**: the single
+  real `Exploitation=active` CVE found (`CVE-2026-9082`) **is already in CISA's own KEV catalog**
+  (`is_kev=true`, EPSS=0.846) — 100% overlap in this sample, directly confirming the double-counting
+  concern was real, not hypothetical. Meanwhile all 24 `Automatable=yes` CVEs have near-zero EPSS (mostly
+  0.002-0.01) and **zero** KEV overlap — confirming `Automatable` surfaces real signal EPSS/KEV miss
+  entirely, not a duplicate of either.
+- **Proved the exploit_boost combination mechanism directly** against these exact real (CVE, SSVC, KEV)
+  triples: `CVE-2026-49975` (poc/yes, not KEV) → boost 1.3; `CVE-2026-44631` (automatable-only, not KEV) →
+  boost 1.3; `CVE-2026-9082` (active/yes, IS KEV) → `max(1.3, 1.5) = 1.5`, KEV correctly wins, no stacking.
+- Published a real `risk.compute` for all 3 orgs — `score_version` confirmed `"1.2"`; overall scores
+  unchanged (`kpi.go.id` 60, `pasarjaya.co.id` 44, `pu.go.id` 45) since their currently-*persisted* findings
+  predate this fix (their `proof` blobs don't yet carry SSVC keys) — expected to move on the next real scan
+  that rediscovers them, same "code is correct, needs a rescan to touch existing rows" pattern as Stage 2's
+  nuclei-vector finding.
+- Full regression suite: **225 passed, 1 skipped**, no regressions. Deployed by restarting `worker-scanner`
+  (runs `coverage_worker.py`) and `worker-risk`.
+
+### Explicitly not in scope for this stage
+`Exploitation=active` contributing to scoring (excluded — confirmed correct via the KEV-overlap check
+above, not just deferred pending it). A real `Finding` column for SSVC data (proof JSONB only). Stage 4
+(full Likelihood×Impact matrix replacing the ad-hoc global `critical_penalty`/`high_penalty` cap) —
+untouched, unplanned in detail. SSVC's own decision structure is inherently matrix-shaped (Exploitation ×
+Automatable × Mission impact) — this stage's additive multiplier is a deliberate placeholder, the same way
+Stage 1's criticality multiplier preceded a more complete future restructure.
+
+---
+
+## 2026-07-12 — Risk Engine Redesign, Stage 2: CVSS vector data flow + parser (no formula change)
+
+Second of the 4-stage NIST/OWASP-aligned risk-engine redesign (Stage 1: asset/org criticality
+multiplier). Stage 2's stated goal: "parse `Finding.cvss_vector` for CVSS Environmental-style C/I/A
+sub-metrics to refine Impact." Investigation before implementation found the groundwork in worse shape
+than expected — reframed this stage the same way Stage 1 was reframed, as "connect what's already there"
+more than "build new."
+
+### The gap found before writing this stage's plan
+- **`Finding.cvss_vector` was 100% NULL across all 1,576 real findings** — nothing anywhere wrote it.
+- **`Finding.cvss_score` was ALSO NULL for the majority — all 822 `version_cve_correlation` findings**
+  (Milestone 21's version-to-CVE feature, 52% of all real findings). The matched CVE's real `cvss_score`
+  was already known at persist time (`coverage_worker.py::_scan_version_cve` already used it to derive
+  `severity`, and stashed it in the finding's `proof` JSONB) — but never passed to `make_finding()` as a
+  real column value, because `scanner_common.py`'s `make_finding()`/`persist_findings()` had no
+  `cvss_score`/`cvss_vector` parameter at all (only `cve_ids` was ever added, M21). This meant
+  `risk_engine.py`'s existing CVSS-blending code — already shipped, already used by nuclei findings —
+  **never fired for 822 of 1,576 real findings**, not a Stage-2-specific bug but a prerequisite gap
+  Stage 2's own goal depended on closing first.
+- Only nuclei-sourced findings (614 of 1,576, 22 with a non-null score) ever got `cvss_score` populated,
+  via nuclei_worker.py's own separate persistence path — and it never read the sibling `cvss-metrics`
+  (vector) field sitting in the same template classification dict as the already-read `cvss-score`
+  (confirmed live: 6,551 mounted nuclei templates carry both).
+- **Frontend/API were already fully wired for display, dead code today**: `findings.py`'s
+  `_finding_to_dict()` already returns `cvss_vector`; `FindingDetailModal.tsx` already conditionally
+  renders the raw vector string. No frontend/API changes needed this stage — populating the column
+  activates existing dead code automatically.
+
+### Decision (via AskUserQuestion, before implementation)
+Ship the data-flow fix + a CVSS vector parser (C/I/A + Scope extraction) with **zero scoring-formula
+changes this stage**. A candidate follow-up — a small Scope-Changed (`S:C`) escalation multiplier,
+mirroring `exploit_boost`'s shape — was explicitly designed and then deferred: CVSS's own base-score
+formula already applies an internal 1.08x multiplier for Scope-Changed vulnerabilities, so a second,
+separate multiplier from the same signal would be a deliberate re-emphasis of an already-partially-counted
+factor, not new information the way asset criticality was in Stage 1. Keeping this stage formula-free
+also kept the real-data verification clean: any score movement observed is attributable purely to
+"previously-missing CVSS data now flowing," never conflated with a new formula hook. A full CVSS
+Environmental re-scoring (per-asset CR/IR/AR fields, the FIRST.org modified-impact formula) was
+considered and rejected outright for this stage — bigger than either remaining stage in the original plan,
+not requested.
+
+### Added
+- `make_finding()`/`persist_findings()` (`workers/scanner/scanner_common.py`) gained `cvss_score`/
+  `cvss_vector` parameters, threaded into the INSERT values and — critically — added to
+  `content_refresh_updates()`'s field list (previously missing both), so a finding's CVSS data actually
+  refreshes on rediscovery instead of freezing at whatever was inserted first (proven by a new real-Postgres
+  integration test, not just asserted).
+- `coverage_worker.py::_scan_version_cve()` now passes `cvss_score=cve.get("cvss_score")` — pure plumbing,
+  the value was already computed and already stashed in `proof`.
+- `nuclei_worker.py` now also reads `classification.cvss-metrics` (alongside the pre-existing
+  `cvss-score` read) and persists it as `cvss_vector`, including in its own separate
+  `content_refresh_updates()` list, which was missing it too.
+- **New `parse_cvss_vector()`** (`risk_engine.py`): CVSS 3.0/3.1 only (~95% of real template vectors:
+  4,501 are 3.1, 1,718 are 3.0, identical C/I/A encoding) → `CvssImpactMetrics(confidentiality, integrity,
+  availability, scope_changed)`. CVSS 2.0 (different `N/P/C` encoding, 297 templates) and CVSS 4.0
+  (different `VC/VI/VA`+`SC/SI/SA` structure, 29 templates) fail closed to `None` rather than being
+  misparsed — verified against the real edge cases found in the mounted template corpus (a handful of
+  quoted vectors, one with no `CVSS:x.y/` prefix at all). `FindingInput.cvss_vector` and
+  `risk_worker.py::_load_findings()` thread the raw string through; `_compute_category_score()` parses it
+  per finding and stashes the result into the (in-memory-only, never persisted) per-finding `penalties`
+  audit dict for future-stage use. `compute_severity_penalty()` itself is untouched — takes no new parameter.
+- **New `workers/scripts/backfill_version_cve_cvss.py`** (`--dry-run`/`--org-id`) — reuses data already
+  sitting in each finding's `proof` JSONB, no CIRCL re-fetch needed. Idempotent (`cvss_score IS NULL AND
+  proof->>'cvss_score' IS NOT NULL`).
+- **Tests**: 11 new cases in `test_risk_engine.py` (`TestParseCvssVector`'s valid/invalid-schema/edge-case
+  coverage, plus a regression-guard proving an otherwise-identical finding scores byte-identically with vs.
+  without a populated `cvss_vector` — the load-bearing proof that this stage really is formula-risk-free,
+  not just an assumption), 4 new cases in `test_scan_pipeline_state.py` (`make_finding` and
+  `NucleiWorker._parse_finding()` threading), and 1 new real-Postgres integration test in
+  `workers/tests/test_finding_upsert_integration.py` proving the `content_refresh_updates` fix actually
+  works, not just compiles. Full suite: **213 passed, 1 skipped** (was 202 before this stage).
+
+### Verified against real production data
+- **Baseline**: `kpi.go.id` 60/C, `pasarjaya.co.id` 44/D, `pu.go.id` 45/D (all `score_version 1.1`, carried
+  over from Stage 1) — 154/535/97 `version_cve_correlation` findings per org, 0% with `cvss_score` in all
+  three.
+- **Backfill**: dry-run first, then applied for real, scoped to the three target orgs. **154/154 on
+  `kpi.go.id`, 516/535 on `pasarjaya.co.id`, 61/97 on `pu.go.id`** actually had a usable score in `proof`
+  (the remainder genuinely have no CVSS score in CIRCL's own data — not a bug). Verified directly: 0
+  mismatches between the newly-populated `cvss_score` column and `proof->>'cvss_score'` across all three orgs.
+- **A real `risk.compute` published through RabbitMQ for each org showed zero overall-score movement** —
+  investigated rather than assumed safe: `patch_hygiene` (where `known_cve` findings map) was already
+  capped at **0/F for all three real orgs** (`MAX_PENALTY_PER_CATEGORY = 100.0`; each org already has
+  60-580+ open critical/high findings in that one category alone, blowing past the cap regardless of any
+  per-finding CVSS-blend adjustment). This is the same "cap saturation masks a marginal formula change"
+  pattern found repeatedly this engagement (Stage 1's `kpi.go.id`, M21) — not a sign the fix didn't work.
+  **Proved the mechanism directly instead**: ran `compute_severity_penalty()` against real (severity,
+  cvss_score) pairs pulled from these exact orgs' findings — e.g. a real "medium"/6.6 pair went from a
+  penalty of 8.0 to 12.25 (+53%), a real "low"/3.7 pair from 3.0 to 6.125 (+104%), a real "high"/8.8 pair
+  from 15.0 to 18.5 (+23%) — confirming the blend is real and meaningfully sized per-finding, even though
+  these three orgs' aggregate scores don't currently expose it.
+- **Nuclei vector wiring verified against a live, real vulnerability**: ran the actual `nuclei` binary
+  (not a mock) against a real production host (`automation.pu.go.id`, an internal n8n workflow-automation
+  instance) with the exact template already on file for a previously-detected finding
+  (`CVE-2026-21858`, an unauthenticated RCE, CVSS 10.0). Real live tool output confirmed
+  `classification.cvss-metrics` present alongside `cvss-score` in the actual JSON result (not just in the
+  static template file). Piped that real output through the updated `NucleiWorker._parse_finding()`
+  directly: correctly extracted `cvss_score: 10.0` and `cvss_vector:
+  "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:N"`; `parse_cvss_vector()` on that exact real vector
+  correctly resolved to Confidentiality=High, Integrity=High, Availability=None, Scope Changed=True. This
+  finding predates the fix, so its stored `cvss_vector` stays empty until the next scan rediscovers it
+  (nuclei findings have no retrievable backfill source, unlike `version_cve_correlation`'s `proof` field —
+  stated plainly here, not papered over).
+- Full regression suite: **213 passed, 1 skipped**, no regressions. Deployed by restarting `worker-nuclei`,
+  `worker-scanner` (runs `coverage_worker.py`), and `worker-risk`.
+
+### Explicitly not in scope for this stage
+Any scoring-formula change from the parsed C/I/A/Scope data (deferred, see Decision above), full CVSS
+Environmental re-scoring with per-asset CR/IR/AR fields (rejected for this stage), and Stage 3 (SSVC
+`Exploitation`/`Automatable` integration) / Stage 4 (Likelihood×Impact matrix replacing the ad-hoc global
+cap) — untouched, unplanned in detail.
+
+---
+
+## 2026-07-12 — Risk Engine Redesign, Stage 1: Asset/Org criticality wired into scoring
+
+After M18-21's detection-tuning pass, the conversation turned to whether `risk_engine.py`'s scoring model
+itself should reflect established frameworks rather than its own hand-tuned formula. Agreed direction:
+align with **NIST** (SP 800-30/CSF's Risk = Likelihood × Impact, informed by CVSS's own Environmental
+metric group for asset-CIA-requirement weighting) and **OWASP** (Risk Rating Methodology's Impact
+sub-factors). This is a 4-stage plan, done incrementally with real verification at each step:
+1. **Wire asset/org criticality into the existing formula as a multiplier ← this entry**
+2. Parse `Finding.cvss_vector` for CVSS Environmental-style C/I/A sub-metrics (not started)
+3. Integrate SSVC `Exploitation`/`Automatable` (already flowing through `cve.circl.lu` responses via M21's
+   `version_cve_intel.py` but currently discarded) (not started)
+4. Full restructure to an explicit Likelihood × Impact matrix, replacing the ad-hoc
+   `critical_penalty`/`high_penalty` global score-cap heuristic (not started)
+
+### The gap found before writing this stage's plan
+`Asset.criticality`/`environment` and `Organization.criticality`/`environment` already existed in the
+schema (1-5 scale, `models.py`). `Organization.criticality` already had a working edit path
+(`organizations/[id]` UI → `PATCH` endpoint) — but **`risk_engine.py` used neither field anywhere**
+(confirmed via full-file grep, zero matches), and **`Asset.criticality` had no write path at all**
+(read-only: filter, CSV export, graph display only). Same "capacity exists in the schema/API but was
+never wired into the logic that matters" pattern found repeatedly this engagement (M6, M10, M18).
+
+### Added
+- **`PATCH /assets/{asset_id}`** (`backend/app/api/v1/endpoints/assets.py`) — the first-ever write path
+  for `Asset.criticality`/`environment`. `require_analyst`-gated, audits via the same
+  `bg.add_task(audit_log, ...)` pattern as `organizations.py`'s `update_organization`, stamps
+  `asset.labels["criticality_source"] = "manual"` so nothing downstream ever overwrites a human's choice.
+- **`workers/asset_criticality.py`** (new) — `infer_asset_criticality(hostname, is_root_domain,
+  org_criticality)`, a hostname-keyword classifier (styled like `web_crawl_worker.py`'s existing
+  `AUTH_PATH_RE`/`ADMIN_PATH_RE` tables) giving new assets a sensible non-manual default instead of being
+  stuck at the schema default of 3 forever: dev/staging/uat keywords → de-escalate; auth/payment/admin
+  keywords or root-domain or prod/www → escalate; otherwise falls back to the org's own criticality.
+  Environment keywords are checked *first*, deliberately — `api-staging.foo.com` must still classify as
+  low-value (a staging payment box is still disposable infrastructure).
+- Hooked at **asset-creation time** in `workers/scanner/discovery_worker.py::_persist_assets` — computed
+  only for the `pg_insert(...).values(**asset_values)` INSERT path, deliberately excluded from the
+  `set_={...}` conflict-update dict, so re-running discovery on an existing asset never touches a
+  previously-set `criticality`/`labels` again.
+- **`workers/scripts/backfill_asset_criticality.py`** (new, `--dry-run` capable, optional `--org-id`) —
+  one-off backfill for the pre-existing stuck-at-3 population, idempotent (targets only
+  `criticality == 3 AND labels->>'criticality_source' IS NULL`, so it never overwrites a manual PATCH or a
+  prior backfill run).
+- **`risk_engine.py`**: `CRITICALITY_MULTIPLIERS = {1: 0.70, 2: 0.85, 3: 1.00, 4: 1.15, 5: 1.30}`,
+  `compute_criticality_multiplier()`, `combine_criticality(asset, org) = max(asset or 3, org or 3)`.
+  `compute_severity_penalty()` gained a trailing `criticality_multiplier` param, applied **unclamped**
+  (unlike `exploit_boost`'s floor) — a genuinely low-value asset's findings must actually shrink, not just
+  fail to grow. `FindingInput.criticality` defaults to 3 (multiplier 1.0) so a finding with no criticality
+  signal scores identically to before this field existed. `workers/risk/risk_worker.py::_load_findings()`
+  now joins `Asset.criticality` (safe inner join — `Finding.asset_id` is `NOT NULL`) and fetches
+  `Organization.criticality` once per org, combining via `max()`.
+- `OrgRiskScore.score_version` bumped `"1.0"` → `"1.1"` — a free forensic marker (field already existed,
+  was dead) for "which formula produced this row." No migration, no chart-annotation work, matching
+  M14/M18/M21 precedent for scoring-formula changes.
+- **Tests**: 18 new cases in `backend/tests/unit/test_risk_engine.py` (multiplier table, `combine_criticality`
+  direction/fallback cases, penalty scaling both up *and down* — the below-1.0 case unlike `exploit_boost` —
+  and an integration test through the full `compute()` pipeline proving criticality 1 vs 5 moves both
+  category and overall scores in the right direction) and 9 new cases in `test_scan_pipeline_state.py`
+  for `infer_asset_criticality`'s keyword-precedence/escalation/baseline-clamping behavior. Full suite:
+  **202 passed, 1 skipped** (was 184 before this stage).
+
+### Verified against real production data
+- **Baseline** (pre-deploy): `kpi.go.id` 60/C, `pasarjaya.co.id` 51/D, `pu.go.id` 47/D — all `score_version 1.0`.
+- **The "no-op" check wasn't one — for a real reason, not a bug.** All three real target orgs already had
+  `Organization.criticality = 5` set via the pre-existing (previously scoring-inert) org edit UI. Wiring it
+  into scoring for the first time immediately, correctly moved their scores: `pasarjaya.co.id` 51→43,
+  `pu.go.id` 47→45. `kpi.go.id` stayed at exactly 60 — not because nothing changed, but because its raw
+  weighted score already sat above the pre-existing `critical_penalty>=75→cap 60` ceiling both before and
+  after (confirmed via its 34 open criticals / 83 open highs comfortably clearing that threshold either
+  way). This *is* the intended real-world behavior of Stage 1: any org that had already configured a
+  criticality the platform was silently ignoring now finally gets it reflected.
+- **Asset-level escalation/de-escalation**, proven via real `PATCH /assets/{id}` + a real `risk.compute`
+  published through RabbitMQ (not a direct function call) + inspecting the actual `risk_scores` row:
+  attempted on `pu.go.id` first, but that org's `Organization.criticality` is already 5 (the ceiling), so
+  `combine_criticality`'s `max()` made any single-asset PATCH there a true no-op by design — switched to
+  `ACME Corp` (`org_criticality=4`, a lower floor) to get a real signal:
+  - Asset at its natural `criticality=4`: `misconfiguration` category score 52.
+  - Escalated to 5 via the real endpoint → real `risk.compute` → category score dropped to **46** (worse,
+    matching the expected 1.15x→1.30x multiplier jump).
+  - De-escalated to 1 → category score returned to **52**, unchanged from the criticality=4 baseline —
+    proving the org's floor genuinely protects against a single low asset value dragging a score down
+    below what the org's own setting already guarantees (`max()`, not average).
+  - All test-asset mutations reverted to their original values after verification (`pu.go.id`'s
+    `apigw.pu.go.id` back to criticality 3/no labels, ACME's `app.acme-test.example` back to 4/no labels),
+    each followed by a real recompute confirming the restore.
+- **Backfill**: dry-run inspected first (sane output — `dev.`/`staging.`/`uat.` hosts → 2, `payment.`/`api.`/
+  `admin.`-style hosts → 5, plain subdomains → org baseline), then applied for real, scoped to the three
+  target orgs only: **293 assets updated on `kpi.go.id`, 866 on `pasarjaya.co.id`, 350 on `pu.go.id`**
+  (1,509 total). Recomputing afterward showed scores essentially unchanged (`kpi.go.id` 60, `pu.go.id` 45,
+  `pasarjaya.co.id` 43→44) — expected, since all three orgs' `Organization.criticality` already sits at the
+  ceiling (5), so `max(asset, org)` is still dominated by the org value regardless of what any individual
+  asset was just backfilled to. **This is an important, honest limitation to flag**: for these three real
+  orgs specifically, Stage 1's asset-level granularity has no scoring effect *today* — it only becomes
+  load-bearing if the org-level criticality is ever lowered below 5, or for any future org onboarded at the
+  schema default. The backfilled values are still correct and useful independent of scoring (asset-list
+  filtering/display, and the floor for whenever org criticality changes).
+- Full regression suite: **202 passed, 1 skipped**, no regressions. Deployed by restarting `api`,
+  `worker-discovery`, `worker-risk` (`workers/` and `backend/app` are volume-mounted, but running processes
+  need a restart to reload changed modules).
+
+### Explicitly not in scope for this stage
+CVSS vector parsing, SSVC integration, and replacing the ad-hoc global `critical_penalty`/`high_penalty`
+cap are Stages 2-4 — untouched here.
+
+---
+
 ## 2026-07-12 — Milestone 21: Version-to-CVE correlation (highest-risk item of the 4-part plan)
 
 Final item of the detection-tuning plan (M18 endpoint-cap → M19 API/GraphQL → M20 ffuf depth → **this**).

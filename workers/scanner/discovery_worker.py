@@ -313,7 +313,8 @@ class DiscoveryWorker(BaseWorker):
             async with get_session() as db:
                 new_count, asset_ids_by_host = await self._persist_assets(
                     db, org_id, workspace_id, scan_id,
-                    persisted_hosts, resolved, discovery_evidence
+                    persisted_hosts, resolved, discovery_evidence,
+                    root_domains=targets.get("domains", []),
                 )
                 cloud_new_count, cloud_asset_ids = await self._persist_cloud_assets(
                     db, org_id, workspace_id, scan_id, extra_discoveries
@@ -1515,20 +1516,30 @@ class DiscoveryWorker(BaseWorker):
         alive_hosts: Dict[str, Dict],
         dns_data: Dict[str, Dict],
         discovery_evidence: Optional[Dict[str, Dict[str, Any]]] = None,
+        root_domains: Optional[List[str]] = None,
     ) -> tuple[int, Dict[str, Any]]:
         """Upsert discovered assets into the database."""
         from sqlalchemy import select, update
         from sqlalchemy.dialects.postgresql import insert as pg_insert
-        from workers.db_models import Asset, Subdomain, Technology
+        from workers.asset_criticality import infer_asset_criticality
+        from workers.db_models import Asset, Organization, Subdomain, Technology
 
         new_count = 0
         asset_ids_by_host: Dict[str, Any] = {}
         now = datetime.now(timezone.utc)
+        root_domain_set = set(root_domains or [])
+
+        org_criticality = (await db.execute(
+            select(Organization.criticality).where(Organization.id == org_id)
+        )).scalar_one_or_none()
 
         for host, http_data in alive_hosts.items():
             validation = http_data.get("validation") or {}
             discovery = self._serializable_discovery_evidence(
                 (discovery_evidence or {}).get(host, {})
+            )
+            inferred_criticality, criticality_reason = infer_asset_criticality(
+                host, is_root_domain=host in root_domain_set, org_criticality=org_criticality,
             )
             # Upsert Asset
             asset_values = {
@@ -1548,6 +1559,12 @@ class DiscoveryWorker(BaseWorker):
                 "validation_sources": validation.get("validation_sources", {}),
                 "last_verified_at": validation.get("last_verified_at", now),
                 "last_seen": now,
+                # Auto-inferred default only — new-asset INSERT path only, see
+                # below; a human can always override via PATCH /assets/{id},
+                # which stamps labels.criticality_source="manual" so this
+                # inference (and the one-off backfill script) never clobbers it.
+                "criticality": inferred_criticality,
+                "labels": {"criticality_source": "auto", "criticality_reason": criticality_reason},
                 "metadata": {
                     "source": "discovery_worker",
                     "discovery": {

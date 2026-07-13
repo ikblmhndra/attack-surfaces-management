@@ -244,6 +244,46 @@ async def test_content_refreshes_on_rescan(test_asset):
 
 
 @pytest.mark.asyncio
+async def test_cvss_fields_refresh_on_rescan(test_asset):
+    """Stage 2 of the risk-engine redesign: make_finding()/persist_findings()
+    gained cvss_score/cvss_vector params, but content_refresh_updates()'s
+    field list must actually include both — otherwise a finding's CVSS data
+    freezes at whatever was inserted the first time, even though the
+    underlying version_cve_cache/nuclei-template data can legitimately change
+    between scans (e.g. CIRCL revising a CVE's published score)."""
+    workspace_id = test_asset["workspace_id"]
+    check_id = "stage2_cvss_refresh_test"
+
+    first_pass = make_finding(
+        org_id=ORG_ID, workspace_id=workspace_id, scanner="test", check_id=check_id,
+        target=TEST_TARGET, title="Finding", severity="high", category="known_cve",
+        description="d", evidence="e",
+        cvss_score=7.5, cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:L/A:N",
+    )
+    async with get_session() as db:
+        await persist_findings(db, test_asset["scan_id_1"], [first_pass])
+        await db.commit()
+
+    finding = await _get_finding(first_pass["fingerprint"])
+    assert finding.cvss_score == 7.5
+    assert finding.cvss_vector == "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:L/A:N"
+
+    second_pass = make_finding(
+        org_id=ORG_ID, workspace_id=workspace_id, scanner="test", check_id=check_id,
+        target=TEST_TARGET, title="Finding", severity="critical", category="known_cve",
+        description="d", evidence="e",
+        cvss_score=9.8, cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H",
+    )
+    async with get_session() as db:
+        await persist_findings(db, test_asset["scan_id_2"], [second_pass])
+        await db.commit()
+
+    finding = await _get_finding(first_pass["fingerprint"])
+    assert finding.cvss_score == 9.8
+    assert finding.cvss_vector == "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H"
+
+
+@pytest.mark.asyncio
 async def test_content_refresh_does_not_override_protected_status(test_asset):
     """The content refresh must layer on top of, not replace, the triage
     protection — a false_positive finding whose severity gets corrected by a

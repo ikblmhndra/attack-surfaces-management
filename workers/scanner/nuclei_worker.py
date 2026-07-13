@@ -867,6 +867,7 @@ class NucleiWorker(BaseWorker):
 
             # CVSS
             cvss_score = classifications.get("cvss-score")
+            cvss_vector = classifications.get("cvss-metrics")
 
             # Category mapping
             tags = template_info.get("tags", [])
@@ -911,6 +912,7 @@ class NucleiWorker(BaseWorker):
                 "scanner": "nuclei",
                 "cve_ids": [self._clean_text(cve_id, limit=100) for cve_id in cve_ids[:10]],
                 "cvss_score": float(cvss_score) if cvss_score else None,
+                "cvss_vector": self._clean_text(cvss_vector, limit=200) if cvss_vector else None,
                 "affected_url": self._clean_text(matched, limit=1000),
                 "evidence": self._clean_text(f"Template: {template_id}\nMatch: {matched}", limit=5000),
                 "request_raw": request_raw,
@@ -1075,6 +1077,7 @@ class NucleiWorker(BaseWorker):
                 "scanner": f.get("scanner"),
                 "cve_ids": f.get("cve_ids", []),
                 "cvss_score": f.get("cvss_score"),
+                "cvss_vector": f.get("cvss_vector"),
                 "affected_url": f.get("affected_url"),
                 "evidence": f.get("evidence"),
                 "request_raw": f.get("request_raw"),
@@ -1092,7 +1095,7 @@ class NucleiWorker(BaseWorker):
                     **status_preserving_conflict_updates(now),
                     **content_refresh_updates(stmt, [
                         "title", "description", "severity", "category",
-                        "cve_ids", "cvss_score", "affected_url", "evidence",
+                        "cve_ids", "cvss_score", "cvss_vector", "affected_url", "evidence",
                         "request_raw", "response_raw", "proof", "remediation", "references",
                     ]),
                 },

@@ -306,6 +306,30 @@ export interface Finding {
   scan_history?:        ScanHistory[];
 }
 
+// Findings collapsed by template_id — one row per underlying issue instead
+// of one row per affected host. Display-only aggregation of the same
+// Finding rows above; see backend/app/services/finding_grouping.py.
+export interface FindingGroup {
+  group_key:            string;
+  template_id?:          string;
+  cve_ids:               string[];
+  severity:               Severity;
+  category:               string;
+  finding_count:          number;
+  asset_count:            number;
+  url_count:              number;
+  max_cvss?:              number;
+  first_seen?:            string;
+  last_seen?:             string;
+  sample_finding_id:      string;
+  sample_status:          FindingStatus;
+  sample_affected_url?:   string;
+  sample_title?:          string;
+  heading:                string;
+  subheading?:            string;
+  heading_kind:           "cve" | "template";
+}
+
 export interface ScanHistory {
   scan_id:     string;
   change_type: "new" | "recurring" | "resolved";
