@@ -8,7 +8,7 @@ from uuid import UUID
 import structlog
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import func, select, text
+from sqlalchemy import case, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.dependencies.auth import (
@@ -17,7 +17,10 @@ from app.api.v1.dependencies.auth import (
     get_db,
     get_workspace_id,
 )
-from app.db.models.models import Asset, Finding, Organization, RiskScore, Scan, ScanTemplate, User
+from app.db.models.models import (
+    Asset, AssetRelationship, Finding, Organization, RiskScore, Scan, ScanTemplate,
+    Subdomain, Technology, User,
+)
 from app.services.audit_service import audit_log
 from app.services.outbox_service import create_queue_event, dispatch_pending_outbox_once
 from app.services.scan_progress import merge_runtime_phase_status
@@ -739,6 +742,267 @@ async def get_attack_surface_timeline(
             {"date": r.date.isoformat(), "severity": r.severity, "count": r.count}
             for r in new_findings
         ],
+    }
+
+
+@router.get("/{org_id}/attack-surface-graph")
+async def get_attack_surface_graph(
+    org_id: UUID,
+    workspace_id: UUID = Depends(get_workspace_id),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Org-wide attack-surface graph. Real `AssetRelationship` edges
+    (resolves_to, shares_infrastructure) plus presentation-only Technology/
+    Finding nodes -- neither Technology nor Finding is an asset-backed
+    entity, so they can't be genuine AssetRelationship rows; they're built
+    directly here instead, same as the frontend previously built them
+    client-side."""
+    await _get_org_or_404(db, org_id, workspace_id)
+
+    # IP assets are touched far less often than subdomains (a port scan runs
+    # once; DNS/HTTP rechecks on subdomains run constantly), so sorted by
+    # last_seen desc they'd fall outside a single page's window -- fetched
+    # separately and merged, same fix the frontend already needed before
+    # this endpoint existed.
+    subdomain_assets = (await db.execute(
+        select(Asset).where(Asset.org_id == org_id, Asset.status == "active", Asset.deleted_at.is_(None))
+        .order_by(Asset.last_seen.desc()).limit(200)
+    )).scalars().all()
+    ip_assets = (await db.execute(
+        select(Asset).where(
+            Asset.org_id == org_id, Asset.asset_type == "ip",
+            Asset.status == "active", Asset.deleted_at.is_(None),
+        ).order_by(Asset.last_seen.desc()).limit(200)
+    )).scalars().all()
+
+    assets_by_id: Dict[UUID, Asset] = {}
+    for asset in [*subdomain_assets, *ip_assets]:
+        assets_by_id[asset.id] = asset
+    asset_ids = list(assets_by_id.keys())
+
+    nodes: List[Dict[str, Any]] = [
+        {
+            "id": str(asset.id),
+            "label": asset.value,
+            "type": "ip" if asset.asset_type == "ip" else "domain",
+            "data": {"criticality": asset.criticality, "status": asset.status},
+        }
+        for asset in assets_by_id.values()
+    ]
+    edges: List[Dict[str, Any]] = []
+
+    if asset_ids:
+        rel_rows = (await db.execute(
+            select(AssetRelationship).where(
+                or_(
+                    AssetRelationship.source_asset_id.in_(asset_ids),
+                    AssetRelationship.target_asset_id.in_(asset_ids),
+                )
+            )
+        )).scalars().all()
+        for rel in rel_rows:
+            # Only keep edges where both ends are actually in this graph --
+            # a relationship can reach outside the 200-asset window above.
+            if rel.source_asset_id not in assets_by_id or rel.target_asset_id not in assets_by_id:
+                continue
+            edges.append({
+                "id": str(rel.id),
+                "source": str(rel.source_asset_id),
+                "target": str(rel.target_asset_id),
+                "label": rel.relationship_type,
+                "type": rel.relationship_type,
+            })
+
+        tech_rows = (await db.execute(
+            select(Technology).where(Technology.asset_id.in_(asset_ids))
+        )).scalars().all()
+        # Keyed by technology name (case-insensitive), not per (name, asset) --
+        # "Apache HTTP Server" running on 30 assets is one shared node with 30
+        # edges fanning in, not 30 separate nodes (confirmed real data: this
+        # was the single largest contributor to graph-density noise).
+        tech_nodes: Dict[str, Dict[str, Any]] = {}
+        for tech in tech_rows:
+            tech_key = tech.name.strip().lower()
+            tech_node_id = f"tech-{tech_key}"
+            entry = tech_nodes.setdefault(tech_node_id, {"label": tech.name, "count": 0})
+            entry["count"] += 1
+            edges.append({
+                "id": f"tech-edge-{tech_node_id}-{tech.asset_id}",
+                "source": str(tech.asset_id),
+                "target": tech_node_id,
+                "label": "runs",
+                "type": "runs",
+            })
+        nodes.extend(
+            {"id": tid, "label": v["label"], "type": "tech", "data": {"asset_count": v["count"]}}
+            for tid, v in tech_nodes.items()
+        )
+
+        # Critical/high only, matching the frontend's pre-existing filter --
+        # avoids clutter from the far larger set of medium/low/info findings.
+        finding_rows = (await db.execute(
+            select(Finding).where(
+                Finding.asset_id.in_(asset_ids),
+                Finding.status == "open",
+                Finding.severity.in_(["critical", "high"]),
+            ).limit(100)
+        )).scalars().all()
+        for finding in finding_rows:
+            finding_node_id = f"finding-{finding.id}"
+            nodes.append({
+                "id": finding_node_id,
+                "label": finding.title[:30],
+                "type": "finding",
+                "severity": finding.severity,
+                "data": {
+                    "severity": finding.severity,
+                    "category": finding.category,
+                    "cve_ids": finding.cve_ids or [],
+                },
+            })
+            edges.append({
+                "id": f"finding-edge-{finding_node_id}",
+                "source": str(finding.asset_id),
+                "target": finding_node_id,
+                "label": "has",
+                "type": "has_finding",
+            })
+
+    return {"nodes": nodes, "edges": edges}
+
+
+@router.get("/{org_id}/network-clusters")
+async def get_network_clusters(
+    org_id: UUID,
+    workspace_id: UUID = Depends(get_workspace_id),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Group subdomains by shared IP -- a real shared-hosting/blast-radius
+    signal, replacing the node-link graph as the primary Attack Surface view
+    (kept as a secondary 'Graph' tab, unmodified). Only hosts with at least
+    one resolved IP are considered -- an unresolved host has no network
+    position to cluster by (same scope boundary as the discovery-noise
+    tuning work)."""
+    await _get_org_or_404(db, org_id, workspace_id)
+
+    rows = (await db.execute(
+        select(Asset, Subdomain)
+        .join(Subdomain, Subdomain.asset_id == Asset.id)
+        .where(
+            Asset.org_id == org_id,
+            Asset.status == "active",
+            Asset.deleted_at.is_(None),
+            func.array_length(Subdomain.ip_addresses, 1) > 0,
+        )
+    )).all()
+
+    hosts_by_id: Dict[UUID, Dict[str, Any]] = {}
+    ips_by_asset: Dict[UUID, List[str]] = {}
+    assets_by_ip: Dict[str, List[UUID]] = {}
+    for asset, subdomain in rows:
+        hosts_by_id[asset.id] = {
+            "id": str(asset.id), "value": asset.value, "http_status": subdomain.http_status,
+        }
+        ips = list(dict.fromkeys(subdomain.ip_addresses or []))
+        ips_by_asset[asset.id] = ips
+        for ip in ips:
+            assets_by_ip.setdefault(ip, []).append(asset.id)
+
+    clustered_ids: set = set()
+    cluster_groups: List[tuple] = []
+    for ip, asset_ids in assets_by_ip.items():
+        unique_ids = sorted(set(asset_ids), key=str)
+        if len(unique_ids) >= 2:
+            cluster_groups.append((ip, unique_ids))
+            clustered_ids.update(unique_ids)
+
+    standalone_ids = [aid for aid in hosts_by_id if aid not in clustered_ids]
+
+    severity_rank = case(
+        {sev: i for i, sev in enumerate(["critical", "high", "medium", "low", "info"])},
+        value=Finding.severity, else_=99,
+    )
+
+    async def _severity_counts_and_top(asset_ids: List[UUID], top_n: int = 0):
+        if not asset_ids:
+            return {}, []
+        counts_rows = (await db.execute(
+            select(Finding.severity, func.count(Finding.id))
+            .where(Finding.asset_id.in_(asset_ids), Finding.status == "open", Finding.deleted_at.is_(None))
+            .group_by(Finding.severity)
+        )).all()
+        counts = {sev: n for sev, n in counts_rows}
+        top = []
+        if top_n:
+            top_rows = (await db.execute(
+                select(Finding)
+                .where(Finding.asset_id.in_(asset_ids), Finding.status == "open", Finding.deleted_at.is_(None))
+                .order_by(severity_rank, Finding.last_seen.desc())
+                .limit(top_n)
+            )).scalars().all()
+            asset_value_by_id = {aid: hosts_by_id[aid]["value"] for aid in asset_ids if aid in hosts_by_id}
+            top = [
+                {
+                    "id": str(f.id), "title": f.title, "severity": f.severity,
+                    "affected_host": asset_value_by_id.get(f.asset_id, ""),
+                }
+                for f in top_rows
+            ]
+        return counts, top
+
+    clusters = []
+    for ip, asset_ids in cluster_groups:
+        tech_rows = (await db.execute(
+            select(Technology.name).where(Technology.asset_id.in_(asset_ids)).distinct()
+        )).scalars().all()
+        severity_counts, top_findings = await _severity_counts_and_top(asset_ids, top_n=5)
+        clusters.append({
+            "ip": ip,
+            "hosts": [hosts_by_id[aid] for aid in asset_ids],
+            "host_count": len(asset_ids),
+            "technologies": sorted(tech_rows),
+            "severity_counts": severity_counts,
+            "top_findings": top_findings,
+        })
+    clusters.sort(key=lambda c: c["host_count"], reverse=True)
+
+    standalone_severity_by_asset: Dict[UUID, Dict[str, int]] = {}
+    if standalone_ids:
+        standalone_counts_rows = (await db.execute(
+            select(Finding.asset_id, Finding.severity, func.count(Finding.id))
+            .where(Finding.asset_id.in_(standalone_ids), Finding.status == "open", Finding.deleted_at.is_(None))
+            .group_by(Finding.asset_id, Finding.severity)
+        )).all()
+        for aid, sev, n in standalone_counts_rows:
+            standalone_severity_by_asset.setdefault(aid, {})[sev] = n
+
+    standalone = [
+        {
+            **hosts_by_id[aid],
+            "ip": (ips_by_asset.get(aid) or [None])[0],
+            "severity_counts": standalone_severity_by_asset.get(aid, {}),
+        }
+        for aid in standalone_ids
+    ]
+
+    total_ips = (await db.execute(
+        select(func.count(Asset.id)).where(
+            Asset.org_id == org_id, Asset.asset_type == "ip",
+            Asset.status == "active", Asset.deleted_at.is_(None),
+        )
+    )).scalar_one()
+
+    return {
+        "clusters": clusters,
+        "standalone": standalone,
+        "summary": {
+            "clusters_found": len(clusters),
+            "hosts_clustered": len(clustered_ids),
+            "standalone_hosts": len(standalone_ids),
+            "total_ips": total_ips,
+        },
     }
 
 

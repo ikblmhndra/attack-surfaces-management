@@ -15,14 +15,14 @@ import { cn } from "@/lib/utils";
 
 type ReportType = "executive" | "technical" | "compliance" | "custom";
 
-// "compliance"/"custom" are aliases of the technical report server-side —
-// there's no real PCI-DSS/SOC2/ISO framework mapping or section picker
-// implemented yet (see report_service.py::DETAILED_REPORT_TYPES), so the
-// labels here shouldn't claim capability the backend doesn't have.
+// "custom" is still an alias of the technical report server-side — no
+// section-picker implemented yet (see report_service.py::DETAILED_REPORT_TYPES).
+// "compliance" now has a real CIS Controls v8 mapping section in addition to
+// the full findings list.
 const REPORT_TYPES: { id: ReportType; label: string; description: string }[] = [
   { id: "executive", label: "Executive Summary", description: "High-level overview for management" },
   { id: "technical", label: "Technical Report", description: "Detailed findings with evidence" },
-  { id: "compliance", label: "Compliance Report", description: "Full findings list (same detail as Technical) — no framework mapping yet" },
+  { id: "compliance", label: "Compliance Report", description: "Findings mapped to CIS Controls v8 safeguards" },
   { id: "custom", label: "Custom Report", description: "Full findings list (same detail as Technical) — section selection not built yet" },
 ];
 

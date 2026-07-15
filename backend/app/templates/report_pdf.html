@@ -6,122 +6,282 @@
 <style>
   @page {
     size: A4;
-    margin: 2cm 1.6cm 2.2cm 1.6cm;
-    @bottom-center {
+    margin: 0 1.6cm 2cm 1.6cm;
+    @bottom-left {
+      content: "ASM Platform · {{ workspace_name }}";
+      font-size: 7.5pt;
+      color: #94a3b8;
+    }
+    @bottom-right {
       content: "Page " counter(page) " of " counter(pages);
-      font-size: 8pt;
+      font-size: 7.5pt;
       color: #94a3b8;
     }
   }
+
+  :root {
+    --ink: #0f172a;
+    --ink-soft: #334155;
+    --muted: #64748b;
+    --faint: #94a3b8;
+    --border: #e2e8f0;
+    --panel: #f8fafc;
+    --panel-alt: #f1f5f9;
+    --brand: #2563eb;
+    --brand-dark: #1e3a8a;
+    --critical: #dc2626;
+    --high: #ea580c;
+    --medium: #d97706;
+    --low: #2563eb;
+    --info: #64748b;
+  }
+
   * { box-sizing: border-box; }
+  html, body { padding: 0; margin: 0; }
   body {
     font-family: "DejaVu Sans", Arial, sans-serif;
-    font-size: 10pt;
-    color: #1e293b;
-    margin: 0;
+    font-size: 9.5pt;
+    color: var(--ink-soft);
+    line-height: 1.45;
   }
-  h1, h2, h3 { margin: 0 0 6px 0; color: #0f172a; }
-  h1 { font-size: 18pt; }
-  h2 { font-size: 12pt; margin-top: 22px; border-bottom: 1px solid #e2e8f0; padding-bottom: 4px; }
-  .muted { color: #64748b; }
-  .header {
+
+  h1, h2, h3 { margin: 0; color: var(--ink); }
+
+  /* ── Cover band ─────────────────────────────────────────── */
+  .cover {
+    background: linear-gradient(135deg, var(--brand-dark) 0%, #1e293b 100%);
+    color: #fff;
+    margin: 0 -1.6cm;
+    padding: 26px 1.6cm 22px 1.6cm;
     display: flex;
     justify-content: space-between;
-    align-items: flex-start;
-    border-bottom: 2px solid #0f172a;
-    padding-bottom: 10px;
-    margin-bottom: 16px;
+    align-items: center;
   }
-  .badge {
-    display: inline-block;
-    padding: 2px 10px;
-    border-radius: 999px;
+  .cover-eyebrow {
     font-size: 8pt;
     font-weight: bold;
+    letter-spacing: 1.5px;
     text-transform: uppercase;
-    background: #e2e8f0;
-    color: #334155;
+    color: #93c5fd;
+    margin-bottom: 6px;
   }
-  .grade-circle {
-    width: 64px;
-    height: 64px;
+  .cover h1 { color: #fff; font-size: 22pt; font-weight: bold; }
+  .cover-meta { color: #cbd5e1; font-size: 8.5pt; margin-top: 6px; }
+  .cover-meta strong { color: #fff; }
+
+  .grade-wrap { text-align: center; flex-shrink: 0; margin-left: 24px; }
+  .grade-ring {
+    width: 72px;
+    height: 72px;
     border-radius: 50%;
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 24pt;
+    font-size: 26pt;
     font-weight: bold;
     color: white;
-    background: #475569;
+    border: 3px solid rgba(255,255,255,0.35);
   }
   .grade-A { background: #16a34a; }
   .grade-B { background: #65a30d; }
   .grade-C { background: #d97706; }
   .grade-D { background: #ea580c; }
   .grade-F { background: #dc2626; }
+  .grade-caption { color: #cbd5e1; font-size: 7.5pt; margin-top: 6px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .grade-caption b { color: #fff; font-size: 9pt; }
 
-  .stat-grid {
-    display: flex;
-    gap: 10px;
-    margin: 12px 0;
+  /* ── Executive summary callout ──────────────────────────── */
+  .callout {
+    margin: 20px 0 22px 0;
+    padding: 14px 16px;
+    background: var(--panel);
+    border-left: 4px solid var(--brand);
+    border-radius: 0 6px 6px 0;
   }
+  .callout-label {
+    font-size: 7.5pt;
+    font-weight: bold;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    color: var(--brand);
+    margin-bottom: 5px;
+  }
+  .callout p { margin: 0; font-size: 10pt; line-height: 1.55; color: var(--ink-soft); }
+
+  /* ── Section header ─────────────────────────────────────── */
+  .section-title {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    margin: 24px 0 10px 0;
+    padding-bottom: 6px;
+    border-bottom: 1.5px solid var(--ink);
+  }
+  .section-title h2 { font-size: 12.5pt; letter-spacing: 0.2px; }
+  .section-title .meta { font-size: 8pt; color: var(--muted); }
+
+  /* ── Stat tiles ──────────────────────────────────────────── */
+  .stat-grid { display: flex; gap: 8px; margin: 4px 0 6px 0; }
   .stat-tile {
     flex: 1;
-    border: 1px solid #e2e8f0;
-    border-radius: 8px;
-    padding: 10px;
+    border: 1px solid var(--border);
+    border-top: 3px solid var(--ink);
+    border-radius: 0 0 6px 6px;
+    background: var(--panel);
+    padding: 10px 8px;
     text-align: center;
   }
-  .stat-tile .value { font-size: 16pt; font-weight: bold; color: #0f172a; }
-  .stat-tile .label { font-size: 7.5pt; color: #64748b; text-transform: uppercase; }
+  .stat-tile.critical { border-top-color: var(--critical); }
+  .stat-tile.high { border-top-color: var(--high); }
+  .stat-tile.medium { border-top-color: var(--medium); }
+  .stat-tile.low { border-top-color: var(--low); }
+  .stat-tile .value { font-size: 18pt; font-weight: bold; color: var(--ink); line-height: 1.1; }
+  .stat-tile .label { font-size: 7pt; color: var(--muted); text-transform: uppercase; letter-spacing: 0.4px; margin-top: 3px; }
 
-  .bar-row { display: flex; align-items: center; margin: 4px 0; font-size: 8.5pt; }
-  .bar-label { width: 110px; flex-shrink: 0; color: #334155; }
-  .bar-track { flex: 1; background: #f1f5f9; border-radius: 4px; height: 12px; overflow: hidden; margin: 0 8px; }
-  .bar-fill { height: 100%; border-radius: 4px; background: #2563eb; }
-  .bar-count { width: 30px; text-align: right; color: #475569; }
+  /* ── Bars ────────────────────────────────────────────────── */
+  .bar-row { display: flex; align-items: center; margin: 6px 0; font-size: 8.5pt; }
+  .bar-label {
+    width: 132px;
+    flex-shrink: 0;
+    color: var(--ink-soft);
+    font-weight: bold;
+    overflow-wrap: break-word;
+    word-break: break-word;
+    padding-right: 6px;
+    line-height: 1.25;
+  }
+  .bar-track { flex: 1; background: var(--panel-alt); border-radius: 5px; height: 11px; overflow: hidden; margin: 0 10px; }
+  .bar-fill { height: 100%; border-radius: 5px; background: var(--brand); }
+  .bar-count { width: 34px; text-align: right; color: var(--ink-soft); font-weight: bold; }
 
-  table { width: 100%; border-collapse: collapse; margin-top: 6px; font-size: 8.5pt; }
-  th, td { text-align: left; padding: 5px 6px; border-bottom: 1px solid #e2e8f0; vertical-align: top; }
-  th { background: #f8fafc; color: #475569; font-size: 7.5pt; text-transform: uppercase; }
-  .sev { font-weight: bold; padding: 1px 6px; border-radius: 4px; color: white; font-size: 7.5pt; }
-  .sev-critical { background: #dc2626; }
-  .sev-high { background: #ea580c; }
-  .sev-medium { background: #d97706; }
-  .sev-low { background: #2563eb; }
-  .sev-info { background: #64748b; }
-  .evidence { font-family: monospace; font-size: 7.5pt; color: #475569; white-space: pre-wrap; word-break: break-all; }
-  .empty { color: #94a3b8; font-style: italic; padding: 8px 0; }
+  /* ── Panels / tables ─────────────────────────────────────── */
+  .panel {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    margin-top: 4px;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 8.5pt; }
+  th, td { text-align: left; padding: 7px 10px; vertical-align: top; }
+  th {
+    background: var(--ink);
+    color: #e2e8f0;
+    font-size: 7pt;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    font-weight: bold;
+  }
+  td { border-bottom: 1px solid var(--border); }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:nth-child(even) td { background: var(--panel); }
+  tr { break-inside: avoid; page-break-inside: avoid; }
+
+  .control-row td {
+    background: #eef2ff !important;
+    font-weight: bold;
+    color: var(--brand-dark);
+    border-bottom: 1px solid #dbe3fb;
+    padding-top: 6px;
+    padding-bottom: 6px;
+  }
+  .safeguard-row td:first-child { padding-left: 20px; color: var(--muted); }
+
+  .sev {
+    display: inline-block;
+    font-weight: bold;
+    padding: 2px 7px;
+    border-radius: 4px;
+    color: white;
+    font-size: 7pt;
+    letter-spacing: 0.3px;
+    text-transform: uppercase;
+    margin: 1px 2px 1px 0;
+  }
+  .sev-critical { background: var(--critical); }
+  .sev-high { background: var(--high); }
+  .sev-medium { background: var(--medium); }
+  .sev-low { background: var(--low); }
+  .sev-info { background: var(--info); }
+
+  .finding-title { font-weight: bold; color: var(--ink); }
+  .finding-url { color: var(--muted); font-size: 7.5pt; margin-top: 2px; }
+  .evidence {
+    font-family: monospace;
+    font-size: 7.5pt;
+    color: var(--ink-soft);
+    white-space: pre-wrap;
+    word-break: break-all;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 5px 7px;
+    margin-top: 4px;
+  }
+  .muted { color: var(--muted); }
+  .badge {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 999px;
+    font-size: 7.5pt;
+    font-weight: bold;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    background: rgba(255,255,255,0.15);
+    color: #fff;
+  }
+  .empty {
+    color: var(--faint);
+    font-style: italic;
+    padding: 14px;
+    text-align: center;
+    background: var(--panel);
+    border: 1px dashed var(--border);
+    border-radius: 8px;
+  }
+
+  .content { margin-top: 4px; }
 </style>
 </head>
 <body>
 
-  <div class="header">
+  <div class="cover">
     <div>
+      <div class="cover-eyebrow">Security Posture Report</div>
       <h1>{{ r.organization_name }}</h1>
-      <p class="muted">{{ workspace_name }} &middot; Generated {{ r.generated_at[:10] }}</p>
-      <span class="badge">{{ r.report_type }} report</span>
+      <p class="cover-meta">
+        <strong>{{ workspace_name }}</strong> &middot; Generated {{ r.generated_at[:10] }}
+        &middot; <span class="badge">{{ r.report_type }}</span>
+      </p>
     </div>
     {% if r.risk_score %}
-    <div style="text-align:center;">
-      <div class="grade-circle grade-{{ r.risk_score.grade }}">{{ r.risk_score.grade }}</div>
-      <p class="muted" style="margin-top:4px;">Score: {{ r.risk_score.overall_score }}/100</p>
+    <div class="grade-wrap">
+      <div class="grade-ring grade-{{ r.risk_score.grade }}">{{ r.risk_score.grade }}</div>
+      <div class="grade-caption"><b>{{ r.risk_score.overall_score }}</b>/100</div>
     </div>
     {% endif %}
   </div>
 
-  <h2>Summary</h2>
+  <div class="content">
+
+  {% if r.narrative %}
+  <div class="callout">
+    <div class="callout-label">Executive Summary</div>
+    <p>{{ r.narrative }}</p>
+  </div>
+  {% endif %}
+
+  <div class="section-title"><h2>Summary</h2></div>
   <div class="stat-grid">
     <div class="stat-tile"><div class="value">{{ r.summary.total_assets }}</div><div class="label">Assets</div></div>
     <div class="stat-tile"><div class="value">{{ r.summary.total_findings }}</div><div class="label">Open Findings</div></div>
-    <div class="stat-tile"><div class="value" style="color:#dc2626;">{{ r.summary.critical }}</div><div class="label">Critical</div></div>
-    <div class="stat-tile"><div class="value" style="color:#ea580c;">{{ r.summary.high }}</div><div class="label">High</div></div>
-    <div class="stat-tile"><div class="value" style="color:#d97706;">{{ r.summary.medium }}</div><div class="label">Medium</div></div>
-    <div class="stat-tile"><div class="value" style="color:#2563eb;">{{ r.summary.low }}</div><div class="label">Low</div></div>
+    <div class="stat-tile critical"><div class="value" style="color:var(--critical);">{{ r.summary.critical }}</div><div class="label">Critical</div></div>
+    <div class="stat-tile high"><div class="value" style="color:var(--high);">{{ r.summary.high }}</div><div class="label">High</div></div>
+    <div class="stat-tile medium"><div class="value" style="color:var(--medium);">{{ r.summary.medium }}</div><div class="label">Medium</div></div>
+    <div class="stat-tile low"><div class="value" style="color:var(--low);">{{ r.summary.low }}</div><div class="label">Low</div></div>
   </div>
 
   {% if charts %}
-  <h2>Findings by Severity</h2>
+  <div class="section-title"><h2>Findings by Severity</h2></div>
   {% for bar in charts.severity %}
   <div class="bar-row">
     <div class="bar-label">{{ bar.label }}</div>
@@ -131,7 +291,7 @@
   {% endfor %}
 
   {% if charts.category %}
-  <h2>Top Finding Categories</h2>
+  <div class="section-title"><h2>Top Finding Categories</h2></div>
   {% for bar in charts.category %}
   <div class="bar-row">
     <div class="bar-label">{{ bar.label }}</div>
@@ -142,37 +302,75 @@
   {% endif %}
   {% endif %}
 
-  <h2>Asset Inventory</h2>
+  <div class="section-title"><h2>Asset Inventory</h2></div>
   {% if r.asset_types %}
+  <div class="panel">
   <table>
     <thead><tr><th>Asset Type</th><th>Count</th></tr></thead>
     <tbody>
       {% for at, count in r.asset_types.items() %}
-      <tr><td>{{ at }}</td><td>{{ count }}</td></tr>
+      <tr><td>{{ at | humanize }}</td><td>{{ count }}</td></tr>
       {% endfor %}
     </tbody>
   </table>
+  </div>
   {% else %}
   <p class="empty">No assets discovered yet.</p>
   {% endif %}
 
+  {% if r.compliance %}
+  <div class="section-title">
+    <h2>Compliance Mapping — {{ r.compliance.framework }}</h2>
+    <span class="meta">{{ r.compliance.coverage_summary.controls_with_findings }} of {{ r.compliance.coverage_summary.controls_total }} Controls affected</span>
+  </div>
+  {% if r.compliance.unmapped_count %}
+  <p class="muted" style="font-size:8pt; margin: 0 0 6px 0;">{{ r.compliance.unmapped_count }} findings have no Control mapping.</p>
+  {% endif %}
+  {% if r.compliance.controls %}
+  <div class="panel">
+  <table>
+    <thead><tr><th>Safeguard</th><th>Findings</th><th>By Severity</th></tr></thead>
+    <tbody>
+      {% for control in r.compliance.controls %}
+        <tr class="control-row"><td colspan="3">CIS {{ control.control_id }} — {{ control.control_name }} · {{ control.total_findings }} finding{{ "s" if control.total_findings != 1 else "" }}</td></tr>
+        {% for sg in control.safeguards %}
+        <tr class="safeguard-row">
+          <td>{{ sg.safeguard_id }} — {{ sg.title }}</td>
+          <td>{{ sg.finding_count }}</td>
+          <td>
+            {% for sev, count in sg.severity_counts.items() %}
+              <span class="sev sev-{{ sev }}">{{ sev }} {{ count }}</span>
+            {% endfor %}
+          </td>
+        </tr>
+        {% endfor %}
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}
+  <p class="empty">No open findings map to a CIS Control in this window.</p>
+  {% endif %}
+  {% endif %}
+
   {% if r.findings is not none %}
-  <h2>Findings ({{ r.date_range_days }}-day window)</h2>
+  <div class="section-title"><h2>Findings</h2><span class="meta">{{ r.date_range_days }}-day window</span></div>
   {% if r.findings %}
+  <div class="panel">
   <table>
     <thead>
-      <tr><th>Severity</th><th>Title</th><th>Category</th><th>CVE</th><th>CVSS</th><th>Last Seen</th></tr>
+      <tr><th>Severity</th><th>Finding</th><th>Category</th><th>CVE</th><th>CVSS</th><th>Last Seen</th></tr>
     </thead>
     <tbody>
       {% for f in r.findings %}
       <tr>
         <td><span class="sev sev-{{ f.severity }}">{{ f.severity }}</span></td>
         <td>
-          {{ f.title }}
-          {% if f.affected_url %}<div class="muted" style="font-size:7.5pt;">{{ f.affected_url }}</div>{% endif %}
+          <div class="finding-title">{{ f.title }}</div>
+          {% if f.affected_url %}<div class="finding-url">{{ f.affected_url }}</div>{% endif %}
           {% if f.evidence %}<div class="evidence">{{ f.evidence }}</div>{% endif %}
         </td>
-        <td>{{ f.category }}</td>
+        <td>{{ f.category | humanize }}</td>
         <td>{{ f.cve_ids | join(", ") if f.cve_ids else "—" }}</td>
         <td>{{ f.cvss_score if f.cvss_score is not none else "—" }}</td>
         <td>{{ f.last_seen[:10] if f.last_seen else "—" }}</td>
@@ -180,12 +378,14 @@
       {% endfor %}
     </tbody>
   </table>
+  </div>
   {% else %}
   <p class="empty">No open findings in this window.</p>
   {% endif %}
 
-  <h2>Recent Scans</h2>
+  <div class="section-title"><h2>Recent Scans</h2></div>
   {% if r.recent_scans %}
+  <div class="panel">
   <table>
     <thead><tr><th>Type</th><th>Status</th><th>Assets Found</th><th>Findings Found</th><th>Started</th></tr></thead>
     <tbody>
@@ -200,10 +400,13 @@
       {% endfor %}
     </tbody>
   </table>
+  </div>
   {% else %}
   <p class="empty">No scans in this window.</p>
   {% endif %}
   {% endif %}
+
+  </div>
 
 </body>
 </html>

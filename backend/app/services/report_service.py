@@ -14,6 +14,8 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 from sqlalchemy import func, select
 
 from app.db.models.models import Asset, Finding, Organization, Report, RiskScore, Scan, Workspace
+from app.services.compliance_mapping import CIS_CONTROLS, get_cis_mapping
+from app.services.report_narrative import build_executive_narrative
 
 log = structlog.get_logger()
 
@@ -24,9 +26,11 @@ _jinja_env = Environment(
     autoescape=select_autoescape(["html"]),
 )
 
-# report_type values that get the same "full detail" treatment as `technical`.
-# `compliance` and `custom` don't have real framework-mapping / section-picker
-# support yet, so they alias to technical rather than fabricating content.
+# report_type values that get the same "full detail" treatment as `technical`
+# (full findings list, recent scans). `compliance` additionally gets a real
+# CIS Controls v8 mapping section (see _build_compliance_section below).
+# `custom` still has no section-picker support -- aliases to technical, not
+# fabricated content.
 DETAILED_REPORT_TYPES = {"technical", "compliance", "custom"}
 
 EVIDENCE_FIELDS = ("evidence", "request_raw", "response_raw", "proof", "affected_url")
@@ -35,6 +39,25 @@ EVIDENCE_FIELDS = ("evidence", "request_raw", "response_raw", "proof", "affected
 def _date_cutoff(days: int, now: Optional[datetime] = None) -> datetime:
     now = now or datetime.now(timezone.utc)
     return now - timedelta(days=max(0, days))
+
+
+# Raw category/asset-type values are snake_case tokens (e.g.
+# "cors_misconfiguration", "cloud_bucket") with no natural word-break point
+# for a renderer to wrap on -- in the PDF's fixed-width chart labels this
+# overflowed and visually collided with the bar next to it. Humanizing to
+# spaced, title-cased words (with known security acronyms kept upper-case)
+# fixes both the overlap (real word breaks now exist) and readability.
+_ACRONYMS = {"cve", "tls", "cors", "hsts", "spf", "dmarc", "dnssec", "eol", "api", "ip", "dns", "ssl", "csp"}
+
+
+def _humanize_label(value: str) -> str:
+    if not value:
+        return value
+    words = value.replace("_", " ").split()
+    return " ".join(w.upper() if w.lower() in _ACRONYMS else w.capitalize() for w in words)
+
+
+_jinja_env.filters["humanize"] = _humanize_label
 
 
 def _strip_evidence(finding: Dict[str, Any]) -> Dict[str, Any]:
@@ -146,6 +169,7 @@ async def _build_report_data(
     # the findings/scans sections at all.
     findings: Optional[List[Dict[str, Any]]] = None
     recent_scans: Optional[List[Dict[str, Any]]] = None
+    compliance: Optional[Dict[str, Any]] = None
 
     if detailed:
         findings_rows = (await db.execute(
@@ -177,6 +201,29 @@ async def _build_report_data(
             "completed_at": s.completed_at.isoformat() if s.completed_at else None,
         } for s in recent_scans_rows]
 
+        if report_type == "compliance":
+            category_severity_rows = (await db.execute(
+                select(Finding.category, Finding.severity, func.count(Finding.id))
+                .where(
+                    Finding.org_id == org_id,
+                    Finding.status == "open",
+                    Finding.deleted_at.is_(None),
+                    Finding.last_seen >= cutoff,
+                )
+                .group_by(Finding.category, Finding.severity)
+            )).all()
+            compliance = _build_compliance_section(category_severity_rows)
+
+    summary = {
+        "total_assets": total_assets,
+        "total_findings": total_findings,
+        "critical": severity_counts["critical"],
+        "high": severity_counts["high"],
+        "medium": severity_counts["medium"],
+        "low": severity_counts["low"],
+    }
+    findings_by_category_map = {cat: count for cat, count in by_category}
+
     return {
         "report_type": report_type,
         "generated_at": now.isoformat(),
@@ -184,18 +231,13 @@ async def _build_report_data(
         "organization_name": org.name,
         "date_range_days": date_range_days,
         "risk_score": risk_score,
-        "summary": {
-            "total_assets": total_assets,
-            "total_findings": total_findings,
-            "critical": severity_counts["critical"],
-            "high": severity_counts["high"],
-            "medium": severity_counts["medium"],
-            "low": severity_counts["low"],
-        },
+        "narrative": build_executive_narrative(org.name, risk_score, summary, findings_by_category_map),
+        "summary": summary,
         "asset_types": {at: count for at, count in asset_types},
-        "findings_by_category": {cat: count for cat, count in by_category},
+        "findings_by_category": findings_by_category_map,
         "findings": findings,
         "recent_scans": recent_scans,
+        "compliance": compliance,
     }
 
 
@@ -205,6 +247,54 @@ SEVERITY_COLORS = {
     "medium": "#d97706",
     "low": "#2563eb",
 }
+
+
+def _build_compliance_section(rows: List[tuple]) -> Dict[str, Any]:
+    """Group (category, severity, count) rows into CIS Controls v8 controls/safeguards.
+
+    Uncapped, uses its own GROUP BY query rather than the (500-row-capped)
+    findings list used for display, so totals stay accurate for orgs with
+    more open findings than that display cap."""
+    control_totals: Dict[str, Dict[str, Any]] = {}
+    unmapped_count = 0
+
+    for category, severity, count in rows:
+        mapping = get_cis_mapping(category)
+        if mapping is None:
+            unmapped_count += count
+            continue
+        control_id, safeguard_id, safeguard_title = mapping
+        control = control_totals.setdefault(control_id, {
+            "control_id": control_id,
+            "control_name": CIS_CONTROLS.get(control_id, control_id),
+            "safeguards": {},
+            "total_findings": 0,
+        })
+        safeguard = control["safeguards"].setdefault(safeguard_id, {
+            "safeguard_id": safeguard_id,
+            "title": safeguard_title,
+            "finding_count": 0,
+            "severity_counts": {},
+        })
+        safeguard["finding_count"] += count
+        safeguard["severity_counts"][severity] = safeguard["severity_counts"].get(severity, 0) + count
+        control["total_findings"] += count
+
+    controls = []
+    for control_id in sorted(control_totals, key=int):
+        control = control_totals[control_id]
+        control["safeguards"] = sorted(control["safeguards"].values(), key=lambda s: s["safeguard_id"])
+        controls.append(control)
+
+    return {
+        "framework": "CIS Controls v8",
+        "controls": controls,
+        "unmapped_count": unmapped_count,
+        "coverage_summary": {
+            "controls_with_findings": len(controls),
+            "controls_total": len(CIS_CONTROLS),
+        },
+    }
 
 
 def _build_chart_data(report_data: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
@@ -224,7 +314,7 @@ def _build_chart_data(report_data: Dict[str, Any]) -> Dict[str, List[Dict[str, A
     by_category = report_data.get("findings_by_category") or {}
     max_cat = max(by_category.values(), default=1) or 1
     category_bars = [
-        {"label": cat, "count": count, "pct": round(100 * count / max_cat, 1)}
+        {"label": _humanize_label(cat), "count": count, "pct": round(100 * count / max_cat, 1)}
         for cat, count in by_category.items()
     ]
 

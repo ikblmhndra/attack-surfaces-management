@@ -34,6 +34,7 @@ from workers.discovery.dns_candidates import (
     dns_fingerprint,
     generate_bruteforce_hosts,
     generate_permutation_hosts,
+    is_unconfirmed_generated_guess,
     normalize_host,
 )
 from app.services.scan_profiles import build_target_candidates, child_profile_config
@@ -304,9 +305,18 @@ class DiscoveryWorker(BaseWorker):
             log.info("http_probed", alive=len(alive_hosts))
 
             persisted_hosts = {}
+            generated_misses_skipped = 0
             for host in resolved:
                 http_data = dict(alive_hosts.get(host, {}))
-                http_data["validation"] = validation_by_host.get(host)
+                validation = validation_by_host.get(host)
+                http_data["validation"] = validation
+                evidence_sources = discovery_evidence.get(host, {}).get("sources") or set()
+                if is_unconfirmed_generated_guess(
+                    evidence_sources,
+                    (validation or {}).get("liveness_status"),
+                ):
+                    generated_misses_skipped += 1
+                    continue
                 persisted_hosts[host] = http_data
 
             # ── Phase 4: Persist Assets ───────────────────────
@@ -358,6 +368,7 @@ class DiscoveryWorker(BaseWorker):
                         for evidence in discovery_evidence.values()
                         if evidence.get("generated")
                     ),
+                    generated_misses_skipped=generated_misses_skipped,
                 )
 
             # ── Phase 5: Queue downstream tasks ───────────────

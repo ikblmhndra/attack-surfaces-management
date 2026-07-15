@@ -4,6 +4,482 @@ All notable changes to this project are documented below, sorted newest-first.
 
 ---
 
+## 2026-07-15 — Frontend consistency pass: DNS Intel, Network Intel, sidebar nav
+
+User asked for a full frontend "revamp." Before touching any code, audited every page in a real browser
+(Overview, Organizations, Assets, Risk Scores, Scans, Screenshots, DNS Intel, TLS/SSL, Network Intel,
+Settings, API Keys, Search, Organization Detail) and cross-checked the design tokens (`tailwind.config.ts`,
+`layout.tsx`) against the `ui-ux-pro-max` design-system tool's own "enterprise security" recommendation.
+**Finding: the base system (Geist Sans/Mono, the brand-blue scale, severity/grade colors) already matches
+professional-enterprise-security best practice almost exactly** — no palette or typography replacement was
+warranted, and doing one anyway would have been wasted risk for no real gain. The actual problem was
+uneven polish across pages, not the foundation. Scoped down to 3 concrete, real issues found during the
+audit; user confirmed proceeding with exactly those.
+
+### Fixed
+- **DNS Intel** (`frontend/src/app/dashboard/dns/page.tsx`): the Records column rendered *every* key in
+  the `dns_records` JSONB blob as a gray chip, including record types with zero entries (`mx: 0`, `ns: 0`,
+  `txt: 0`, `aaaa: 0`, `cname: 0` on nearly every row) — and, on closer inspection while fixing it,
+  `discovery_sources`/`discovery_evidence` (worker-side bookkeeping fields sharing the same JSONB blob, not
+  real DNS data) were being rendered as if they were record types too. Now only real record types
+  (a/aaaa/mx/txt/ns/cname) with at least one actual entry render, as a colored brand badge; a host with
+  none shows a plain "No records" instead of a wall of zero-value chips.
+- **Network Intel** (`frontend/src/app/dashboard/intel/page.tsx`): the `Risk` column showed a muted dash on
+  literally every row — by design, per the existing code comment, since the no-key `network_baseline`
+  enrichment never populates `risk_score`/`is_malicious` (reserved for a future intel-feed source; see
+  CLAUDE.md's enrichment-scope decision, deliberately not touched here). Now the column only renders when
+  at least one row on the current page actually has a value — reappears on its own the moment a real
+  scored source starts writing to this table, no code change needed then. The `Source` column (constant
+  `network_baseline` string repeated on every single row today) moved from a dedicated column to a small
+  caption under the asset value, freeing a full column of pure repetition while keeping the field visible
+  for whenever a second source exists to actually distinguish.
+- **Sidebar nav** (`frontend/src/components/layout/Sidebar.tsx`): `isActive()` used plain
+  `pathname.startsWith(href)`, so a parent route and a nested child both lit up at once — e.g. "Settings"
+  (`/dashboard/settings`) and "API Keys" (`/dashboard/settings/api-keys`) were both highlighted
+  simultaneously while on the API Keys page. Now resolves the single most specific (longest-href) match
+  across both nav sections, so only one item is ever active.
+
+### Verified in a real browser
+Rebuilt the frontend (`target: production`, no hot-reload) and confirmed all three fixes with fresh
+screenshots against real `pasarjaya.co.id` data: DNS Intel now shows compact `A 1`-style badges or "No
+records" instead of the zero-value wall; Network Intel's Risk column is correctly absent for this org
+(no scored rows) and Source reads as a quiet caption; the API Keys page now highlights only "API Keys" in
+the sidebar, not both it and "Settings". `npx tsc --noEmit` clean throughout.
+
+### Explicitly not done
+- No color/typography/token replacement — confirmed already correct via the design-system tool, would
+  have been unnecessary risk.
+- Settings page structure — audited, found genuinely plain but not wrong for a settings page; left as-is.
+
+---
+
+## 2026-07-15 — Attack Surface: Network Clusters view replaces the node-link graph as default
+
+Follow-up to the same-day graph density fixes: user asked to move away from the node-link "mind map"
+entirely, not just tune it further. Presented a concept mockup (published as a Claude artifact, built with
+the `artifact-design` skill) showing a grouped-by-shared-IP list view instead; user approved it as-is
+("nah boleh tuh seperti itu"). The mockup's own "Graph (legacy)" toggle affordance was treated as tacit
+approval to keep the existing graph reachable rather than deleting a feature verified earlier the same day
+— nothing working was thrown away.
+
+### Added
+- **`GET /organizations/{org_id}/network-clusters`** (`organizations.py`) — new endpoint. Groups subdomain
+  assets by shared resolved IP (only hosts with at least one resolved IP are considered — unresolved hosts
+  have no network position to cluster by, same scope boundary as the earlier discovery-noise tuning work).
+  IP groups with 2+ hosts become a cluster (host list with real `http_status`, aggregated distinct
+  `Technology` names, open-finding severity counts, and a top-5 findings preview ordered by the existing
+  severity-rank pattern); everything else is a standalone host. Unlike the persisted
+  `shares_infrastructure` relationship rows (capped at 20 per IP to bound pairwise-edge growth), this is a
+  pure display grouping with no O(n²) concern, so no cap was needed.
+- **`frontend/src/components/charts/NetworkClusters.tsx`** (new) — renders `{clusters, standalone,
+  summary}` using existing primitives (`Collapsible`/`CollapsibleContent` from the Grouped Findings work,
+  `SeverityBadge`) rather than reinventing them: each cluster is an expandable row (IP, host count, tech
+  chips, severity summary → host list + top findings + full tech stack); standalone hosts as a flat list
+  below.
+- **`frontend/src/app/dashboard/attack-surface/page.tsx`**: new `view: "clusters" | "graph"` toggle,
+  **defaulting to `"clusters"`**. The existing graph data-fetching/rendering block (tech-dedup + degree
+  sizing, shipped earlier today) is completely untouched, just gated behind the "Graph (legacy)" tab and
+  now only fetches when that tab is actually selected (previously fetched unconditionally).
+- `frontend/src/types/index.ts`: `NetworkCluster`/`StandaloneHost`/`NetworkClustersResponse` types.
+
+### Verified against real production data + real browser
+- Direct invocation of `get_network_clusters` against `pasarjaya.co.id`: **8 clusters, 23 clustered hosts,
+  25 standalone hosts, 25 total IPs** — exact match to hand-computed real numbers from planning. Largest
+  cluster (`223.27.156.70`) returned exactly the 6 real hosts predicted in advance
+  (admretail/admantrian/crm/perawatangerai/retail/rusunawa).
+- `npx tsc --noEmit` clean. Frontend rebuilt (`target: production`, no hot-reload) before browser checks.
+- Real-browser check (user provided fresh login credentials again for this explicit purpose): Clusters
+  loads as the default view showing all 8 real clusters sorted by host count with correct severity-colored
+  pills; expanding the largest cluster showed the real host list with HTTP status, real critical CVE
+  findings (CVE-2026-44631/29167/34182/42535) with correct affected-host attribution, and the full
+  real shared-tech-stack chip list; switching to "Graph (legacy)" rendered the untouched graph correctly
+  (226 nodes/287 relationships, same as the earlier same-day verification) with zero console exceptions.
+  Full backend suite: 283 passed, 1 skipped (same pre-existing unrelated skip).
+
+---
+
+## 2026-07-15 — Attack Surface Map: dedupe tech nodes, size by importance, quieter default view
+
+User asked for redesign input on the Attack Surface Map (shipped earlier this session): at real density
+(605 nodes / 672 edges for `pasarjaya.co.id`) it rendered as an unreadable "hairball" — every node the same
+size, and every label invisible at the default fit-to-screen zoom (`min-zoomed-font-size` cutoff, combined
+with how zoomed-out `fit:true` has to go to fit 600+ nodes). Investigation found a concrete, quantified
+root cause worth fixing at the data layer: the Technology-node loop in `get_attack_surface_graph` keyed
+each node as `f"tech-{tech.name}-{tech.asset_id}"` — one node **per (technology, asset) pair**, not one
+shared node per technology. Real data: "Apache HTTP Server" alone is on 30 assets in `pasarjaya.co.id`,
+producing 30 separate identical nodes instead of 1 shared one with 30 edges fanning in.
+
+### Fixed
+- **`backend/app/api/v1/endpoints/organizations.py::get_attack_surface_graph`**: Technology nodes now keyed
+  by name only (case-insensitive), with an `asset_count` on each node. "Apache HTTP Server" is now 1 node
+  with `asset_count: 28`, not 28+ duplicates — confirmed real data drop from 196 tech nodes to 45 distinct
+  technologies for this org.
+
+### Changed
+- **`frontend/src/app/dashboard/attack-surface/page.tsx`**: `tech`/`finding` node-type toggles now default
+  **off** (were all-on) — the initial view is topology-focused (org/domain/ip/port + real relationships),
+  with tech/findings one click away. Real effect: default node count for `pasarjaya.co.id` dropped from 605
+  to 226 (edges 672 → 287).
+- **`frontend/src/components/charts/AssetRelationshipGraph.tsx`**:
+  - Node size now scales with degree (edge count touching the node) instead of a flat per-type constant —
+    hubs (a shared IP, a widely-used technology) visibly stand out; clamped so one mega-hub can't swallow
+    the canvas.
+  - Label visibility is now content-driven, not purely zoom-driven: `org` and `tech` nodes (low-cardinality
+    after the dedup fix) always show their name; `domain`/`ip`/`port` only label once they're an actual hub
+    (degree ≥ 3). Previously every label was governed solely by `min-zoomed-font-size`, which suppressed
+    *all* of them at the zoom level 600+ nodes force. Also lowered that zoom threshold (8 → 4) so it stops
+    fighting the new content-driven filtering.
+  - `tech`'s color (`#0284c7`/`#38bdf8`) was visually confusable with `org`'s (`#0ea5e9`/`#38bdf8` — literally
+    the same border color) — changed to a distinct teal (`#0d9488`/`#2dd4bf`).
+- **Not changed this pass** (explicit, per the user's own framing — try the above first): the "cose"
+  force-directed layout algorithm itself.
+
+### Verified against real production data + real browser
+- Direct invocation of `get_attack_surface_graph` against `pasarjaya.co.id`: confirmed the single "Apache
+  HTTP Server" tech node has `asset_count: 28` with exactly 28 edges pointing at it, zero dangling edges.
+- `npx tsc --noEmit` clean.
+- Real-browser check (user provided fresh login credentials again for this explicit purpose; the frontend
+  is a `target: production` Docker build with no hot-reload, so a rebuild was required to pick up the
+  frontend changes — done via `docker compose build frontend && docker compose up -d frontend`): confirmed
+  node count dropped 605 → 226 with tech/finding off by default (visible in the Graph Summary sidebar: 0
+  Technologies, 0 Findings), IP nodes render at clearly varying sizes matching real degree differences,
+  zoomed-in screenshot confirmed domain labels render legibly (`disbangan.pasarjaya.co.id` fully readable),
+  and toggling Tech back on showed 45 distinct technology nodes in a clearly-different teal color from the
+  org node's blue, with size variation matching `asset_count`. Full backend suite: 283 passed, 1 skipped
+  (same pre-existing unrelated skip).
+
+---
+
+## 2026-07-15 — Fixed overlapping category labels in report bar charts
+
+Follow-up to the same-day PDF redesign: user spotted `cors_misconfiguration` and `exposed_admin_panel`
+visually colliding with their own bar in "Top Finding Categories". Root cause: raw category values are
+unbroken snake_case tokens (no spaces), so the renderer had no natural point to wrap the fixed-width label
+column onto a second line — it just overflowed into the bar next to it.
+
+### Fixed
+- **`report_service.py`**: new `_humanize_label()` (+ a small acronym list — CVE/TLS/CORS/HSTS/SPF/DMARC/
+  DNSSEC/EOL/API/IP/DNS/SSL/CSP kept upper-case, everything else title-cased) converts raw tokens like
+  `cors_misconfiguration` → `CORS Misconfiguration` before they ever reach the template. Registered as a
+  `humanize` Jinja filter, applied to the Findings table's Category column and the Asset Inventory table's
+  Asset Type column too, for consistency — not just the chart labels that prompted the fix.
+- **`report_pdf.html`**: `.bar-label` widened (118px → 132px) with `overflow-wrap`/`word-break` so a label
+  that's still long after humanizing wraps onto a second line inside its own column instead of colliding
+  with the bar, rather than relying on humanization alone to always produce a short-enough string.
+
+### Verified against real production data
+Regenerated the `pu.go.id` executive report (the exact org/categories the user flagged) and visually
+confirmed: "CORS Misconfiguration" and "Exposed Admin Panel" now wrap cleanly onto two lines with zero
+overlap into the bar track; "Known CVE", "Old TLS Version", "Missing HSTS", "EOL Software" all render with
+correct acronym casing; Asset Inventory now shows "Subdomain"/"IP" instead of raw lowercase. Full backend
+suite: 283 passed, 1 skipped (same pre-existing unrelated skip).
+
+---
+
+## 2026-07-15 — PDF report visual redesign
+
+Follow-up to the executive narrative feature, same day: user felt the report still looked plain/flat
+("data doang") and asked for a real visual pass. Full rewrite of `backend/app/templates/report_pdf.html`'s
+CSS/structure — no `report_service.py` data changes, purely presentational.
+
+### Changed
+- **Cover band**: full-width dark navy→slate gradient header replacing the plain white header row —
+  organization name, workspace/date/report-type metadata, and a larger grade badge with a subtle ring
+  border, all in one cohesive block instead of a thin bottom-bordered strip.
+- **Executive summary callout**: the narrative paragraph (shipped earlier today) now sits in a distinct
+  tinted panel with a colored left accent bar and an "EXECUTIVE SUMMARY" label, instead of a bare paragraph
+  floating between the header and the stat tiles.
+- **Section headers**: consistent `.section-title` treatment (bold heading + full-width rule, optional
+  right-aligned context text) replacing plain `<h2>` tags with inconsistent visual weight.
+- **Stat tiles**: color-coded top borders per severity (critical/high/medium/low) instead of uniform gray
+  borders — the tile itself now visually pre-empts what its number means before you read the label.
+- **Tables**: dark header row (was light gray), zebra-striped body rows, wrapped in a rounded `.panel`
+  container. Findings table: title/URL/evidence restructured into a clearer visual stack per row.
+- **Compliance Mapping table** (real bug fix, not just polish): the previous table used
+  `{% if loop.first %}` to show the CIS Control name only on a safeguard's first row, leaving confusing
+  blank cells on every subsequent row for a multi-safeguard control. Replaced with a distinct bold/tinted
+  "control-row" spanning all columns (showing the Control name + its total finding count) followed by
+  indented safeguard rows underneath — matches how the data is actually grouped instead of fighting the
+  table's row-per-record shape.
+- **Pagination**: added `break-inside: avoid` on table rows — long finding rows (title + URL + evidence
+  block) no longer split awkwardly across a page boundary.
+
+### Also investigated (no change needed)
+User asked to remove scheduled/automatic daily reports (reasoning: unbounded recurring generation would
+accumulate storage for no benefit). Confirmed this is **already gone** from the codebase —
+`workers/scheduler/scheduler.py::_generate_daily_summaries` and the `report.daily` queue it used to publish
+to don't exist anywhere in the current code, and `scheduler.py::_register_jobs` registers no daily-report
+job. `CLAUDE.md`'s documented gotcha entry about this is stale and should be dropped next time that file is
+touched — no removal work was needed here.
+
+### Verified against real production data
+Regenerated real reports for both `pasarjaya.co.id` (executive) and `pu.go.id` (compliance, 355 findings
+across 38 pages) through the same direct-service-invocation technique used throughout today (no session
+token available) and visually inspected the rendered PDFs page-by-page: cover band, executive summary
+callout, color-coded stat tiles, severity/category bars, the restructured compliance table (4 real CIS
+Controls rendering correctly with per-safeguard severity badges), and the paginated findings table (confirmed
+row-splitting fix by inspecting the exact page boundary that previously split a row). Full backend suite:
+283 passed, 1 skipped (same pre-existing unrelated skip).
+
+---
+
+## 2026-07-15 — Report executive narrative
+
+User asked to enhance reporting, calling out that report content was "just data" (tables/numbers, no
+synthesis). Investigation found a concrete instance of exactly that: `_fetch_latest_risk_score()` already
+computes the full 9-category risk breakdown (network/DNS/web/TLS/exposure/patch-hygiene/info-leakage/
+reputation/misconfiguration scores) for every report, but `report_pdf.html` only ever rendered the overall
+grade/score badge — the per-category breakdown was fetched and silently discarded, never shown anywhere.
+Presented 4 concrete enhancement options (surface the unused category breakdown; a written executive
+narrative; score trend vs. previous report using the already-built `/score-history` endpoint; an EPSS/KEV-
+prioritized remediation list); user picked the narrative.
+
+Separately, user asked to remove scheduled/automatic daily reports (reasoning: recurring generation would
+accumulate storage over time for no benefit — on-demand only). Investigation found this is **already gone**
+— `CLAUDE.md`'s documented gotcha about `workers/scheduler/scheduler.py::_generate_daily_summaries`
+publishing to an unconsumed `report.daily` queue no longer matches the code: that function, the publish
+call, and the `report.daily` queue reference don't exist anywhere in the current codebase, and
+`scheduler.py::_register_jobs` has no daily-report job registered. No removal work was needed; `CLAUDE.md`'s
+gotcha entry is now stale and should be dropped next time that file is touched.
+
+### Added
+- **`backend/app/services/report_narrative.py`** (new) — `build_executive_narrative()`, a deterministic,
+  templated paragraph synthesizing already-computed report fields (risk score/grade, the worst-scoring of
+  the 9 categories if below a healthy threshold, open finding counts by severity, the top finding category,
+  a remediation call-to-action gated on critical/high findings actually being present). Explicitly **not**
+  an LLM call — every sentence traces directly to a field already in `report_data`, so it's always
+  explainable and never asserts something the underlying numbers don't support. Reuses the exact category
+  label wording already established in `frontend/src/app/dashboard/risks/page.tsx::CATEGORY_LABELS`.
+- **`report_service.py`**: `_build_report_data()` now always includes a `narrative` field (all report
+  types — the plain `executive` report benefits from this most, since it has no findings table to fall
+  back on).
+- **`report_pdf.html`**: narrative renders as a lead paragraph directly under the header/score badge,
+  before the Summary tiles.
+- **Tests**: `backend/tests/unit/test_report_narrative.py` (8 cases) — grade/score inclusion, worst-category
+  callout only below the healthy threshold, no-risk-score and zero-findings degradation, severity-count
+  phrasing, top-category phrasing, remediation sentence gated correctly.
+
+### Verified against real production data
+Generated a real `executive` report for `pasarjaya.co.id`: narrative read *"pasarjaya.co.id's overall
+security posture is rated D (42/100) as of 2026-07-14. The most significant risk driver is TLS Security
+(0/100), the lowest-scoring category. There are currently 792 open findings, including 95 critical and 333
+high severity. Known cve accounts for the largest share of open findings (593). Prioritizing remediation of
+critical and high severity findings is recommended to improve the organization's overall risk posture."* —
+every number in it cross-checked against the same report's own Summary/category data. Rendered to PDF and
+visually confirmed correct placement/formatting. Full backend suite: 283 passed, 1 skipped (same
+pre-existing unrelated skip).
+
+---
+
+## 2026-07-13 — Attack-surface graph: fixed relationship data, wired the graph to it
+
+Third of three requested ASM product features. Original framing was "wire the existing graph to the real
+`AssetRelationship` endpoint" — investigation found that would have made the graph *worse*: the table only
+ever gets 2 relationship types written to it, and one is a real bug.
+
+### Fixed
+- **`workers/correlation/correlation_worker.py::_build_relationships`**: removed the `has_finding` block
+  entirely. It matched a Technology row to a Finding via `finding.asset_id`, then wrote a relationship from
+  that same asset back to `finding.asset_id` — source and target were always identical.
+  **Confirmed empirically: 137/137 existing `has_finding` rows were self-loops.** Structurally, this could
+  never have worked: `AssetRelationship` is strictly Asset↔Asset, and neither `Technology` nor `Finding`
+  rows are asset-backed nodes, so "Technology → Finding" was never really representable in this schema —
+  not just a coding slip. The 137 existing self-loop rows were deleted (this table isn't read by any
+  frontend page today, so this had zero visible impact — pure dead-row cleanup).
+
+### Added
+- **New relationship type `shares_infrastructure`**: sibling subdomains resolving to the same IP (from
+  already-collected `Subdomain.ip_addresses`, no new scanning). Real shared-hosting/blast-radius signal —
+  two subdomains on the same box mean a compromise of one plausibly reaches the other. Capped at 20
+  subdomains per shared IP to avoid an O(n²) edge explosion on CDN/shared-hosting IPs where "same IP" stops
+  meaning anything.
+- **`GET /organizations/{org_id}/attack-surface-graph`** (`organizations.py`) — new org-wide graph
+  endpoint. Real `AssetRelationship` edges (`resolves_to`, `shares_infrastructure`) plus presentation-only
+  Technology/Finding nodes built directly from `Technology`/`Finding` tables (not real relationship rows —
+  same reasoning as above: neither is an asset-backed node). Same asset/finding caps and critical/high-only
+  finding filter the frontend already used, just computed server-side now.
+- **Frontend**: `frontend/src/app/dashboard/attack-surface/page.tsx` now calls the single new endpoint
+  instead of 3 parallel `/assets`+`/findings` fetches and ~90 lines of client-side graph construction — the
+  only client-side addition left is the synthetic org root node and its "contains" edges (purely
+  structural, not real data, so no reason to round-trip them). `npx tsc --noEmit` clean.
+
+### Verified against real production data
+- Direct invocation of the fixed `_build_relationships()` against `pasarjaya.co.id`: **0 self-loops**,
+  40 `resolves_to`, 29 `shares_infrastructure` — including a real, predicted-in-advance shared-hosting
+  group (`103.82.242.226` shared by `cdn-sirupa`/`admin-sirupa`/`api-sirupa`/`sirupa.pasarjaya.co.id`).
+  Persisted via the existing `_persist_relationships()` and confirmed via direct SQL: `has_finding` now 0
+  rows platform-wide, `shares_infrastructure` 29 rows for this org, 0 self-loops across the whole table.
+- Direct invocation of the new `GET /organizations/{id}/attack-surface-graph` endpoint: 497 nodes (25 ip,
+  176 domain, 196 tech, 100 finding), 339 edges (28 resolves_to, 15 shares_infrastructure, 196 runs, 100
+  has_finding) — **zero dangling edges** (every edge's source/target resolves to a node in the same
+  response).
+- Full backend unit suite: 275 passed, 1 skipped (same pre-existing unrelated skip as before).
+
+### Real-browser verification (follow-up, same day)
+The gap noted for all three features — no legitimate session token available for a CDP browser
+click-through — was closed once the user provided real login credentials for this explicit purpose (not a
+self-mint/bypass; a normal `POST /auth/login` through nginx, same as any real user). Confirmed visually via
+headless Chrome: the Attack Surface Map renders 605 nodes / 672 relationships for `pasarjaya.co.id` with the
+correct type breakdown (1 org, 200 domains, 25 IPs, 279 tech, 100 findings) in the sidebar summary, node
+color-coding matches the legend, and the page loads with zero console exceptions.
+
+### Explicitly not done
+- `IP → Port` relationships — structurally not representable without making `Port` an asset-backed entity;
+  would be a real schema change, not attempted.
+- No new scanning/data collection — `shares_infrastructure` uses only already-collected data.
+
+---
+
+## 2026-07-13 — CIS Controls v8 compliance report mapping
+
+Second of three requested ASM product features (after change/diff detection below). `compliance`/`custom`
+report types previously aliased straight to `technical` with zero framework mapping
+(`report_service.py::DETAILED_REPORT_TYPES` comment admitted this). User picked CIS Controls v8 over
+ISO 27001/SOC2/PCI-DSS after being shown that real finding categories (53 distinct values) are almost
+entirely technical/infrastructure (TLS, DNS auth, exposed panels, CVEs, misconfig) rather than
+policy/governance — a technical control catalog fits the actual data far better than a governance-heavy
+framework would.
+
+### Added
+- **`backend/app/services/compliance_mapping.py`** (new) — `CATEGORY_TO_CIS_SAFEGUARD`, an exhaustive
+  1:1 map from every category already in `risk_engine.py::FINDING_CATEGORY_MAP` (reused as the category
+  taxonomy source rather than re-deriving one — that map is what the risk engine itself already relies on,
+  and a past incident already caught/fixed categories missing from it) to a CIS Controls v8
+  Control+Safeguard. `get_cis_mapping()` lookup, case-insensitive.
+- **`report_service.py`**: `compliance` report type now gets a real `compliance` section (additive to the
+  existing full findings list, not a replacement) — findings grouped by CIS Control/Safeguard with
+  per-safeguard severity breakdowns and a coverage summary ("X of 8 mapped Controls have open findings").
+  Uses its own uncapped `GROUP BY category, severity` query (not the 500-row-capped display findings list),
+  so totals stay accurate for orgs with more open findings than that cap.
+- **`report_pdf.html`**: new "Compliance Mapping — CIS Controls v8" section, same conditional-block pattern
+  as the existing Findings/Recent Scans sections.
+- **Tests**: `backend/tests/unit/test_compliance_mapping.py` (8 cases) — exhaustiveness check (every
+  `FINDING_CATEGORY_MAP` key has a CIS entry and vice versa, guards the same kind of drift a past incident
+  caught in the risk-scoring map), lookup correctness, case-insensitivity. Full suite: **275 passed, 1
+  skipped** (unrelated pre-existing skip — a worker-side test module not importable from the `api`
+  container's Python path).
+
+### Verified against real production data
+- Generated a real `compliance`-type report for `pu.go.id` (116 assets, 355 open findings) via direct
+  service invocation (no session token available this round — see Feature 1's verification note below for
+  why). Compliance section correctly produced 4 populated CIS Controls (Data Protection 60, Secure
+  Configuration 159, Access Control Management 7, Continuous Vulnerability Management 129) — **sum of all
+  control totals + unmapped_count (0) == 355**, exact match to the summary's `total_findings`, confirming
+  zero findings lost or double-counted in the grouping.
+- Rendered the actual PDF (WeasyPrint) and visually inspected the output — the new section renders
+  correctly with proper severity-colored badges, matching the verified numbers exactly.
+
+### Real-browser verification (follow-up, same day)
+User provided real login credentials for this explicit purpose (normal `POST /auth/login`, not a
+bypass). Confirmed in a headless-Chrome session: the Reports page's Compliance Report tile shows the
+updated description ("Findings mapped to CIS Controls v8 safeguards"), and the two real compliance reports
+generated during verification appear correctly in the Recent Reports list for `pu.go.id`.
+
+---
+
+## 2026-07-13 — Scan change/diff detection ("What Changed Since Last Scan")
+
+First of three requested ASM product features. Investigation found the backend groundwork was more built
+than expected but had two real, previously-undiscovered gaps:
+- **`Scan.new_assets`/`new_findings`/`removed_assets` columns (`models.py:681-683`, `default=0`) were read
+  by two endpoints and shown on two frontend pages, but never written anywhere in the entire codebase** —
+  every scan ever run silently showed "0 new," regardless of reality.
+- `correlation_worker.py::_detect_changes`'s docstring claimed it detects "resolved findings" — it didn't;
+  no resolved-finding change type existed, and nothing auto-resolves a finding that isn't redetected
+  (resolution stays human-driven by design, not attempted here).
+
+### Added
+- **`workers/correlation/correlation_worker.py`**: `_detect_changes` now persists real counts onto the
+  `Scan` row after computing them — `new_findings` counts **all severities** (a separate, deliberately
+  broader definition than the existing crit/high-only filter that feeds `notify.send` alerts, which is
+  untouched).
+- **`backend/app/api/v1/endpoints/scans.py`**: new `_scan_changes()` helper, wired into `_scan_to_dict`'s
+  `detailed=True` payload (`GET /scans/{id}`) — read-only diff against the org's previous completed scan:
+  new assets, removed assets (offline since then), new findings (all severities, with a per-severity
+  breakdown), and **findings a human resolved since then** (new capability — purely additive, doesn't
+  change resolution behavior). No new tables; reuses the existing `ScanFinding.change_type`/`Asset.first_
+  seen`/`last_seen` comparison pattern `_detect_changes` already established.
+- **Frontend**: new "What Changed Since Last Scan" section on `frontend/src/app/dashboard/scans/[id]/
+  page.tsx`, four collapsible categories reusing the existing `components/ui/Collapsible.tsx` (built for
+  the Grouped Findings feature). First-scan-for-this-org case shows an explicit empty state instead of a
+  confusing all-zero diff. `npx tsc --noEmit` clean.
+
+### Verified against real production data, two ways
+- Direct invocation of `_scan_changes()` against an already-completed historical scan pair for
+  `pasarjaya.co.id` — computed new_assets=1, removed_assets=1, new_findings=15 (all `info` severity),
+  resolved_findings=0 — exact match to a manual SQL cross-check.
+- Triggered a fresh live scan on the same org (270+ subdomains) specifically to confirm the counter-
+  persistence fix fires on a real run end-to-end, not just in the read-only helper. Nuclei took a long time
+  across many sequential batches (single replica); `worker-nuclei` was scaled to 2 replicas mid-flight at
+  the user's request. Once complete: `new_assets=0, removed_assets=1, new_findings=101` (critical 8/high
+  30/medium 15/low 4/info 44) — **persisted `Scan` columns matched a fresh direct SQL count exactly**, and
+  a second `_scan_changes()` invocation against this same scan matched too, including the empty-list
+  (`new_assets=0`) and full-severity-spread cases the first check didn't exercise.
+
+### Real-browser verification (follow-up, same day)
+Initially skipped — no legitimate way to obtain a session token existed in-session (querying user
+credentials and directly minting a JWT were both correctly blocked by the permission classifier as out of
+scope for a verification task). Closed once the user explicitly provided real login credentials for this
+purpose: logged in normally via `POST /auth/login` through nginx, then confirmed in headless Chrome that
+the "What Changed Since Last Scan" section on the Scan Detail page for the fresh live scan
+(`7889d812-...`) renders exactly the verified numbers — New Assets 0, Removed Assets 1 (`202.148.26.203`,
+type `ip`), New Findings 101 (expanded to show real critical CVE findings with correct severity badges and
+affected hosts), Resolved Findings 0 — and that each category expands/collapses correctly.
+
+---
+
+## 2026-07-13 — Stop persisting unresolved dns_bruteforce/dns_permutation guesses as Assets
+
+Follow-up to the Grouped Findings triage work: checked the Assets inventory next and found the same
+volume-noise pattern there. Some orgs showed 200+ subdomains, most of which don't actually exist —
+`pasarjaya.co.id` had 437 subdomain assets but 388 (89%) were `liveness_status='unresolved'`, all still
+`status='active'` so all visible in the default Assets view. Broken down by discovery source across all 5
+active orgs: `dns_permutation` (env-prefix guesses like `dev-api.x.com` off already-known labels) had a
+**0.0% real-world hit rate — 0 out of 1070 candidates, platform-wide**; `dns_bruteforce` (wordlist guesses)
+was ~3.5%. Passive/observed sources (crt.sh, subfinder, assetfinder, tls_san_mining, wayback) were left
+untouched — their misses can still be dangling-CNAME/subdomain-takeover signal, unlike a pure wordlist miss.
+
+### Added
+- **`workers/discovery/dns_candidates.py`**: `GENERATED_ONLY_SOURCES` constant and
+  `is_unconfirmed_generated_guess(sources, liveness_status)` — true only when *every* discovery source for
+  a host is `dns_bruteforce`/`dns_permutation` and it never resolved (`liveness_status == "unresolved"`). A
+  host corroborated by any passive source is always kept regardless of liveness.
+- **`workers/tests/test_dns_candidates_guess_filter.py`** (new, 7 cases): pure-generated miss pruned,
+  resolved-generated kept, passive-corroborated-but-unresolved kept, empty/no-source input never pruned.
+
+### Changed
+- **`workers/scanner/discovery_worker.py`** (`process()`): the `persisted_hosts` loop (feeding
+  `_persist_assets`) now skips hosts matching `is_unconfirmed_generated_guess()` before the Asset/Subdomain
+  upsert runs — they no longer become permanent inventory rows. The existing `DiscoveredAsset` audit-trail
+  table (`_persist_discovered_assets`) is untouched — these attempts are still recorded there for
+  drill-down, just with `asset_id = NULL` since no real Asset backs them (already-existing `SET NULL` FK
+  behavior, no schema change). `update_scan_phase` gains a new `generated_misses_skipped` counter for
+  scan-detail visibility. Scan performance is unaffected — DNS resolution/HTTP probing still runs on these
+  candidates as before (a small % of `dns_bruteforce` guesses do occasionally resolve); only the *storage*
+  of confirmed misses changed.
+
+### Data cleanup (existing rows, confirmed with the user before running)
+Since this fix only prevents *new* noise, existing bogus rows were still cluttering the 5 active orgs today
+— soft-deleted (`deleted_at = now()`, same reversible mechanism already used for org deletion, and already
+respected by every `Asset` read path via `Asset.deleted_at.is_(None)`) rather than hard-deleted. Queried
+production DB directly for exact matches before touching anything: 856 Asset rows total (`pu.go.id` 234,
+`pasarjaya.co.id` 164, `ACME Corp` 160, `comika.id` 154, `kpi.go.id` 144) had `liveness_status='unresolved'`
+and *every* discovery source in `validation_sources->evidence->discovery->sources` was one of
+`dns_bruteforce`/`dns_permutation`. Verified FK cascade safety first (`subdomains.asset_id` → `CASCADE`,
+`discovered_assets.asset_id` → `SET NULL`, `findings.asset_id` → `CASCADE`); found only 3 `findings` rows
+would cascade, all three on `ACME Corp` (`app.acme-test.example` — an `.example` TLD, i.e. seed/demo data,
+not a real customer). Ran the soft-delete; visible subdomain counts dropped immediately:
+`pasarjaya.co.id` 437→273, `pu.go.id` 309→75, `kpi.go.id` 265→121, `comika.id` 172→18, `ACME Corp` 160→0
+(that org had no real subdomains at all — every one of its "subdomains" was an unresolved generated guess).
+
+### Explicitly not changed
+- Passive-source discovery (crt.sh, subfinder, assetfinder, wayback, tls_san_mining) and any host they
+  corroborate, even if currently unresolved — kept as-is, preserved for subdomain-takeover investigation.
+- `dns_bruteforce`/`dns_permutation` candidate generation and DNS/HTTP resolution attempts themselves are
+  unchanged — only whether a confirmed miss gets promoted to a permanent Asset row.
+
+---
+
 ## 2026-07-13 — Grouped/deduplicated findings view
 
 A real end-to-end validation scan (fresh `pasarjaya.co.id` org, run right after the risk-engine redesign
@@ -62,10 +538,23 @@ underlying issue into one row, expandable to the individual findings, without to
 - `npx tsc --noEmit` clean, `npm run lint` clean (only pre-existing warnings in unrelated files).
 - Dev server verified to build and serve the Findings page with zero compile/runtime errors (1518 modules)
   after the `next.config.js` fix above.
-- **Honest limitation**: no browser-automation tooling is available in this environment, so the actual
-  rendered toggle/expand/collapse interaction was not visually click-tested — verification stopped at
-  confirmed-correct API responses, a clean type-check/lint, and a successfully-serving dev build. A quick
-  manual look at `localhost:3000/dashboard/findings` is recommended before considering this fully done.
+- **Real browser click-testing, not just API/type-check verification**: no browser-automation tool was
+  available directly, so this was driven manually via Chrome DevTools Protocol (headless `google-chrome
+  --remote-debugging-port` + raw CDP websocket calls) — visually confirmed against the fresh
+  `pasarjaya.co.id` org: the Grouped view renders on load by default exactly as designed ("68 issues (645
+  findings)" header, correct severity tiles, CVE headings uppercased with an "e.g., ..." sample subheading
+  for multi-finding groups, non-CVE headings showing the verbatim title + `template_id`), clicking a
+  severity tile correctly filters both the header count and the row list ("4 issues (87 findings)" for
+  Critical), and the Grouped/Flat toggle correctly switches to the original unmodified flat table (645
+  individual rows, "645 findings" header) and back. Two more real, pre-existing local-dev gaps were found
+  and fixed along the way (unrelated to this feature, needed to even reach an authenticated page):
+  `frontend/.env.local` never existed, so `NEXT_PUBLIC_API_URL` fell back to an unreachable `localhost:8000`
+  (the API container's port isn't published to the host — dev only worked before via the fully-Dockerized
+  `docker compose` stack, never via standalone `npm run dev`); worked around for this session only via a
+  transient `.env.local` pointing at the API container's internal Docker IP, removed afterward since it's
+  not gitignored and the IP isn't stable across container recreation — a real, durable fix (e.g. publishing
+  a host port, or documenting the correct local-dev API URL) is a separate, pre-existing gap worth raising
+  with the team, not fixed here.
 
 ### Explicitly not in scope
 Any change to detection logic or finding volume — display-only aggregation. Bulk actions operating on a

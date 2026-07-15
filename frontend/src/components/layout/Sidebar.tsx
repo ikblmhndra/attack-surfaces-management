@@ -12,7 +12,15 @@ import { motion, AnimatePresence } from "framer-motion";
 import { cn } from "@/lib/utils";
 import { useWorkspaceStore } from "@/store/workspace";
 
-const NAV_ITEMS = [
+interface NavItem {
+  label: string;
+  href: string;
+  icon: typeof LayoutDashboard;
+  exact?: boolean;
+  badge?: boolean;
+}
+
+const NAV_ITEMS: NavItem[] = [
   { label: "Overview", href: "/dashboard", icon: LayoutDashboard, exact: true },
   { label: "Organizations", href: "/dashboard/organizations", icon: Building2 },
   { label: "Assets", href: "/dashboard/assets", icon: Layers },
@@ -27,21 +35,32 @@ const NAV_ITEMS = [
   { label: "Reports", href: "/dashboard/reports", icon: FileText },
 ];
 
-const BOTTOM_ITEMS = [
+const BOTTOM_ITEMS: NavItem[] = [
   { label: "Notifications", href: "/dashboard/notifications", icon: Bell, badge: true },
   { label: "Search", href: "/dashboard/search", icon: Search },
   { label: "API Keys", href: "/dashboard/settings/api-keys", icon: Key },
   { label: "Settings", href: "/dashboard/settings", icon: Settings },
 ];
 
+const ALL_ITEMS = [...NAV_ITEMS, ...BOTTOM_ITEMS];
+
 export function Sidebar() {
   const pathname = usePathname();
   const { user, sidebarCollapsed, setSidebarCollapsed } = useWorkspaceStore();
   const collapsed = sidebarCollapsed;
 
+  // Prefix-matching on its own lights up both a parent route and its child
+  // at once (e.g. "Settings" -> /dashboard/settings and "API Keys" ->
+  // /dashboard/settings/api-keys both match on /dashboard/settings/api-keys).
+  // Only the single most specific (longest href) match should be active.
   const isActive = (href: string, exact = false) => {
     if (exact) return pathname === href;
-    return pathname.startsWith(href);
+    if (pathname !== href && !pathname.startsWith(`${href}/`)) return false;
+    const matches = ALL_ITEMS.filter(
+      (item) => !item.exact && (pathname === item.href || pathname.startsWith(`${item.href}/`))
+    );
+    const mostSpecific = matches.reduce((a, b) => (b.href.length > a.href.length ? b : a));
+    return href === mostSpecific.href;
   };
 
   return (

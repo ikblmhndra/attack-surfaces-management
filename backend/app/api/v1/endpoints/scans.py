@@ -8,11 +8,14 @@ from fastapi import APIRouter, Depends, Query, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
 from app.api.v1.dependencies.auth import get_current_user, get_workspace_id, get_db, RequireRole
-from app.db.models.models import User, Scan, Organization, ScanPhaseRun, ScanTargetSelection, DiscoveredAsset
+from app.db.models.models import (
+    User, Scan, Organization, ScanPhaseRun, ScanTargetSelection, DiscoveredAsset,
+    Asset, Finding, ScanFinding,
+)
 from app.services.scan_profiles import apply_scan_profile, normalize_scan_profile
 from app.services.scan_progress import merge_runtime_phase_status
 from app.services.outbox_service import create_queue_event, dispatch_pending_outbox_once
-from sqlalchemy import select, update, func, or_, cast, String
+from sqlalchemy import select, update, func, or_, cast, String, case
 from sqlalchemy.ext.asyncio import AsyncSession
 
 router = APIRouter()
@@ -109,6 +112,7 @@ async def _scan_to_dict(scan: Scan, detailed: bool = False, db: AsyncSession | N
         data["target_selections"] = selections[:500]
         data["discovered_asset_summary"] = await _discovered_asset_summary(db, scan)
         data["why_no_findings"] = _why_no_findings(data)
+        data["changes"] = await _scan_changes(db, scan)
     return data
 
 
@@ -215,6 +219,126 @@ async def _discovered_asset_summary(db: AsyncSession, scan: Scan) -> dict:
         "by_type": dict(by_type),
         "by_source": dict(by_source),
         "by_status": dict(by_status),
+    }
+
+
+async def _scan_changes(db: AsyncSession, scan: Scan) -> dict:
+    """What changed vs. this org's previous completed scan -- new/removed
+    assets, new findings (all severities, unlike notify.send's crit/high-only
+    alert filter), and findings a human resolved since then. Read-only, live
+    computation against already-persisted data; no new tables."""
+    if scan.started_at is None:
+        return {"has_previous_scan": False}
+
+    previous = (await db.execute(
+        select(Scan)
+        .where(
+            Scan.org_id == scan.org_id,
+            Scan.status == "completed",
+            Scan.started_at < scan.started_at,
+        )
+        .order_by(Scan.started_at.desc())
+        .limit(1)
+    )).scalar_one_or_none()
+
+    if previous is None or previous.started_at is None:
+        return {"has_previous_scan": False}
+
+    prev_start = previous.started_at
+    cap = 200
+    severity_rank = case(
+        {sev: i for i, sev in enumerate(["critical", "high", "medium", "low", "info"])},
+        value=Finding.severity,
+        else_=99,
+    )
+
+    new_assets_filter = (
+        Asset.org_id == scan.org_id,
+        Asset.first_seen >= prev_start,
+        Asset.deleted_at.is_(None),
+    )
+    new_assets_rows = (await db.execute(
+        select(Asset).where(*new_assets_filter).order_by(Asset.first_seen.desc()).limit(cap)
+    )).scalars().all()
+    new_assets_total = (await db.execute(
+        select(func.count()).select_from(Asset).where(*new_assets_filter)
+    )).scalar_one()
+
+    removed_assets_filter = (
+        Asset.org_id == scan.org_id,
+        Asset.first_seen < prev_start,
+        Asset.last_seen < prev_start,
+        Asset.deleted_at.is_(None),
+    )
+    removed_assets_rows = (await db.execute(
+        select(Asset).where(*removed_assets_filter).order_by(Asset.last_seen.desc()).limit(cap)
+    )).scalars().all()
+    removed_assets_total = (await db.execute(
+        select(func.count()).select_from(Asset).where(*removed_assets_filter)
+    )).scalar_one()
+
+    new_findings_filter = (ScanFinding.scan_id == scan.id, ScanFinding.change_type == "new")
+    new_findings_rows = (await db.execute(
+        select(Finding).join(ScanFinding, ScanFinding.finding_id == Finding.id)
+        .where(*new_findings_filter)
+        .order_by(severity_rank, Finding.first_seen.desc())
+        .limit(cap)
+    )).scalars().all()
+    new_findings_total = (await db.execute(
+        select(func.count()).select_from(ScanFinding).where(*new_findings_filter)
+    )).scalar_one()
+    new_findings_by_severity = Counter(f.severity for f in new_findings_rows)
+
+    resolved_findings_filter = (
+        Finding.org_id == scan.org_id,
+        Finding.status == "resolved",
+        Finding.resolved_at.is_not(None),
+        Finding.resolved_at >= prev_start,
+    )
+    resolved_findings_rows = (await db.execute(
+        select(Finding).where(*resolved_findings_filter).order_by(Finding.resolved_at.desc()).limit(cap)
+    )).scalars().all()
+    resolved_findings_total = (await db.execute(
+        select(func.count()).select_from(Finding).where(*resolved_findings_filter)
+    )).scalar_one()
+
+    return {
+        "has_previous_scan": True,
+        "previous_scan_id": str(previous.id),
+        "previous_scan_completed_at": previous.completed_at.isoformat() if previous.completed_at else None,
+        "new_assets": {
+            "total": new_assets_total,
+            "items": [
+                {"id": str(a.id), "value": a.value, "asset_type": a.asset_type, "first_seen": a.first_seen.isoformat()}
+                for a in new_assets_rows
+            ],
+        },
+        "removed_assets": {
+            "total": removed_assets_total,
+            "items": [
+                {"id": str(a.id), "value": a.value, "asset_type": a.asset_type, "last_seen": a.last_seen.isoformat()}
+                for a in removed_assets_rows
+            ],
+        },
+        "new_findings": {
+            "total": new_findings_total,
+            "by_severity": dict(new_findings_by_severity),
+            "items": [
+                {
+                    "id": str(f.id), "title": f.title, "severity": f.severity, "category": f.category,
+                    "affected_url": f.affected_url, "cve_ids": f.cve_ids or [],
+                }
+                for f in new_findings_rows
+            ],
+        },
+        "resolved_findings": {
+            "total": resolved_findings_total,
+            "items": [
+                {"id": str(f.id), "title": f.title, "severity": f.severity,
+                 "resolved_at": f.resolved_at.isoformat() if f.resolved_at else None}
+                for f in resolved_findings_rows
+            ],
+        },
     }
 
 

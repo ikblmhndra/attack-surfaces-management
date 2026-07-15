@@ -224,6 +224,14 @@ DEFAULT_DNS_WORDS = [
 
 PERMUTATION_PREFIXES = ["dev", "staging", "test", "uat", "qa", "api", "admin"]
 
+# Speculative guess sources: dns_bruteforce (wordlist) and dns_permutation
+# (env-prefix variants of already-known labels) have a near-zero real-world hit
+# rate (confirmed 0% and ~3.5% respectively across production scan data) unlike
+# passive/observed sources (crt.sh, subfinder, wayback, tls_san_mining), where a
+# miss can still be a dangling-CNAME/takeover signal worth keeping. A host is
+# only pruned when EVERY source that found it is one of these two.
+GENERATED_ONLY_SOURCES = frozenset({"dns_bruteforce", "dns_permutation"})
+
 
 def normalize_host(value: str) -> str:
     return str(value or "").strip().lower().rstrip(".")
@@ -282,6 +290,20 @@ def generate_permutation_hosts(
                 if len(results) >= max_hosts:
                     return results
     return results
+
+
+def is_unconfirmed_generated_guess(sources: Iterable[str], liveness_status: str | None) -> bool:
+    """True when a discovered host should not be promoted to a persistent Asset row.
+
+    Applies only to hosts whose entire discovery evidence is speculative guesses
+    (dns_bruteforce/dns_permutation) that never resolved to anything real. A host
+    corroborated by any passive/observed source is always kept, regardless of
+    liveness, since a miss there can still be takeover-relevant evidence.
+    """
+    source_set = set(sources or [])
+    if not source_set:
+        return False
+    return source_set <= GENERATED_ONLY_SOURCES and liveness_status == "unresolved"
 
 
 def dns_fingerprint(record: dict) -> tuple[str, ...]:

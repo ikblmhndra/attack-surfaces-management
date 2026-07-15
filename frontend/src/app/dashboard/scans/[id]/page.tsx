@@ -1,14 +1,17 @@
 "use client";
 
+import { useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
 import {
-  AlertTriangle, ArrowLeft, CheckCircle, Clock, ExternalLink,
-  ListChecks, RefreshCw, Target, XCircle
+  AlertTriangle, ArrowLeft, CheckCircle, ChevronRight, Clock, ExternalLink,
+  GitCompare, ListChecks, RefreshCw, Target, XCircle
 } from "lucide-react";
 
 import { apiClient } from "@/lib/api";
 import { cn, formatRelative } from "@/lib/utils";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/Collapsible";
+import { SeverityBadge } from "@/components/ui/SeverityBadge";
 
 const STATUS_ICON: Record<string, any> = {
   completed: CheckCircle,
@@ -124,6 +127,58 @@ export default function ScanDetailPage() {
               </div>
             ))}
           </div>
+        </div>
+      )}
+
+      {scan.changes && (
+        <div className="glass-card p-5">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-semibold text-foreground">What Changed Since Last Scan</h2>
+            {scan.changes.has_previous_scan && scan.changes.previous_scan_completed_at && (
+              <span className="text-xs text-muted-foreground">
+                vs. scan completed {formatRelative(scan.changes.previous_scan_completed_at)}
+              </span>
+            )}
+          </div>
+          {!scan.changes.has_previous_scan ? (
+            <EmptyState icon={GitCompare} text="This is the first scan for this organization — nothing to compare yet." />
+          ) : (
+            <div className="space-y-2">
+              <ChangeSection label="New Assets" count={scan.changes.new_assets.total} tone="info">
+                {scan.changes.new_assets.items.map((a: any) => (
+                  <div key={a.id} className="flex items-center justify-between gap-3 py-1.5 border-b border-border/30 last:border-0">
+                    <span className="text-xs font-mono text-foreground truncate">{a.value}</span>
+                    <span className="text-xs text-muted-foreground shrink-0">{a.asset_type}</span>
+                  </div>
+                ))}
+              </ChangeSection>
+              <ChangeSection label="Removed Assets" count={scan.changes.removed_assets.total} tone="warn">
+                {scan.changes.removed_assets.items.map((a: any) => (
+                  <div key={a.id} className="flex items-center justify-between gap-3 py-1.5 border-b border-border/30 last:border-0">
+                    <span className="text-xs font-mono text-foreground truncate">{a.value}</span>
+                    <span className="text-xs text-muted-foreground shrink-0">{a.asset_type}</span>
+                  </div>
+                ))}
+              </ChangeSection>
+              <ChangeSection label="New Findings" count={scan.changes.new_findings.total} tone="danger">
+                {scan.changes.new_findings.items.map((f: any) => (
+                  <div key={f.id} className="flex items-center gap-3 py-1.5 border-b border-border/30 last:border-0">
+                    <SeverityBadge severity={f.severity} compact />
+                    <span className="text-xs text-foreground truncate flex-1">{f.title}</span>
+                    <span className="text-xs text-muted-foreground truncate max-w-[200px]">{f.affected_url}</span>
+                  </div>
+                ))}
+              </ChangeSection>
+              <ChangeSection label="Resolved Findings" count={scan.changes.resolved_findings.total} tone="success">
+                {scan.changes.resolved_findings.items.map((f: any) => (
+                  <div key={f.id} className="flex items-center justify-between gap-3 py-1.5 border-b border-border/30 last:border-0">
+                    <span className="text-xs text-foreground truncate">{f.title}</span>
+                    <span className="text-xs text-muted-foreground shrink-0">{f.resolved_at ? formatRelative(f.resolved_at) : ""}</span>
+                  </div>
+                ))}
+              </ChangeSection>
+            </div>
+          )}
         </div>
       )}
 
@@ -491,6 +546,41 @@ function MetricLine({ label, value }: { label: string; value: number }) {
       <span className="text-xs text-muted-foreground capitalize">{label.replace("_", " ")}</span>
       <span className="text-sm text-foreground tabular-nums">{value.toLocaleString()}</span>
     </div>
+  );
+}
+
+const CHANGE_TONE_CLASS: Record<string, string> = {
+  info: "bg-brand-500/10 text-brand-400 border-brand-500/20",
+  warn: "bg-orange-500/10 text-orange-400 border-orange-500/20",
+  danger: "bg-red-500/10 text-red-400 border-red-500/20",
+  success: "bg-emerald-500/10 text-emerald-400 border-emerald-500/20",
+};
+
+function ChangeSection({
+  label, count, tone, children,
+}: { label: string; count: number; tone: keyof typeof CHANGE_TONE_CLASS; children: React.ReactNode }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <Collapsible open={open} onOpenChange={setOpen}>
+      <CollapsibleTrigger asChild>
+        <button className="w-full flex items-center justify-between gap-3 rounded-lg border border-surface-700 bg-surface-800/50 px-3 py-2 hover:bg-surface-800/80">
+          <div className="flex items-center gap-2">
+            <ChevronRight className={cn("w-3.5 h-3.5 text-muted-foreground transition-transform", open && "rotate-90")} />
+            <span className="text-sm text-foreground">{label}</span>
+          </div>
+          <span className={cn("text-xs px-2 py-0.5 rounded-full border font-medium", CHANGE_TONE_CLASS[tone])}>
+            {count}
+          </span>
+        </button>
+      </CollapsibleTrigger>
+      <CollapsibleContent>
+        {count === 0 ? (
+          <p className="px-3 py-2 text-xs text-muted-foreground">None</p>
+        ) : (
+          <div className="px-3 py-1 max-h-64 overflow-y-auto">{children}</div>
+        )}
+      </CollapsibleContent>
+    </Collapsible>
   );
 }
 

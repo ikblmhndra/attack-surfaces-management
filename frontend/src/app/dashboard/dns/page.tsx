@@ -112,15 +112,26 @@ export default function DnsPage() {
                           </td>
                           <td>
                             <div className="flex flex-wrap gap-1">
-                              {Object.keys(dns).length > 0 ? (
-                                Object.entries(dns).map(([type, records]: [string, any]) => (
-                                  <span key={type} className="text-xs bg-surface-700 text-muted-foreground px-1.5 py-0.5 rounded font-mono">
-                                    {type}: {Array.isArray(records) ? records.length : 1}
+                              {(() => {
+                                // dns_records also carries discovery_sources/discovery_evidence
+                                // in the same JSONB blob (worker-side bookkeeping, not DNS data)
+                                // -- only these are real record types worth showing here.
+                                const RECORD_TYPES = ["a", "aaaa", "mx", "txt", "ns", "cname"];
+                                const present = RECORD_TYPES
+                                  .map((type) => [type, dns[type]] as [string, any])
+                                  .filter(([, records]) => Array.isArray(records) && records.length > 0);
+                                if (present.length === 0) {
+                                  return <span className="text-xs text-muted-foreground">No records</span>;
+                                }
+                                return present.map(([type, records]) => (
+                                  <span
+                                    key={type}
+                                    className="text-xs bg-brand-500/10 text-brand-400 border border-brand-500/20 px-1.5 py-0.5 rounded font-mono uppercase"
+                                  >
+                                    {type} {records.length}
                                   </span>
-                                ))
-                              ) : (
-                                <span className="text-xs text-muted-foreground">—</span>
-                              )}
+                                ));
+                              })()}
                             </div>
                           </td>
                           <td>

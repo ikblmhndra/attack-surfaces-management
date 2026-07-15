@@ -193,6 +193,11 @@ class CorrelationWorker(BaseWorker):
 
     # ── Relationship Building ─────────────────────────────────
 
+    # Shared-IP groups above this size stop being a meaningful signal (CDN/
+    # shared-hosting IPs can carry hundreds of unrelated tenants) and would
+    # otherwise blow up into an O(n^2) edge count.
+    MAX_SHARED_IP_GROUP = 20
+
     async def _build_relationships(
         self,
         db: AsyncSession,
@@ -201,13 +206,22 @@ class CorrelationWorker(BaseWorker):
         """
         Build asset relationship graph:
         - Subdomain → IP (resolves_to)
-        - IP → Port (exposes)
-        - Asset → Technology (runs)
-        - Technology → Finding (vulnerable_to)
+        - Subdomain siblings resolving to the same IP (shares_infrastructure)
+
+        Technology and Finding are deliberately NOT modeled here.
+        AssetRelationship is strictly Asset<->Asset, and neither Technology
+        nor Finding rows are asset-backed nodes -- an earlier version of this
+        method tried to force a "Technology -> Finding" edge in here anyway,
+        which was structurally impossible and actually produced an asset-to-
+        itself self-loop every time (source_asset_id == target_asset_id via
+        finding.asset_id), 137/137 confirmed on real data. Technology/Finding
+        are presentation-only graph nodes now, built directly by
+        organizations.py::get_attack_surface_graph instead.
         """
-        from workers.db_models import Asset, Subdomain, IPAddress, Technology, Finding
+        from workers.db_models import Asset, Subdomain
 
         relationships = []
+        subdomains_by_ip: Dict[str, List[str]] = defaultdict(list)
 
         # Subdomain → IP relationships (from DNS resolution)
         subdomains_q = (
@@ -221,7 +235,6 @@ class CorrelationWorker(BaseWorker):
             if not subdomain.ip_addresses:
                 continue
             for ip in subdomain.ip_addresses:
-                # Find IP asset
                 ip_asset = await self._find_asset_by_value(db, org_id, ip, "ip")
                 if ip_asset:
                     relationships.append({
@@ -231,52 +244,28 @@ class CorrelationWorker(BaseWorker):
                         "confidence": 1.0,
                         "metadata": {"dns_record": "A"},
                     })
+                subdomains_by_ip[ip].append(str(asset.id))
 
-        # Asset → Technology relationships
-        tech_q = (
-            select(Asset, Technology)
-            .join(Technology, Technology.asset_id == Asset.id)
-            .where(Asset.org_id == org_id, Asset.deleted_at.is_(None))
-        )
-        tech_rows = (await db.execute(tech_q)).all()
-
-        # Group by technology name → identify tech clusters
-        tech_by_name: Dict[str, List] = defaultdict(list)
-        for asset, tech in tech_rows:
-            tech_by_name[tech.name].append((asset, tech))
-
-        # Technology → Finding cross-references
-        finding_q = (
-            select(Finding)
-            .where(Finding.org_id == org_id, Finding.status == "open")
-        )
-        findings = (await db.execute(finding_q)).scalars().all()
-
-        # Map finding CVEs to technologies (simple heuristic).
-        # Index tech_rows by asset_id once (O(T)) instead of scanning it per
-        # finding (O(F×T)) — this was a real cost at scale since this whole
-        # method used to re-run on every intermediate correlation trigger.
-        tech_by_asset_id: Dict[str, Any] = {}
-        for asset, tech in tech_rows:
-            tech_by_asset_id.setdefault(str(asset.id), (asset, tech))
-
-        for finding in findings:
-            match = tech_by_asset_id.get(str(finding.asset_id))
-            if not match:
+        # Sibling subdomains sharing an IP -- real shared-hosting/blast-radius
+        # signal, computed entirely from data already collected above.
+        seen_pairs: set = set()
+        for ip, asset_ids in subdomains_by_ip.items():
+            unique_ids = sorted(set(asset_ids))
+            if len(unique_ids) < 2 or len(unique_ids) > self.MAX_SHARED_IP_GROUP:
                 continue
-            asset, tech = match
-            # Implies: tech may be the reason for this finding
-            # In production, use CPE matching
-            relationships.append({
-                "source_asset_id": str(asset.id),
-                "target_asset_id": str(finding.asset_id),
-                "relationship_type": "has_finding",
-                "confidence": 0.8,
-                "metadata": {
-                    "finding_id": str(finding.id),
-                    "severity": finding.severity,
-                },
-            })
+            for i in range(len(unique_ids)):
+                for j in range(i + 1, len(unique_ids)):
+                    pair = (unique_ids[i], unique_ids[j])
+                    if pair in seen_pairs:
+                        continue
+                    seen_pairs.add(pair)
+                    relationships.append({
+                        "source_asset_id": pair[0],
+                        "target_asset_id": pair[1],
+                        "relationship_type": "shares_infrastructure",
+                        "confidence": 1.0,
+                        "metadata": {"shared_ip": ip},
+                    })
 
         return relationships
 
@@ -402,6 +391,27 @@ class CorrelationWorker(BaseWorker):
                 "finding_id": str(finding.id),
                 "template_id": finding.template_id,
             })
+
+        # Persist real counts onto the Scan row. These columns are read by
+        # scans.py/organizations.py and shown on two frontend pages, but
+        # nothing ever wrote them -- every scan silently showed "0 new"
+        # regardless of reality. Count is all-severity (unlike the crit/high
+        # filter above, which is a deliberate notify.send alert-noise choice,
+        # not the right definition for a summary counter).
+        all_new_findings_count = (await db.execute(
+            select(func.count()).select_from(ScanFinding).where(
+                ScanFinding.scan_id == scan_id,
+                ScanFinding.change_type == "new",
+            )
+        )).scalar_one()
+        await db.execute(
+            update(Scan).where(Scan.id == scan_id).values(
+                new_assets=len(new_assets),
+                new_findings=all_new_findings_count,
+                removed_assets=len(removed),
+            )
+        )
+        await db.commit()
 
         # TLS expiry check
         await self._check_tls_expiry(db, org_id, changes)

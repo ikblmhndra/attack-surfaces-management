@@ -463,6 +463,48 @@ export interface GraphEdge {
   type?:   string;
 }
 
+// ── Network Clusters (Attack Surface, grouped-by-shared-IP view) ──────────
+export interface ClusterHost {
+  id:          string;
+  value:       string;
+  http_status: number | null;
+}
+
+export interface ClusterTopFinding {
+  id:             string;
+  title:          string;
+  severity:       Severity;
+  affected_host:  string;
+}
+
+export interface NetworkCluster {
+  ip:               string;
+  hosts:            ClusterHost[];
+  host_count:       number;
+  technologies:     string[];
+  severity_counts:  Partial<Record<Severity, number>>;
+  top_findings:     ClusterTopFinding[];
+}
+
+export interface StandaloneHost {
+  id:               string;
+  value:            string;
+  http_status:      number | null;
+  ip:               string | null;
+  severity_counts:  Partial<Record<Severity, number>>;
+}
+
+export interface NetworkClustersResponse {
+  clusters:   NetworkCluster[];
+  standalone: StandaloneHost[];
+  summary: {
+    clusters_found:   number;
+    hosts_clustered:  number;
+    standalone_hosts: number;
+    total_ips:        number;
+  };
+}
+
 // ── Search ─────────────────────────────────────────────────────
 export interface SearchResult {
   assets:          Asset[];

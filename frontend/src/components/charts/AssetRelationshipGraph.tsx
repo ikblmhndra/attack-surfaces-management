@@ -36,9 +36,20 @@ const NODE_STYLES: Record<string, {
   domain:  { bg: "#8b5cf6", border: "#a78bfa", size: 44, shape: "roundrectangle", icon: "🌐" },
   ip:      { bg: "#059669", border: "#34d399", size: 38, shape: "ellipse",   icon: "🖥️" },
   port:    { bg: "#d97706", border: "#fbbf24", size: 28, shape: "diamond",   icon: "⚡" },
-  tech:    { bg: "#0284c7", border: "#38bdf8", size: 30, shape: "octagon",   icon: "⚙️" },
+  // Distinct teal -- was #0284c7/#38bdf8, close enough to org's sky blue
+  // (same border color even) to be confusable at a glance.
+  tech:    { bg: "#0d9488", border: "#2dd4bf", size: 30, shape: "octagon",   icon: "⚙️" },
   finding: { bg: "#dc2626", border: "#f87171", size: 32, shape: "star",      icon: "⚠️" },
 };
+
+// Node types that always show their label regardless of degree -- org is
+// always the single root, tech is low-cardinality after backend dedup (one
+// node per distinct technology name, not per asset) so its name is always
+// the interesting signal.
+const ALWAYS_LABELED_TYPES = new Set(["org", "tech"]);
+// domain/ip/port nodes only get a visible label once they're a real hub --
+// otherwise the default view (600+ nodes) is either all-blank or all-text.
+const LABEL_DEGREE_THRESHOLD = 3;
 
 const SEVERITY_COLORS: Record<string, string> = {
   critical: "#ef4444",
@@ -67,6 +78,16 @@ export function AssetRelationshipGraph({
     // Dynamically import cytoscape
     const cytoscape = (await import("cytoscape")).default;
 
+    // Degree per node -- how many edges touch it -- drives both size (hubs
+    // read as visually bigger/more important) and label visibility (only
+    // label a domain/ip/port once it's actually a hub; otherwise the default
+    // view is either all-blank or an unreadable wall of text at 600+ nodes).
+    const degree = new Map<string, number>();
+    for (const e of edges) {
+      degree.set(e.source, (degree.get(e.source) || 0) + 1);
+      degree.set(e.target, (degree.get(e.target) || 0) + 1);
+    }
+
     // Build elements
     const elements = [
       ...nodes.map((n) => {
@@ -74,14 +95,18 @@ export function AssetRelationshipGraph({
         const borderColor = n.severity
           ? SEVERITY_COLORS[n.severity] || style.border
           : style.border;
+        const nodeDegree = degree.get(n.id) || 0;
+        const showLabel = ALWAYS_LABELED_TYPES.has(n.type) || nodeDegree >= LABEL_DEGREE_THRESHOLD;
+        const truncated = n.label.length > 24 ? n.label.slice(0, 21) + "…" : n.label;
 
         return {
           data: {
             id: n.id,
-            label: n.label.length > 24 ? n.label.slice(0, 21) + "…" : n.label,
+            label: showLabel ? truncated : "",
             fullLabel: n.label,
             type: n.type,
             severity: n.severity,
+            degree: nodeDegree,
             ...n.data,
           },
           classes: [n.type, n.severity].filter(Boolean).join(" "),
@@ -120,8 +145,18 @@ export function AssetRelationshipGraph({
             "border-color": (el: any) => NODE_STYLES[el.data("type")]?.border || "#475569",
             "border-width": 2,
             "border-opacity": 0.8,
-            width: (el: any) => NODE_STYLES[el.data("type")]?.size || 36,
-            height: (el: any) => NODE_STYLES[el.data("type")]?.size || 36,
+            // Base size per type, scaled up by degree (how connected/central
+            // the node is) so hubs -- a shared IP, a widely-used technology
+            // -- visually stand out instead of every node looking equally
+            // important. Clamped so one mega-hub doesn't swallow the canvas.
+            width: (el: any) => {
+              const base = NODE_STYLES[el.data("type")]?.size || 36;
+              return Math.min(base + Math.min(el.data("degree") || 0, 12) * 2.5, 90);
+            },
+            height: (el: any) => {
+              const base = NODE_STYLES[el.data("type")]?.size || 36;
+              return Math.min(base + Math.min(el.data("degree") || 0, 12) * 2.5, 90);
+            },
             shape: (el: any) => NODE_STYLES[el.data("type")]?.shape || "ellipse",
             label: "data(label)",
             "font-size": 10,
@@ -132,7 +167,7 @@ export function AssetRelationshipGraph({
             "text-margin-y": 4,
             "text-outline-width": 2,
             "text-outline-color": "#0a0f1a",
-            "min-zoomed-font-size": 8,
+            "min-zoomed-font-size": 4,
             "overlay-opacity": 0,
             "transition-property": "background-color, border-color, width, height",
             "transition-duration": "0.15s",
@@ -174,7 +209,7 @@ export function AssetRelationshipGraph({
             "text-outline-width": 2,
             "text-outline-color": "#0a0f1a",
             "text-margin-y": -6,
-            "min-zoomed-font-size": 8,
+            "min-zoomed-font-size": 4,
             opacity: 0.7,
           } as any,
         },
