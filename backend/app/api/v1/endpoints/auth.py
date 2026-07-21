@@ -4,13 +4,14 @@ JWT-based auth with refresh tokens and MFA support.
 """
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import List, Optional
 
 import pyotp
 import structlog
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordRequestForm
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field, field_validator
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.dependencies.auth import get_current_user, get_db
@@ -30,6 +31,12 @@ from app.services.user_service import UserService
 log = structlog.get_logger()
 router = APIRouter()
 
+# A self-serve registration always creates a brand-new workspace (never
+# joins an existing one -- see register() below), so product selection is a
+# natural one-time choice made right here, not a per-user setting layered on
+# top later. See Workspace.enabled_products.
+PRODUCTS = {"asm", "bounty"}
+
 
 # ── Schemas ───────────────────────────────────────────────────
 
@@ -38,6 +45,7 @@ class RegisterRequest(BaseModel):
     password: str
     full_name: str
     workspace_name: str
+    enabled_products: List[str] = Field(default_factory=lambda: ["asm"])
     invite_token: Optional[str] = None
 
     class Config:
@@ -47,6 +55,16 @@ class RegisterRequest(BaseModel):
         if len(self.password) < 12:
             raise ValueError("Password must be at least 12 characters")
         return self
+
+    @field_validator("enabled_products")
+    @classmethod
+    def validate_enabled_products(cls, value: List[str]) -> List[str]:
+        if not value:
+            raise ValueError("Choose at least one product: asm, bounty")
+        invalid = set(value) - PRODUCTS
+        if invalid:
+            raise ValueError(f"Unknown product(s): {', '.join(sorted(invalid))}. Must be one of: {', '.join(sorted(PRODUCTS))}")
+        return sorted(set(value))
 
 
 class LoginRequest(BaseModel):
@@ -63,6 +81,7 @@ class TokenResponse(BaseModel):
     user_id: str
     workspace_id: str
     role: str
+    enabled_products: List[str] = Field(default_factory=lambda: ["asm"])
 
 
 class RefreshRequest(BaseModel):
@@ -118,6 +137,7 @@ async def register(
     workspace = Workspace(
         name=request.workspace_name,
         slug=_slugify(request.workspace_name),
+        enabled_products=request.enabled_products,
     )
     db.add(workspace)
     await db.flush()
@@ -143,6 +163,7 @@ async def register(
         subject=str(user.id),
         workspace_id=str(workspace.id),
         role=user.role,
+        extra_claims={"products": workspace.enabled_products},
     )
     refresh_token = create_refresh_token(subject=str(user.id))
 
@@ -170,6 +191,7 @@ async def register(
         user_id=str(user.id),
         workspace_id=str(workspace.id),
         role=user.role,
+        enabled_products=workspace.enabled_products,
     )
 
 
@@ -212,11 +234,16 @@ async def login(
                 detail="Invalid MFA code",
             )
 
+    enabled_products = (await db.execute(
+        select(Workspace.enabled_products).where(Workspace.id == user.workspace_id)
+    )).scalar_one_or_none() or ["asm"]
+
     # Generate tokens
     access_token = create_access_token(
         subject=str(user.id),
         workspace_id=str(user.workspace_id),
         role=user.role,
+        extra_claims={"products": enabled_products},
     )
     refresh_token = create_refresh_token(subject=str(user.id))
 
@@ -248,6 +275,7 @@ async def login(
         user_id=str(user.id),
         workspace_id=str(user.workspace_id),
         role=user.role,
+        enabled_products=enabled_products,
     )
 
 
@@ -282,11 +310,16 @@ async def refresh_token(
             detail="Refresh token has expired",
         )
 
+    enabled_products = (await db.execute(
+        select(Workspace.enabled_products).where(Workspace.id == user.workspace_id)
+    )).scalar_one_or_none() or ["asm"]
+
     # Issue new token pair (rotation)
     access_token = create_access_token(
         subject=str(user.id),
         workspace_id=str(user.workspace_id),
         role=user.role,
+        extra_claims={"products": enabled_products},
     )
     new_refresh_token = create_refresh_token(subject=str(user.id))
 
@@ -303,6 +336,7 @@ async def refresh_token(
         user_id=str(user.id),
         workspace_id=str(user.workspace_id),
         role=user.role,
+        enabled_products=enabled_products,
     )
 
 
@@ -383,14 +417,21 @@ async def mfa_disable(
 
 
 @router.get("/me")
-async def get_me(current_user: User = Depends(get_current_user)):
+async def get_me(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     """Get current authenticated user profile."""
+    enabled_products = (await db.execute(
+        select(Workspace.enabled_products).where(Workspace.id == current_user.workspace_id)
+    )).scalar_one_or_none() or ["asm"]
     return {
         "id": str(current_user.id),
         "email": current_user.email,
         "full_name": current_user.full_name,
         "role": current_user.role,
         "workspace_id": str(current_user.workspace_id),
+        "enabled_products": enabled_products,
         "mfa_enabled": current_user.mfa_enabled,
         "last_login": current_user.last_login.isoformat() if current_user.last_login else None,
         "created_at": current_user.created_at.isoformat(),

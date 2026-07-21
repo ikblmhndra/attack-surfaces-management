@@ -151,6 +151,7 @@ export const authAPI = {
     password: string;
     full_name: string;
     workspace_name: string;
+    enabled_products: string[];
   }) => api.post("/auth/register", data),
 
   logout: () => api.post("/auth/logout"),
@@ -262,6 +263,47 @@ export const adminAPI = {
     api.put(`/admin/users/${id}`, data),
   getAuditLogs: (params?: Record<string, any>) =>
     api.get("/admin/audit-logs", { params }),
+};
+
+// Bug Bounty active-testing pipeline (workspace-scoped, independent of the
+// ASM org/asset model — see backend endpoints/bounty.py).
+export const bountyAPI = {
+  listPrograms: (params?: Record<string, any>) => api.get("/bounty/programs", { params }),
+  getProgram: (id: string) => api.get(`/bounty/programs/${id}`),
+  createProgram: (data: Record<string, any>) => api.post("/bounty/programs", data),
+  updateProgram: (id: string, data: Record<string, any>) => api.put(`/bounty/programs/${id}`, data),
+  deleteProgram: (id: string) => api.delete(`/bounty/programs/${id}`),
+  runStage: (id: string, stage: string) => api.post(`/bounty/programs/${id}/run/${stage}`),
+  runPipeline: (id: string) => api.post(`/bounty/programs/${id}/run/pipeline`),
+
+  listTargets: (id: string) => api.get(`/bounty/programs/${id}/targets`),
+  createTarget: (id: string, data: { value: string; target_type?: string }) =>
+    api.post(`/bounty/programs/${id}/targets`, data),
+  deleteTarget: (id: string, targetId: string) =>
+    api.delete(`/bounty/programs/${id}/targets/${targetId}`),
+
+  listAssets: (id: string, params?: Record<string, any>) =>
+    api.get(`/bounty/programs/${id}/assets`, { params }),
+  promoteAsset: (id: string, assetId: string) =>
+    api.post(`/bounty/programs/${id}/assets/${assetId}/promote`),
+  promoteAssetsBulk: (id: string, assetIds: string[]) =>
+    api.post(`/bounty/programs/${id}/assets/promote-bulk`, { asset_ids: assetIds }),
+
+  listFindings: (id: string, params?: Record<string, any>) =>
+    api.get(`/bounty/programs/${id}/findings`, { params }),
+
+  getSummary: (id: string) => api.get(`/bounty/programs/${id}/summary`),
+  getReportHtml: (id: string) =>
+    api.get(`/bounty/programs/${id}/report.html`, { responseType: "text" }),
+
+  listReports: (id: string, params?: Record<string, any>) =>
+    api.get(`/bounty/programs/${id}/reports`, { params }),
+  getReport: (id: string, reportId: string) =>
+    api.get(`/bounty/programs/${id}/reports/${reportId}`),
+  updateReport: (id: string, reportId: string, data: Record<string, any>) =>
+    api.put(`/bounty/programs/${id}/reports/${reportId}`, data),
+  deleteReport: (id: string, reportId: string) =>
+    api.delete(`/bounty/programs/${id}/reports/${reportId}`),
 };
 
 // ── WebSocket client ──────────────────────────────────────────

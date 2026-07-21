@@ -23,6 +23,11 @@ ROUTING_CONFIG = {
     "notify.send":         {"exchange": "asm.notify",       "type": aio_pika.ExchangeType.TOPIC},
     "enrich.assets":       {"exchange": "asm.enrich",       "type": aio_pika.ExchangeType.DIRECT},
     "asset.validate":      {"exchange": "asm.asset",        "type": aio_pika.ExchangeType.DIRECT},
+    "bounty.recon":        {"exchange": "asm.bounty",       "type": aio_pika.ExchangeType.TOPIC},
+    "bounty.probe":        {"exchange": "asm.bounty",       "type": aio_pika.ExchangeType.TOPIC},
+    "bounty.vulnscan":     {"exchange": "asm.bounty",       "type": aio_pika.ExchangeType.TOPIC},
+    "bounty.exploit":      {"exchange": "asm.bounty",       "type": aio_pika.ExchangeType.TOPIC},
+    "bounty.report":       {"exchange": "asm.bounty",       "type": aio_pika.ExchangeType.TOPIC},
 }
 
 QUEUE_CONFIG = {

@@ -4,6 +4,1312 @@ All notable changes to this project are documented below, sorted newest-first.
 
 ---
 
+## 2026-07-21 — Bug Bounty program detail page: readability redesign (+ a real grouping bug it exposed)
+
+The user flagged the Bug Bounty program detail page as "kurang enak dibaca" (uncomfortable to read). Root
+cause, confirmed by viewing the real KPI program's own data (66 targets, 450 recon assets) rather than
+guessing: Targets/Recon/Findings render as one flat, endlessly-scrolling list where a domain row and a URL
+row underneath it look identically weighted, with no search, filter, or grouping to navigate hundreds of
+rows. Iterated on interactive HTML mockups (published as an artifact) against two design directions before
+touching real code, per the user's own request to see it first.
+
+### Added
+- **Targets & Recon tabs**: URLs now nest under their parent domain (matched by exact hostname) as
+  collapsible groups, instead of one undifferentiated flat list. A **Grouped / Table** toggle switches
+  between that hierarchy and a dense sortable table for fast scanning — kept both instead of forcing a
+  single tradeoff, since the two mockup directions shown to the user each won on a different axis
+  (hierarchy clarity vs. scan speed). Added search (domain/URL substring) and filter chips (Targets:
+  all/alive/no-response; Recon: all/promoted/not-promoted) to both. `groupByDomain()` is a small generic
+  helper shared by both tabs, keyed off `target_type === "domain"` / `asset_type === "subdomain"`.
+- **Findings tab**: search + status chips (confirmed/candidate) + severity chips (critical through info),
+  previously not filterable at all despite being the tab most in need of triage.
+- **Visual polish pass**: replaced ad-hoc unicode glyphs used in the mockup stage with real `lucide-react`
+  icons throughout (sidebar-equivalent tab icons, priority-bucket icons keyed by bucket-name prefix --
+  idor/bac/auth/upload/payment/webhook/debug/graphql -- pipeline stage icons). Smooth expand/collapse via
+  CSS grid-template-rows transition (no layout jump), hover-lift on cards (`LIFT` shared class), a pulsing
+  "active" status dot, `tabular-nums` on every count so columns of numbers stay aligned, and a
+  `SearchX`/`Inbox`-style empty state component instead of a bare italic sentence.
+- Icon system and reusable primitives (`SearchInput`, `FilterChip`, `ViewToggle`, `EmptyState`) are new,
+  colocated in the same file since they're specific to this page and not yet needed elsewhere.
+
+### Fixed
+- **Recon tab's grouping had nothing to group under, on this exact program** -- found live while validating
+  against KPI's real data, not caught by the design mockups (synthetic data doesn't reproduce pagination
+  edge cases). `GET .../assets` sorts by `discovered_at DESC` and caps `page_size` at 200 server-side; KPI
+  has 450 recon assets (122 `subdomain`, 311 `url`, plus js_endpoint/js_finding) and, because URLs are
+  discovered *after* subdomains in the recon pipeline, the 200 most-recently-discovered rows were **100%
+  url-type -- zero subdomains** made it into the fetched page at all, so the new grouped view silently fell
+  back to one giant flat list on exactly the program this feature was built for. Fixed by fetching
+  `asset_type=subdomain` in its own parallel query (subdomain counts are an order of magnitude smaller than
+  URL counts in practice, comfortably under the 200 cap) and merging with the general fetch, deduped by id.
+  Added a visible amber note ("Showing the N most recent of TOTAL") when the merged set is still truncated,
+  rather than silently dropping older items with no indication -- the truncation itself is a pre-existing,
+  accepted limit (the old flat list had the same 200-item cap with no complaint), only the *silent* part
+  was new and worth surfacing honestly now that grouping depends on it.
+
+### Verified
+- Two rounds of interactive HTML mockups shown to the user before writing real code (published as a single
+  evolving artifact, same URL redeployed each round) -- first a 2-option comparison (grouped-hierarchy vs.
+  dense-table), then a full-page version combining both into one Grouped/Table toggle per the user's
+  "lebih comprehensive" request, then a visual-polish pass (real icons, animations) per "masih kurang
+  sentuhan". Implementation only started after explicit approval of the polished mockup.
+- Real implementation validated against the actual `KPI` program (not synthetic data) via a JWT minted
+  directly for the real user for headless-browser screenshotting: all 6 tabs render correctly, search
+  ("jdih" correctly isolates that one domain's 7 URLs), Grouped/Table toggle both work, filter chip counts
+  match real data (Targets: 66 all/66 alive/0 down; Recon: 322 all/199 not-promoted/123 promoted after the
+  fix). No console errors attributable to this change (pre-existing/unrelated: a Google Fonts CSP warning
+  and a WebSocket 403 from the synthetic auth token used for testing, neither touched by this work).
+  `tsc --noEmit` clean, `eslint` clean (0 errors), backend suite unaffected (311 passed, 1 pre-existing
+  skip -- this was a frontend-only change).
+
+---
+
+## 2026-07-20 — Split ASM and Bug Bounty into separate, workspace-entitled products
+
+The user wanted ASM and Bug Bounty separated at the user/workspace level rather than mixed into one
+sidebar -- registration now asks which product(s) a new workspace wants (ASM, Bug Bounty, or both), and
+each renders as its own dashboard shell rather than a shared nav with a "Bug Bounty" item bolted on.
+
+### Added
+- **`Workspace.enabled_products`** (`backend/app/db/models/models.py`, migration `4ec377801f60`) --
+  `ARRAY(String)`, e.g. `["asm"]` / `["bounty"]` / `["asm","bounty"]`. A self-serve registration always
+  creates a brand-new workspace (never joins an existing one -- confirmed by reading `register()` before
+  building this), so product selection is a natural one-time choice made right there, not a per-user
+  setting layered on top later. Migration backfills every pre-existing workspace to `["asm"]` (server
+  default, since they all predate Bug Bounty entirely) -- hand-written rather than using the autogenerated
+  migration, which had picked up a large amount of unrelated pre-existing schema drift across ~30 other
+  tables that had nothing to do with this change.
+- **`RequireProduct`** dependency (`backend/app/api/v1/dependencies/auth.py`) -- FastAPI dependency factory
+  wired at the router level (`api_router.include_router(..., dependencies=[Depends(require_asm_product)])`
+  in `router.py`), not per-endpoint, so a whole product's endpoint surface is gated in one place. Reads the
+  workspace's product list from a new `products` JWT claim (set at register/login/refresh via
+  `create_access_token`'s existing `extra_claims` param -- no signature change needed) for the common
+  bearer-token path; falls back to a fresh DB lookup for API-key auth, since a long-lived key shouldn't
+  trust a claim that could go stale if the workspace's entitlement changes later. `organizations`, `assets`,
+  `scans`, `findings`, `scores`, `intel`, `reports`, `screenshots`, `templates` gated on `"asm"`; `bounty`
+  gated on `"bounty"`. Cross-cutting routers (`auth`, `workspaces`, `notifications`, `admin`, `keys`,
+  `websocket`, `search`) stay ungated -- they serve every workspace regardless of product (e.g. a
+  bounty-only workspace still configures notification channels through the same `NotificationRule` rows an
+  asm workspace would).
+- **`RegisterRequest.enabled_products`** -- validated non-empty subset of `{asm, bounty}`
+  (`@field_validator`), defaults to `["asm"]`. `TokenResponse` and `GET /auth/me` now also return
+  `enabled_products` so the frontend can route without an extra round trip.
+- **Register page product picker** (`frontend/src/app/auth/register/page.tsx`) -- two selectable cards
+  (ASM / Bug Bounty), at-least-one validation, ASM pre-selected by default.
+- **Two fully separate dashboard shells** -- `Sidebar.tsx` now takes a `variant: "asm" | "bounty"` prop
+  selecting an entirely different nav tree and branding (icon/title/accent), instead of one shared list with
+  a "Bug Bounty" item mixed in (removed). `dashboard/layout.tsx` picks the variant purely from the route
+  (`pathname.startsWith("/dashboard/bounty")`) and redirects to whichever product the workspace *is*
+  entitled to if the current route's product isn't enabled -- a UX-side mirror of `RequireProduct`, not a
+  replacement for it (the API still enforces this regardless of what the frontend shows). A "Switch to
+  ASM"/"Switch to Bug Bounty" control appears only when a workspace is entitled to both.
+- **`DashboardHeader.tsx`** also takes the `variant` prop -- the org selector and "Quick Scan" button are
+  ASM-only concepts (`/organizations` is now product-gated) and are hidden entirely on the Bug Bounty shell
+  rather than firing a request that can only 403; the `organizations` query itself is skipped
+  (`enabled: !isBounty`) rather than just hiding its result.
+- `workspace.ts` store: `enabledProducts` (persisted) + `hasProduct()` helper, populated from the `/auth/me`
+  response `login()`/`refreshUser()` already receive -- no new API call needed.
+
+### Verified
+- Backend: registered 3 real workspaces via the actual `/auth/register` endpoint (asm-only, bounty-only,
+  both) and hit `/organizations` + `/bounty/programs` with each token -- asm-only got 200/403, bounty-only
+  got 403/200, both got 200/200. Confirmed the JWT's embedded `products` claim matches what was requested,
+  and that invalid input (`enabled_products: []` or an unknown value) 422s with a clear message.
+  `test_security.py::test_extra_claims_included` (pre-existing) already covered the `extra_claims` mechanism
+  this reuses. Full backend suite: 311 passed, 1 pre-existing/unrelated skip.
+- **Critical real-data check before any of this went live**: the migration's backfill would have defaulted
+  the user's own real workspace (`b65ec528-...`, 2 live bounty programs -- KPI, OWASP Juice Shop) to
+  `["asm"]` only, locking them out of their own bounty data the moment `RequireProduct` started enforcing.
+  Caught and fixed by explicitly setting that workspace to `["asm","bounty"]` before wiring the router gate
+  live; confirmed via `bounty_programs` count join that this is in fact the workspace with real program data,
+  not a guess.
+- Frontend: rebuilt and redeployed the production frontend container, then exercised all 3 registration
+  combinations end-to-end through the real UI (Playwright, isolated browser contexts per case so sessions
+  couldn't bleed into each other) -- correct landing page per combination, product switcher present only for
+  "both", direct navigation to the disallowed product's route correctly redirects back, Bug Bounty shell
+  renders its own rose-branded sidebar/header with zero ASM chrome (screenshotted and visually confirmed).
+  `tsc --noEmit` clean throughout. All 6 test workspaces created during validation deleted by exact ID
+  afterward; confirmed the real `john` workspace and pre-existing `Test Workspace` were unaffected at every
+  step.
+
+---
+
+## 2026-07-20 — Bug Bounty pipeline: hash-routed SPA XSS coverage (search route + stored XSS)
+
+The user asked why XSS still wasn't scoring hits on the real `owasp-juice.com` engagement despite manual
+testing routinely finding several, and asked to check the target's own challenge scoreboard for what was
+still unsolved. Investigation (root-caused with a real headless-browser test against the live target before
+writing any code, matching this session's established discipline) found two compounding, general pipeline
+gaps, not a Juice-Shop-specific quirk.
+
+### Root cause
+- **The vulnerable route was never discovered.** Juice Shop's reflected-XSS search box is a hash-routed SPA
+  path (`#/search?q=...`) that renders its query param straight into the DOM client-side -- it never touches
+  the network as an HTTP request (a hash fragment is never sent to the server), so `browser_crawl.py`'s
+  network-request listener could never see it, and every other recon tool (katana/waybackurls/gau) only
+  found the *backing* REST call (`/rest/products/search?q=`), a JSON endpoint with no relation to the actual
+  client-side rendering bug. Confirmed live: navigating a real headless browser straight to
+  `#/search?q=<iframe src="javascript:alert(\`xss\`)">` executes the payload for real.
+- **Even if discovered, it wouldn't have been tested.** `exploit_dom.py::run_dom_xss` (and
+  `exploit_tools.py::url_has_params`/`recon_ext.py::classify_url`, used to build the exploit stage's
+  param-URL candidate pool) all read query params via `urlparse(url).query` alone -- which is empty for a
+  hash-routed URL like this, since the "query string" lives inside `.fragment` instead. A URL shaped this
+  way would have been silently invisible to every param-injection module, not just XSS.
+
+### Added
+- **`browser_crawl.py`**: `page.url()` is now captured after *every* navigation (initial load, each internal
+  link click, and a new search-probe step), not just off the network-request listener -- a hash-routed SPA's
+  own client-side navigation (clicking a `routerlink`, submitting a search) changes `page.url()` without ever
+  firing an HTTP request the old listener-only approach could see. Added a narrow, deliberate exception to
+  this module's "never fills a form" rule: typing into a search-style input and reading back the resulting
+  URL, gated to a tight selector (`type=search`/name/placeholder/aria-label containing "search") -- search is
+  idempotent by definition, unlike every other form on a real app. Also handles a collapsed search-icon-only
+  toggle (confirmed live: Juice Shop's real `<input>` carries zero discriminating attributes at all -- generic
+  `id="mat-input-1"`, no name/aria-label/placeholder -- until a `<mat-icon>search</mat-icon>` toggle is
+  clicked first): falls back to clicking anything labelled "search" by icon text/aria-label/title, then to
+  whatever plain input becomes newly visible, since the revealed field routinely has no attributes to match
+  on at all.
+- **`exploit_dom.py`**: `_params`/`_inject` now fall back to parsing/rewriting a hash-fragment-embedded query
+  string (`#/path?q=x`) when the URL's real `.query` is empty, via a shared `_query_location()` helper --
+  same fix class as the discovery-side one above, needed because a real browser renders both forms
+  identically even though `urlparse` only ever sees one of them.
+- **`exploit_worker.py`**: DOM-XSS's own candidate pool (`dom_xss_urls`) now tops up the existing
+  xss-bucketed query-param URLs with any owned URL carrying a hash-fragment-embedded query string --
+  deliberately *not* changed upstream in `url_has_params`/`classify_url` themselves, since those also gate
+  the HTTP-only modules (dalfox/sqlmap/ssrf/...), which correctly have no use for a fragment the server would
+  never see regardless.
+- **`exploit_stored.py`** (new): persisted/stored XSS confirmation -- every existing XSS check only proves
+  *reflected* behaviour (same request/response cycle). This fills and submits a real, visible form field
+  found on the page (deliberately narrow keyword match: comment/feedback/review/bio/about/description/...,
+  explicitly excluding search/password/email/login fields) with a uniquely-tokened payload (same inert
+  `img`/`svg onerror`/`onload` marker-setting sink as `exploit_dom.py`), then checks for that exact token
+  executing -- first on the same page (an SPA re-rendering its own submission immediately), then again after
+  a fresh reload (the classic stored-XSS shape). Unlike every other check in this pipeline, this one creates
+  real, visible content on the target rather than just probing and discarding a response -- gated behind an
+  explicit `rules_of_engagement.stored_xss_test = true` opt-in, the same "real capability increase, not a bug
+  fix" precedent set by the two-identity IDOR feature, independent of the `exploit_modules` list.
+
+### Verified
+- `browser_crawl` against the real `owasp-juice.com`: correctly discovers and persists
+  `http://owasp-juice.com/#/search?q=asmsearchprobe1` as a `BountyAsset` (source `browser_crawl`) via the
+  icon-toggle fallback -- confirmed the exact same generic attribute-based selector alone still matches
+  nothing on this target's real search input, exactly as diagnosed.
+- `exploit_dom.py::run_dom_xss` against that exact discovered URL: `dom-xss`/`confirmed`/`high`, real token
+  execution (`window.__asmxss` set by an injected `<img onerror>`/`<svg onload>`).
+- `exploit_stored.py::check_stored_xss` against a synthetic test server: confirmed on the vulnerable page
+  (unescaped stored render), correctly empty on the safe/escaped one. Against the real target's one
+  discovered storable-content page (`/#/contact`), correctly returns empty -- that form requires a CAPTCHA,
+  an intentionally out-of-scope obstacle for any generic automated tool (same category as CSP bypass), not a
+  bug in the check: confirmed the submit button stays disabled with only the comment field filled, so the
+  module's own submit-then-check flow correctly never gets a false positive out of it.
+- **Full pipeline, not just isolated function calls**: triggered a real `bounty.recon` run against the live
+  `owasp-juice.com` program -- the fixed `browser_crawl` discovered and persisted the hash-route URL with no
+  manual URL feeding. Triggered a real `bounty.exploit` run immediately after (with `stored_xss_test: true`
+  set) -- `dom-xss`/`confirmed` on that exact URL appeared in `bounty_exploit_attempts` from the ordinary
+  pipeline dispatch path, and a critical/high notification fired through the existing `notify.send` pipeline.
+  No `stored-xss` row, matching the CAPTCHA-gated negative result above.
+- Re-checked the target's own `/api/Challenges` scoreboard: its `reflectedXssChallenge` flag still didn't
+  flip even with the exact literal payload the challenge's own hint text suggests (`<iframe
+  src="javascript:alert(\`xss\`)">`) -- tested directly to rule out a payload-shape issue on our end. This
+  appears to be a target-specific detection quirk in how Juice Shop's own challenge-tracking hooks work
+  (likely keyed off the raw server-side `/rest/products/search` request log rather than pure DOM execution),
+  not a flaw in the finding itself -- the token-execution proof is structurally the same kind of evidence
+  `dom-xss` findings already rely on elsewhere in this pipeline. Backend bounty scope suite green (28 tests).
+
+---
+
+## 2026-07-20 — Bug Bounty pipeline: 5 new detection/response modules (+ a live NUL-byte crash it exposed)
+
+The user asked "what else should be improved" for the bounty pipeline and approved building all five
+proposed items directly: subdomain takeover, session-derived IDOR candidates, critical-finding
+notifications, file-upload/XXE detection, and deeper GraphQL testing.
+
+### Added
+- **Subdomain takeover (subzy)** -- `workers/bounty/tools.py::run_subzy` ports `coverage_worker.py`'s
+  existing ASM-pipeline subzy wrapper (same CLI flags, same "trust `status`, not the tool's own
+  unreliable `vulnerable` boolean" quirk) into the bounty pipeline. `vulnscan_worker.py::
+  _run_takeover_check` runs it against every in-scope target host and records a `high`/`confirmed`
+  finding per CNAME-to-unclaimed-resource match.
+- **Session-derived IDOR candidates** -- `idor_confirm.py::derive_id_candidates`/
+  `derive_session_id_urls` mine the logged-in test identity's own login-response fields (e.g. Juice
+  Shop's `bid`) for id/uid/bid/pid/gid/oid/aid/cid-named scalar values, then construct `{path}/{id}`
+  variants for bare in-scope resource paths that don't already carry a path- or query-id. Wired into
+  `exploit_worker.py` right after the ownership-scope check, capped at `MAX_SESSION_DERIVED_URLS = 20`.
+  `exploit_worker.py` now calls `login_and_get_session` (token + flattened scalar fields) instead of
+  `login_and_get_token` (token only) to get these fields.
+- **Critical/confirmed finding notifications** -- `workers/bounty/notify.py::notify_critical_findings`
+  publishes onto the existing `notify.send` queue/`NotificationWorker` (Slack/Discord/Telegram/email/
+  webhook, keyed by workspace) rather than building a bounty-specific channel sender; `BountyProgram` has
+  no `org_id`, which `Notification.org_id` being nullable already accommodates. Filters strictly to
+  `severity in {critical, high} AND status == confirmed` -- an `inconclusive` finding, however severe if
+  true, never fires a notification. Called from both `vulnscan_worker.py` and `exploit_worker.py` after
+  their respective persist commits.
+- **File upload / XXE detection** -- `workers/bounty/upload_xxe.py`: `check_unrestricted_upload` POSTs an
+  inert file with a dangerous extension (`.php`/`.svg`/`.html`) across common field names and flags 2xx
+  acceptance as `inconclusive`/`high` (whether it's actually web-accessible needs human confirmation);
+  `check_xxe` POSTs a classic external-entity payload targeting `/etc/passwd` and reuses `exploit_tools.py`
+  's own `LFI_SIGNATURES` set for confirmation, `confirmed`/`critical` on a match. New `"upload"` module
+  added to `exploit_worker.py`'s `ALL_MODULES`/`DEFAULT_MODULES`, dispatched against URLs matching the
+  existing `upload` priority bucket.
+- **Deeper GraphQL testing** -- `detect.py::graphql_schema_scan` runs a `__schema` introspection query and
+  flags type/field names matching a sensitive-name pattern (password/secret/token/apiKey/admin/...),
+  `inconclusive`/`medium` (introspection proves the field is *named* sensitively and reachable via schema,
+  not that it's actually readable). `detect.py::check_graphql_batching` POSTs a 5-element query-array batch
+  and flags acceptance as `inconclusive`/`low` (batch-based rate-limit bypass risk). Both dispatched from
+  `vulnscan_worker.py::_run_detection` against endpoint URLs matching the existing `graphql` priority
+  bucket (`PRIORITY_BUCKETS["graphql"]`, aliased there as `GRAPHQL_URL_RE`).
+
+### Fixed
+- **`_detect_attempt()` (`vulnscan_worker.py`) was hardcoding `"status": "confirmed"`** regardless of what
+  the underlying finding dict actually said -- found while wiring the new GraphQL checks, which explicitly
+  return `status: "inconclusive"`. Every check that predates this session's GraphQL work happened to only
+  ever return a result when genuinely confirmed, so the bug was latent/harmless until now. Fixed to
+  `finding.get("status", "confirmed")`.
+- **NUL bytes in evidence crashed the JSONB insert, silently looping a real scan to failure** -- found live
+  against the actual `kpi.go.id` production program (not a test one): a `.DS_Store` sensitive-file finding's
+  raw-byte excerpt (decoded with `errors="ignore"`, which passes a NUL byte through unchanged since it's a valid, just
+  unstorable, Unicode code point) hit Postgres's `UntranslatableCharacterError` on every insert attempt,
+  requeuing at `retry=3` -- one message away from exhausting `MAX_RETRIES` and dead-lettering the whole
+  `bounty.vulnscan` stage as failed for a real, live engagement. Fixed with a `@validates("evidence")` hook
+  on `ExploitAttempt` (`backend/app/db/models/bounty_models.py`) that recursively strips NUL bytes at the
+  ORM boundary -- covers every current and future evidence producer (nuclei, sensitive-file, XXE/upload,
+  GraphQL) in one place, rather than patching each detection module's own excerpt-building code.
+
+### Verified
+- `check_unrestricted_upload`/`check_xxe` against a synthetic Python test server covering vulnerable and
+  safe cases for both checks -- all 4 scenarios correct.
+- `graphql_schema_scan`/`check_graphql_batching` against a synthetic GraphQL-shaped test server (sensitive
+  vs. clean schema, batch-accepted vs. batch-rejected) -- all 4 scenarios correct.
+- The NUL-byte fix: constructed an `ExploitAttempt` directly inside the running `worker-bounty-vulnscan`
+  container with embedded `\x00` bytes in nested evidence -- confirmed stripped. Then let the *actual stuck
+  message* against the live `kpi.go.id` program run to completion rather than clearing/replaying it
+  synthetically: `bounty_vulnscan_completed` (868s elapsed, nuclei=3, detection=1, takeover=0, no crash),
+  and the previously-failing `.DS_Store` row now persisted (`bounty_exploit_attempts`, confirmed, excerpt
+  reduced from ~1800 raw bytes to a clean 23-char sanitized string).
+- No GraphQL finding fired against `kpi.go.id` in that same run -- expected, not a bug: its recon assets
+  contain no GraphQL-shaped endpoint URL, so `GRAPHQL_URL_RE` never matched, mirroring the upload/XXE
+  module's earlier negative-but-valid result against Juice Shop.
+- Backend bounty scope suite green (28 tests, `test_bounty_scope.py`).
+
+---
+
+## 2026-07-20 — Bug Bounty pipeline: bulk-promote recon assets (checkboxes + multi-select)
+
+The user had just manually promoted 202 recon assets one at a time (scripted around nginx's per-client rate
+limit, `zone=api rate=200r/m burst=50`, since that many sequential individual API calls trips it) and asked
+for a checkbox-based multi-select in the Recon tab instead.
+
+### Added
+- **`POST /programs/{id}/assets/promote-bulk`** (`backend/app/api/v1/endpoints/bounty.py`) -- same rule as
+  the existing single-asset `promote` endpoint (asset-type check, scope check, dedup against existing
+  targets), applied to up to 500 assets in one request/transaction. Per-asset outcome reported as
+  `{promoted: [...], skipped: [{asset_id, value, reason}]}` with reasons (`out_of_scope`,
+  `not_a_target_shape:*`, `already_promoted`, `target_already_exists`, `not_found`) rather than failing the
+  whole batch on the first rejection. This is the actual fix for the rate-limit problem, not just a frontend
+  convenience -- one request instead of N sequential ones.
+- Recon tab (`frontend/.../bounty/[id]/page.tsx`): a checkbox per promotable (unpromoted, subdomain/url/ip)
+  asset row, a header "Select all (N)" checkbox, and a "Promote Selected (N)" button that calls the new bulk
+  endpoint, invalidates the assets/targets queries, and toasts a promoted/skipped summary. Non-promotable
+  rows (js_endpoint/js_finding/graphql/already-promoted) render no checkbox, consistent with the existing
+  single-item "Promote" button's own visibility rule.
+
+### Verified
+- Backend: bulk call against 5 known out-of-scope assets (external credit links from the earlier browser-
+  crawl entry) -> all correctly skipped with `reason: out_of_scope`, 0 promoted. Bulk call against a
+  synthetic in-scope subdomain asset -> promoted successfully, target created. Both cleaned up by specific
+  tracked ID afterward (never a bulk/filtered delete) -- the real `KPI` program was confirmed untouched
+  throughout.
+- Frontend: rebuilt and redeployed the (production-mode, no hot-reload) frontend container, then exercised
+  the actual UI end-to-end via headless Chrome against 3 synthetic unpromoted assets -- "Select all"
+  selected them (+ the real remaining out-of-scope ones), "Promote Selected" fired one bulk request, and the
+  toast/list updated to reflect the promoted/skipped split. `tsc --noEmit` clean. Backend bounty scope suite
+  green (28 tests).
+
+---
+
+## 2026-07-20 — Bug Bounty pipeline: step-by-step PoC in the HTML report (+ a real "stale finding" bug it exposed)
+
+The user asked for step-by-step proof-of-concept instructions in the shareable HTML report. That logic
+already existed (`workers/bounty/report_templates.py::build_report`, used for the per-finding Markdown
+`BountyReport` drafts in the Reports tab) but the polished HTML report (`app/services/bounty_report.py::
+render_html`, the Summary tab's "Open HTML Report") never used it -- and wiring it in surfaced a real,
+separate bug worth fixing before shipping the feature at all.
+
+### Added
+- Moved the report-templating logic to `backend/app/services/bounty_report_templates.py` (was `workers/
+  bounty/report_templates.py`) -- both the worker-side Markdown drafts and the backend-side HTML report
+  need it, and workers already import backend directly (the reverse direction doesn't exist in this
+  codebase), so shared logic belongs in `app.services`. `report_worker.py` updated to the new import; old
+  file removed (only the one importer, no back-compat shim needed).
+- Significantly richer `_build_steps()`: previously handled only `poc_url` / `payload+param` / `matched_at`
+  shapes generically. Added dedicated, accurate step-by-step branches for every technique introduced this
+  session that has its own distinct evidence shape: `sqli-auth-bypass` (baseline-vs-payload login request
+  pair), `idor-cross-identity-confirmed` (identity A vs identity B request pair), `bac-unauth-privileged`
+  (unauthenticated request), `method-switch-*` (GET baseline vs the alternate method). Added a generic
+  fallback that surfaces *every* evidence field the pipeline actually recorded when no specific branch
+  matches, so a finding's steps are never thinner than the real evidence available. Added `MODULE_META`/
+  `TECHNIQUE_META` entries for `ssti`/`nosql`/`jsonbody`/`oauth`/`bac` and their sub-techniques (prototype-
+  pollution, mass-assignment, nosql-body) -- these previously fell through to a generic "nuclei" label with
+  the wrong impact/remediation text entirely.
+- `render_html` now renders a "Proof of Concept" section: one expandable `<details>` per top finding (title,
+  steps-to-reproduce with real request/response snippets, impact, remediation) below the existing summary
+  table, native-HTML-only (no JS) so it works in the self-contained report with no dependencies.
+- `exploit_dom.py`'s DOM-XSS finding now records the actual `payload`/`poc_url` used (it previously recorded
+  neither, since the per-attempt token is randomised for false-positive-proofing -- the token itself isn't
+  sensitive, so including it doesn't weaken that guarantee, and the report needs *something* concrete to show).
+
+### Fixed
+- **The report/summary aggregated every ExploitAttempt row ever persisted for a program, forever** --
+  found immediately while visually checking the new PoC section: it prominently showed, as "confirmed"
+  findings with generated PoC steps, several bugs already found, explained, and fixed earlier in this same
+  session (the dalfox-empty-dict XSS false positive, the SSTI no-baseline false positive, the CORS wildcard
+  false positive, the weak-signature `.env`/`.htpasswd` false positive) -- because those buggy runs' rows
+  never got deleted, they just kept accumulating alongside every subsequent clean run, and "confirmed" +
+  high severity sorted them straight to the top of the report. Fixed at the source rather than by deleting
+  rows: `_gather_urls_findings` (`backend/app/api/v1/endpoints/bounty.py`) now scopes findings to the latest
+  *completed* run of whichever stage produced them (vulnscan for nuclei/exposure/cors/403bypass, exploit for
+  everything else), using `program.stage_status.{stage}.started_at`. A program with incomplete/missing
+  stage_status falls back to "include everything" rather than risk hiding real findings. This is a general
+  fix, not specific to the PoC feature -- the existing Summary tab (`GET /programs/{id}/summary`) had the
+  exact same bug and is fixed by the same change.
+- **The same historical-accumulation problem also produced literal duplicate rows** for findings that
+  *are* still real and still reproduce on every run (e.g. the SQLi login bypass showed up 3+ times in the
+  unscoped findings list, once per re-run). Added `_dedup_findings()` (module+technique+target key) used by
+  both `classify_program`'s `top_findings` and `render_html`'s PoC section -- the raw counts
+  (`severity_counts`/`module_counts`/`totals`) still reflect every run, only the *display* lists dedupe.
+
+### Verified
+- Rendered the report before and after the stage-cutoff fix: 332 accumulated findings (7 high, including
+  the stale false positives) collapsed to 30 findings scoped to the latest run (0 high, 1 critical -- the
+  real SQLi bypass) once the fix landed; `GET /programs/{id}/summary` confirmed the same before/after via
+  its module_counts (`xss`/`ssti`/`cors`/`exposure` present before, entirely gone after -- exactly the
+  techniques with known, already-fixed false-positive bugs). Screenshotted the rendered HTML report
+  (headless Chrome, both before and after) to confirm the PoC `<details>` sections expand/collapse correctly
+  and render real request/response content, not just the fix's effect on the finding count. Backend bounty
+  scope suite green (28 tests); `report_worker.py` (the separate Markdown-draft path) re-run end-to-end
+  against the new import location with no errors.
+
+---
+
+## 2026-07-20 — Bug Bounty pipeline: browser-driven recon (real SPA execution, not just static parsing)
+
+Closes the gap called out in every entry above since the auth-crawl work: katana/hakrawler/ffuf/feroxbuster/
+waybackurls/gau/waymore all parse static HTML/JS text or brute-force paths -- none of them execute
+JavaScript, so a modern SPA's real routes and API calls (constructed entirely client-side, often only once
+logged in) were invisible to recon no matter how well the rest of the pipeline worked.
+
+### Added
+- **`workers/bounty/browser_crawl.py::browser_crawl`** -- loads a seed URL in real headless Chromium
+  (Playwright), passively captures every network request the page fires during normal rendering (its own
+  XHR/fetch calls included), then clicks through a bounded set (`MAX_INTERNAL_CLICKS = 8`) of pure-
+  navigation elements (`a[href]` or anything carrying Angular's `routerLink`, on *any* tag -- Juice Shop's
+  basket/account icons are `<button routerlink="...">`, not real links) to trigger more page transitions.
+  Deliberately never clicks a plain button with no navigation target (that's exactly where "Add to
+  Basket"-style state-changing actions live) and never fills or submits a form -- detection-only, same
+  discipline as every other module in this pipeline. Dismisses cookie-consent/welcome-banner overlays first
+  (near-universal on real sites, and Angular Material's modal backdrop blocks every subsequent click
+  otherwise) via Escape + a generic close/dismiss/accept button selector.
+- **Auth-state simulation, not just the header**: carrying `Authorization: Bearer <token>` at the network
+  level does *not* make an SPA render its logged-in UI or fire logged-in-only calls (basket, order-history,
+  whoami) -- the app's own client-side JS decides that from its own state, almost always read back out of
+  `localStorage`. Added `tools.py::login_and_get_session` (alongside the existing `login_and_get_token`,
+  now a thin wrapper over it) returning every scalar field found anywhere in the login response, not just
+  the token -- e.g. Juice Shop's response also carries a `bid` (basket id) field its own Angular code reads
+  separately from the token. `browser_crawl` seeds all of these under their own field names, plus the token
+  under every common storage-key convention (`token`, `authToken`, `jwt`, ...), before the first navigation.
+- Wired into `recon_worker.py` as a new bounded source (`MAX_BROWSER_CRAWL_HOSTS = 2` -- by far the most
+  expensive source in that file) alongside the existing ones; discovered URLs get the same gf-classification
+  and persistence path as everything else.
+
+### Fixed (found while validating this feature, same class as the earlier tini fix)
+- Confirmed the existing `tini` PID-1 fix (added for `worker-bounty-exploit`'s DOM-XSS module) also needed
+  applying to `worker-bounty-recon` now that it drives Chromium too -- rebuilt and redeployed that image;
+  verified 0 zombie processes in both containers after a full pipeline run.
+
+### Verified
+- Against the Juice Shop program: unauthenticated crawl alone surfaced `/rest/products/search?q=` -- the
+  real backing endpoint for the classic search-box challenge -- which no other source (katana, hakrawler,
+  ffuf, feroxbuster, historical archives) had ever found, because the app only constructs that request from
+  JS when the search box actually receives input. With auth-state seeding, the app rendered its logged-in
+  UI (`Logout` present) and additionally fired `/rest/user/whoami`; click-through successfully navigated
+  into the basket view, confirming the `/rest/basket/{id}` endpoint pattern exists (though the specific ID
+  resolved to `NaN` in this app's own client-side basket-id logic beyond what the generic field-mirroring
+  heuristic could replicate -- a documented, honest limit, not silently hidden). Full pipeline re-run: recon
+  found 71 assets (`browser_crawl` contributing 27, `authenticated: true`), exploit tested 152 URLs (up
+  from 125), 0 zombie processes in either container. Backend bounty scope suite green (28 tests), all 5
+  bounty workers healthy.
+- Not chased further (would mean hand-tuning payloads to this one app's specific challenge design rather
+  than building generally useful detection): the search endpoint's specific DOM XSS trigger didn't fire with
+  the existing `<img onerror>`/`<svg onload>` payload set this run -- Juice Shop's actual known vector for
+  this challenge is more specific than what a general-purpose two-payload probe covers.
+
+---
+
+## 2026-07-19 — Bug Bounty pipeline: two-identity IDOR/BAC confirmation (found a real critical bug)
+
+The last item from the post-auth improvement list. Every existing IDOR check (`exploit_tools.py::
+idor_candidates`, `exploit_ext.py::idor_bac_probe`) deliberately stops at "candidate" -- proving IDOR needs
+a *second* identity with no legitimate claim on a resource to compare against, which the pipeline never
+held. Unlike every other feature this session, this one is a genuine capability increase (the pipeline now
+creates and holds a second account, and compares cross-account access), not a bug fix -- confirmed with the
+user via AskUserQuestion before building anything, per the standing rule that active-exploitation
+capability increases need an explicit conversation, not an assumed "go ahead."
+
+Two things were confirmed before implementation: (1) the second identity is **auto-registered** by the
+pipeline itself via the program's own public registration endpoint (same opt-in-template pattern as
+`auth_login_url`), and (2) confirmation is **status/shape-only** -- the pipeline never parses, extracts, or
+stores the actual resource content, even for a confirmed hit.
+
+### Added
+- **`workers/bounty/idor_confirm.py`**:
+  - `generate_test_identity(reference_email)` -- a disposable `asm-bounty-2-<random>@<same-domain>` email +
+    random password, never overlapping with the primary test identity.
+  - `register_test_identity(registration_url, fields_template, email, password)` -- POSTs a program-
+    configured registration payload shape (`{email}`/`{password}` placeholders substituted recursively
+    through arbitrary JSON nesting, since real registration schemas vary -- Juice Shop needs a nested
+    `securityQuestion`/`securityAnswer`, most apps don't). New opt-in `rules_of_engagement` fields:
+    `idor_registration_url`, `idor_registration_fields`. Both must be set, on top of the existing
+    `auth_login_url`/`auth_email`/`auth_password` -- absent by default, no behavior change for any program
+    that doesn't configure this.
+  - `confirm_idor_cross_identity(url, token_a, token_b)` -- fetches the same path-shaped object-reference
+    URL (`/resource/{id}`, the same pattern `idor_candidates` already flags) as both identities. Identity B
+    was *just* created and owns nothing yet, so it has no legitimate claim on any pre-existing resource --
+    if it still gets a full, resource-shaped response, that's a missing ownership check, confirmed
+    (`severity: critical`). The shape check (`_looks_like_resource`) is deliberately coarse (200 status,
+    non-trivial JSON body) and explicitly rejects a `"data":null`/`{}`/`[]` wrapper envelope (an empty-but-
+    200 resource, which passed a naive length check during testing but proves nothing) -- there is no
+    field-extraction code path in this module at all, by construction.
+- Wired into `exploit_worker.py`'s existing `idor` module: after identity A's auth, if
+  `idor_registration_url`/`idor_registration_fields` are set, registers + logs in identity B, then runs the
+  cross-identity check against `PATH_ID_RE`-matched candidates from `owned` (bounded separately,
+  `MAX_TWO_IDENTITY_IDOR_URLS = 10`, since it's 2 requests per URL on top of everything else). Stage summary
+  now reports `two_identity_idor: bool`.
+
+### Verified
+- End-to-end against the Juice Shop program: registered a second test identity via its real `/api/Users`
+  endpoint, logged in as both, and **found a genuine, confirmed critical vulnerability** -- `GET /rest/
+  basket/1` and `/rest/basket/2` (real baskets belonging to other users) are both readable by a completely
+  unrelated, seconds-old test account. `/rest/basket/49` (an existing-but-empty basket) correctly produced
+  no finding after the `"data":null` refinement, confirming the shape check isn't just "any 200." Ran
+  through the real pipeline (not just a standalone script): `bounty_exploit_idor_identity_b registered=true
+  authenticated=true`, stage summary `two_identity_idor: true`.
+- Zero findings from the *pipeline* run itself (as opposed to the direct validation above): recon hasn't
+  discovered any real path-ID-shaped URL for this program yet (`/rest/basket/{id}` is a per-user resource
+  Juice Shop only creates at runtime -- the same "crawler doesn't execute the SPA" gap already documented in
+  the auth-crawl entry above, not a new one). The mechanism is proven correct against real data; whether it
+  fires during an ordinary run depends on recon eventually discovering a concrete numbered/UUID resource
+  URL to test, which needs the same headless-crawl improvement already on the list. Backend bounty scope
+  suite green (28 tests), all 5 bounty workers healthy.
+
+---
+
+## 2026-07-19 — Bug Bounty pipeline: DOM-based XSS confirmation (real headless browser) + a container-wide zombie-process fix
+
+Closes the second item from the post-auth improvement list: dalfox (`run_dalfox`) only ever sees server-
+response reflection, so it's structurally blind to a client-rendered app (Angular/React/Vue) that takes a
+param and unsafely binds it into the DOM (`[innerHTML]`, `document.write`, `v-html`, ...) -- exactly the
+shape of most modern SPA "XSS challenges."
+
+### Added
+- **`workers/bounty/exploit_dom.py::run_dom_xss`** -- for each query param on a candidate URL, injects a
+  payload (`<img src=x onerror=...>`, `<svg onload=...>`) carrying a fresh random token, loads the page in
+  a real headless browser, and confirms only if that exact token executes as JavaScript. No baseline/
+  diffing needed like SSTI's digit-matching -- a browser actually executing a token only *we* could have
+  injected has no other explanation. Wired into the existing `xss` module (alongside dalfox), bounded
+  separately (`MAX_DOM_XSS_URLS = 8`) since a browser load is far more expensive per-URL than a plain
+  request. Uses the exploit-stage auth session (`extra_headers`) via Playwright's `extra_http_headers`.
+  Built on **Playwright** (already a dependency in this image for the screenshot feature) rather than
+  hand-rolling Chrome DevTools Protocol over a raw WebSocket -- see the fix below for why that mattered.
+
+### Fixed
+- **Headless Chromium was leaking permanent zombie processes, container-wide** -- found while validating
+  `run_dom_xss` itself (a synthetic true-positive/true-negative test left over a hundred `<defunct>`
+  processes after a handful of runs). Root cause: this image's containers run `python -m workers....`
+  directly as PID 1, which is not an init and never reaps orphaned processes. Killing a Chromium process
+  after each browser-driven check reparents its renderer/GPU/crashpad children to PID 1, where they sit as
+  zombies forever (they don't consume CPU, but they permanently hold a process-table slot -- over the
+  lifetime of a long-running worker container this is a real, if slow, resource leak, not cosmetic).
+  A first attempt at fixing this via raw CDP with `--single-process --no-zygote` chromium flags avoided
+  forking child processes but broke the `/json/new` (new-tab) DevTools endpoint outright in this chromium
+  build. Rewrote `run_dom_xss` on Playwright instead (its driver manages Chromium's process tree and
+  reaps it properly on `browser.close()`) -- cut the leak from ~15-20 zombies/URL down to ~2/browser
+  session, but still not zero. The actual fix: added `tini` to `workers/Dockerfile` and set
+  `ENTRYPOINT ["tini", "--"]` -- a real init as PID 1 reaps any reparented orphan regardless of which tool
+  spawned it. Verified: 3 consecutive full `run_dom_xss` browser lifecycles produced 0 zombies post-fix
+  (was still accumulating them with the Playwright-only fix). Benefits any worker using Chromium/Playwright
+  once rebuilt, not just this module -- currently rebuilt and deployed for `worker-bounty-exploit` only
+  (the one running this new code); other worker images should pick up the same protection on their next
+  routine rebuild.
+
+### Verified
+- Synthetic test fixture: a genuinely DOM-XSS-vulnerable page (`el.innerHTML = 'results for: ' + query`
+  read client-side from `location.search`) → confirmed hit. A safe page (`el.textContent = ...`, same
+  shape) → no finding, 3/3 consecutive runs. Full pipeline re-run on the Juice Shop program: 0 zombie
+  processes after the run (was accumulating before the tini fix), 0 false DOM-XSS findings on the
+  currently-discovered URL set (correctly -- none of Juice Shop's currently-crawled REST endpoints have a
+  working DOM XSS sink; the classic search-box DOM XSS challenge lives behind an Angular hash route
+  (`#/search?q=`) that a server-side crawl never sees in the first place, a pre-existing, already-documented
+  gap, not something this module could fix on its own). Backend bounty scope suite green (28 tests), all 5
+  bounty workers healthy.
+
+---
+
+## 2026-07-19 — Bug Bounty pipeline: authenticated crawl + smarter target selection
+
+Follow-up to the previous entry: exploit already had single-identity auth, but recon's own crawl
+(katana/hakrawler/ffuf/feroxbuster/API-discovery) and vulnscan (nuclei + detection checks) still ran fully
+unauthenticated, so the pipeline still couldn't *discover* most of a real app's authenticated-only surface,
+only test the handful of authenticated URLs a human happened to promote manually.
+
+### Added
+- **Authenticated recon + vulnscan**, same opt-in `rules_of_engagement.auth_login_url`/`auth_email`/
+  `auth_password` used by exploit: `recon_worker.py` and `vulnscan_worker.py` each log in once at the start
+  of their own run (workers are separate processes/queue messages, so the token isn't shared across stages
+  -- each stage re-authenticates, a few extra cheap login requests per pipeline run) and thread the
+  resulting `Authorization: Bearer` header through every tool that supports custom headers: katana/ffuf/
+  feroxbuster/hakrawler/httpx (`-H`/`-h` flags), nuclei (`-H`, already redacting `authorization` from its
+  own output), and the aiohttp-based sensitive-file/CORS/API-spec/GraphQL checks.
+  - Moved `login_and_get_token`/token-extraction from `exploit_ext.py` to the shared `tools.py` so every
+    stage can import it without a cross-module dependency on the exploit-specific file.
+  - **Deliberately excluded**: `check_403_bypass` (vulnscan) and `idor_bac_probe`'s unauthenticated-access
+    check (exploit) -- both specifically measure what an anonymous caller can reach, and authenticating
+    them would silently stop measuring that instead of improving it. Probe stage (basic httpx liveness)
+    also left unauthenticated -- low value for its purpose, not worth the added surface.
+- **Priority-ordered candidate URLs + raised MAX_URLS** (`exploit_worker.py`): reused the same regex buckets
+  `bounty_report.py`'s classifier already uses (now exported as `PRIORITY_BUCKETS`) to sort candidate URLs
+  so auth/admin/payment/IDOR-shaped endpoints survive truncation instead of being crowded out by bulk CSS/
+  JS/asset URLs. Raised `MAX_URLS` 80 -> 200 now that a fixed recon actually finds 100+ real endpoints per
+  program; `MAX_URLS_PER_MODULE` (15) remains the real per-module cost throttle, so this mainly widens the
+  pool each module's bucket is drawn from, not the runtime.
+
+### Verified
+- Full pipeline re-run on the Juice Shop program with the test account from the previous entry: recon and
+  vulnscan both logged `authenticated=true`, exploit's `tested_urls` went from 80 to 125 (more candidates
+  survive the wider MAX_URLS + priority sort). New findings that only became reachable once authenticated:
+  `bac-unauth-privileged` on `/rest/admin/application-configuration` (medium), `mass-assignment` on
+  `/api/Users` (medium), plus previously-401 endpoints (`/rest/user/whoami`, `/rest/admin`,
+  `/rest/user/reset-password`, `/rest/user/authentication-details`) now crawled and tested at all. The
+  `sqli-auth-bypass` critical finding on `/rest/user/login` persists across every re-run, as expected.
+  Backend bounty scope suite green (28 tests), all 5 bounty workers healthy.
+- Still open: recon's crawl, even authenticated, is static/JS-based and doesn't execute the SPA, so it still
+  can't discover the concrete numeric-ID basket/order URLs Juice Shop only creates via runtime interaction
+  (add-to-basket, place-order) -- the path-based IDOR detection added in the previous entry is correct but
+  still has nothing real to match on this target. That would need a headless-browser-driven crawl, a bigger
+  step than header-threading.
+
+---
+
+## 2026-07-19 — Bug Bounty pipeline: closed the auth-wall gap (JSON-body SQLi, path IDOR, single-session auth)
+
+The user pushed back on the "0 findings" result below: they manually test Juice Shop regularly and know
+it's full of confirmable bugs (XSS, SQLi, BAC), so a clean run was itself suspicious, not reassuring. That
+was the right call — three structural gaps, not tuning, explained it:
+
+### Fixed
+- **SQLi/XSS modules only ever look at GET query strings** (`url_has_params`) — Juice Shop's textbook
+  `' OR 1=1--` admin login bypass is a POST JSON body with no query string at all
+  (`/rest/user/login`, `{"email": "...", "password": "..."}`), so sqlmap/dalfox never attempted it, no
+  matter how well recon crawled. Manually confirmed the bypass works against this instance (logs in as
+  `admin@juice-sh.op`) before writing the fix. Added `run_login_sqli_bypass()`
+  (`workers/bounty/exploit_ext.py`): POSTs classic auth-bypass payloads into a login-shaped JSON body,
+  diffed against a baseline garbage-credential POST on the same field names — a hit requires the baseline
+  to fail and the payload to succeed (a hard, structural signal). Wired into the `sqli` module against any
+  owned URL whose path looks like a login endpoint. **Now fires as a "critical", "confirmed"
+  `sqli-auth-bypass` finding on `/rest/user/login`** — the exact bug the user expected to see.
+- **IDOR module only matched object references in query param *names*** (`IDOR_PARAM_HINTS`) — modern REST
+  APIs (Juice Shop included) put the reference in the *path* (`/rest/basket/6`, `/api/BasketItems/12`), which
+  never touched that regex at all. Added `PATH_ID_RE` to `idor_candidates()`
+  (`workers/bounty/exploit_tools.py`): matches a resource-name-looking path segment immediately followed by
+  a numeric or UUID segment, flagged the same conservative way (`inconclusive`, first-match-only, no
+  enumeration). Verified directly: `/rest/basket/6` and `/api/BasketItems/12` now flag, `/rest/products/search`
+  correctly doesn't.
+- **The entire pipeline was, and by default still is, 100% unauthenticated** — confirmed by grepping for
+  any auth/cookie/session concept anywhere in `workers/bounty/*.py` (none existed) and by hitting a
+  known-protected endpoint (`/rest/basket/1` → `401 UnauthorizedError`). Most of a real target's interesting
+  surface (profile, basket, orders, admin-after-creds) sits behind a login wall the pipeline could never
+  see past — this is why manual testing (which logs in first) finds far more than an unauthenticated
+  automated pass ever could, independent of any bug. Added **optional single-identity authenticated
+  testing**, off by default:
+  - `login_and_get_token()` (`exploit_ext.py`) — POSTs program-supplied test credentials to a
+    program-supplied login URL, pulls a bearer token out of common JSON response shapes
+    (`authentication.token`, `token`, `data.token`, `jwt`, `access_token`).
+  - New optional `rules_of_engagement` fields: `auth_login_url`, `auth_email`/`auth_password`,
+    `auth_email_field`/`auth_password_field` (default `email`/`password`). Nothing changes for a program
+    that doesn't set these.
+  - `exploit_worker.py` logs in once per run (if configured) and threads the resulting
+    `Authorization: Bearer` header through every module that makes its own HTTP request (dalfox `-H`,
+    sqlmap `--headers`, arjun `--headers`, and every aiohttp-based check). **Deliberately excluded**:
+    `idor_bac_probe`'s unauthenticated-access check (adding auth would silently change what that specific
+    probe measures) and `idor_candidates`/BAC confirmation in general (still requires a *second* identity to
+    compare against, which this does not add — that boundary is unchanged).
+  - This is a single-identity enhancement only, not multi-identity IDOR confirmation. Both were confirmed
+    with the user via AskUserQuestion before building (auth testing is a real capability increase, not a bug
+    fix, so it got the same check-in as the earlier full-automation/aggressive-modules decisions).
+
+### Verified
+- Registered a real test account on the Juice Shop instance (`asm-bounty-test@example.com`) via its own
+  `/api/Users` endpoint, set it as the program's `auth_login_url`/`auth_email`/`auth_password`, re-ran the
+  exploit stage: `bounty_exploit_auth authenticated=true` logged, `/api/BasketItems` (401 unauthenticated)
+  became reachable for jsonbody testing, and the SQLi login-bypass fires as a critical confirmed finding
+  every run. `idor_candidates` path-ID matching verified directly against constructed URLs.
+- Known remaining gaps, left for a future increment rather than silently claimed as solved: recon's own
+  crawl (katana/hakrawler/ffuf) still runs unauthenticated, so it can't discover the concrete numeric-ID
+  basket/order URLs Juice Shop only fills in per logged-in session — path-based IDOR detection is proven
+  correct but has nothing real to match yet on this target. Classic Angular DOM-based XSS (e.g. the search
+  box) isn't caught by dalfox's server-response-reflection approach; that needs a headless-browser-based
+  checker, a different tool category. IDOR/BAC confirmation (vs. candidate-flagging) still deliberately
+  requires two identities the pipeline does not hold.
+
+---
+
+## 2026-07-19 — Bug Bounty pipeline: exploitation modules were silently starved of targets (3 more bugs)
+
+Follow-up to the E2E validation below, triggered by the user noticing XSS/SQLi/etc. produced no findings
+and asking why. The honest answer was worse than "tuned conservatively" — three real bugs, found by
+tracing the question instead of taking the "no findings" result at face value:
+
+### Fixed
+- **Katana crawler has been silently broken since it was built** (`workers/bounty/tools.py::run_katana`) —
+  the command line passed `-retries 1`; this katana build (v1.6.1) only recognizes `-retry`. An unrecognized
+  flag makes katana exit immediately with a CLI-parse error and no output file, and `run_katana` never
+  checked the exit code, so this has silently returned `{"urls": {}, "js_files": {}}` on *every* recon run
+  since Phase 1, for every program, not just Juice Shop. This is the actual root cause of the XSS/SQLi/SSRF/
+  LFI/SSTI modules finding nothing: those modules only test query-parameterized URLs, and katana (the one
+  crawler that discovers real in-app links/API calls) had never contributed a single URL — every previously
+  "collected" URL came from ffuf/feroxbuster (path brute-forcing, never produces query params) or hakrawler
+  (a handful of static JS file links). Fixed the flag; also added exit-code logging so a CLI-parse failure
+  like this surfaces as a warning instead of silently reading as "found nothing." Impact on Juice Shop:
+  recon assets went from ~22 (all path-guessed, zero params) to 182, including the app's real REST surface
+  (`/rest/user/change-password?current=`, `/rest/user/security-question?email=`, `/redirect?to=`,
+  `/api/BasketItems`, `/rest/admin`, `/rest/track-order`, dozens more) — the actual attack surface XSS/SQLi/
+  SSRF/LFI need query parameters to test against.
+- **Dalfox "no vulnerabilities" sentinel was read as a confirmed XSS finding**
+  (`workers/bounty/exploit_tools.py::run_dalfox`) — this dalfox build's JSON output for "nothing found" is
+  literally `[{}]`, an array containing one empty object, not `[]`. The parser only checked
+  `isinstance(poc, dict)` before building a finding from it — an empty dict passes that check trivially, so
+  *every* dalfox run that found nothing was recorded as a "confirmed" "high" XSS finding with every evidence
+  field `null`/empty (severity defaults to "high" when dalfox doesn't supply one, compounding it). Caught
+  because the evidence looked wrong (no param, no PoC URL, no message) on inspection. Fixed by skipping empty
+  dicts and requiring at least a `type` or `data`/`poc` field before treating a poc entry as a real finding.
+- **SSTI check had no baseline and missed escaped reflection**
+  (`workers/bounty/exploit_ext.py::run_ssti`) — flagged `/redirect?to=<%=7*7%>` as confirmed SSTI because
+  the digits "49" appeared in the response and the literal payload string didn't. In reality the endpoint
+  returned a generic "Unrecognized target URL for redirect" error page that (a) reflects the input
+  HTML-escaped (`&lt;%=7*7%&gt;`, so the raw-payload check never fires) and (b) already contains "49"
+  somewhere in its boilerplate even for a completely inert param value — confirmed by directly diffing the
+  response against a harmless baseline value in the same param. Fixed by adding that baseline check (skip if
+  the expected digits appear regardless of payload) and checking for HTML-escaped payload reflection, not
+  just the raw string.
+- Minor cleanup: katana's `-jc` (in-JS-string link extraction) occasionally pulled a stray literal or
+  percent-encoded backslash/quote out of an embedded JSON blob on Juice Shop's credits page (e.g.
+  `/api/%5C%22/ftp/legal.md%5C%22`), producing a handful of junk test URLs. Stripped `\`, `%5C`, `%22` from
+  each discovered line — never legitimate URL characters in this position.
+
+### Verified
+- Re-ran the full pipeline after each fix. Final run: recon assets 182 (up from 0 collected pre-fix),
+  exploit tested 80 URLs (up from 18, capped by `MAX_URLS`) across all 11 modules, 0 false "confirmed"
+  XSS/SSTI (both gone after the dalfox/SSTI fixes, correctly — this Juice Shop instance's sampled 80 URLs
+  don't have a working reflected-XSS or SSTI PoC). Remaining findings are honestly calibrated: nuclei
+  info/medium (missing headers, exposed `/metrics`, `/api-docs/swagger.yaml`) plus NoSQL-body and HTTP
+  method-switching candidates correctly marked "inconclusive." Backend bounty scope suite green (28 tests).
+- Noted for later: `MAX_URLS=80`/`MAX_URLS_PER_MODULE=15` mean this run still only sampled a subset of
+  Juice Shop's real endpoint list (150+ unique paths surfaced by the katana fix); widening those bounds or
+  prioritizing high-value buckets (auth, admin, payment) is a tuning question, not a bug.
+
+---
+
+## 2026-07-19 — Bug Bounty pipeline: real-target E2E validation against OWASP Juice Shop (4 bugs found + fixed)
+
+First full-auto pipeline run (`run/pipeline`) against a real, live target (the user's local OWASP Juice
+Shop test instance, `owasp-juice.com`) rather than a synthetic fixture. DNS/reachability were validated
+first from both the host and a worker container (`nslookup`/`getent hosts`/`curl`, all → `172.25.1.212`).
+The run surfaced four real bugs that unit tests and the earlier synthetic-fixture testing hadn't caught —
+each is a genuine gap in a differently-shaped real target (HTTP-only, SPA catch-all routing, standard
+public-CORS config, a promoted-URL target list), not a Juice-Shop-specific quirk:
+
+### Fixed
+- **Recon assumed HTTPS everywhere** (`workers/bounty/recon_worker.py`) — katana/hakrawler/ffuf/feroxbuster/
+  API-discovery seeded every crawl with a hardcoded `https://{host}`. Juice Shop is HTTP-only, so the seed
+  URL failed to connect and every downstream crawler silently returned nothing (`collected=0` URLs from an
+  app with dozens of real endpoints). Added `_resolve_base_urls()`, which runs `httpx` once per host (it
+  auto-negotiates scheme) and threads the resolved origin through `_collect_urls`/`_discover_paths`/
+  `_discover_apis` instead of guessing. Any in-scope internal/staging/on-prem target that isn't HTTPS was
+  silently unscannable before this fix.
+- **Sensitive-file check defeated by weak signatures** (`workers/bounty/detect.py::check_sensitive_files`) —
+  the existing catch-all/SPA guard (`_is_catch_all_200`) only applies to signature-less checks, but `.env`
+  (signature `"="`) and `.htpasswd` (signature `":"`) have signatures so trivially weak they match *any*
+  HTML page's markup, bypassing the guard entirely. On Juice Shop (an Angular SPA that 200s on literally
+  any path, confirmed via a random-nonce probe) this produced `.env` (high) and `.htpasswd` (medium)
+  "confirmed" findings whose "matched" content was just the app's index.html. Added a second, unconditional
+  guard: skip whenever the catch-all flag is set and the response body itself looks like an HTML shell
+  (`<html`/`<!doctype`), regardless of whether a signature matched — a genuine `.env`/`.htpasswd` never
+  contains those markers, so this closes the gap for any weak signature, not just these two.
+- **CORS check flagged standard, safe `Access-Control-Allow-Origin: *`** (`workers/bounty/detect.py::
+  check_cors`) — treated a bare wildcard ACAO as a reflection finding unconditionally. `ACAO: *` without
+  `Allow-Credentials: true` is a normal, intentional config for public/no-auth resources (browsers refuse
+  credentialed requests against a literal `*` anyway), so this produced 41 near-identical "medium" findings
+  on Juice Shop's public JS bundles, `robots.txt`, etc. — 42% of one run's total findings, all noise. Now
+  only flags exact reflection of the probe's own attacker-controlled Origin (real evidence of "no allowlist
+  at all"), or a wildcard combined with `Allow-Credentials` (spec-invalid, still worth a low-severity flag).
+- **Nuclei re-scanned the same origin once per promoted URL target** (`workers/bounty/vulnscan_worker.py::
+  run_stage`) — nuclei's target list was built from every `BountyTarget.value` verbatim, including url-type
+  targets a human had promoted individually from the Recon tab (19 of them here, all on one host). Nuclei's
+  template catalog (misconfig/CVE/tech-detection) is host-level, not endpoint-level, so this repeated the
+  full template set 19x against the same origin — and in one run that repetition ran long enough to hit the
+  10-minute scan timeout and yield zero results instead of the ~10 legitimate findings a single-origin scan
+  produces in under 3 minutes. Now dedupes nuclei's target list to one entry per origin; per-endpoint
+  injection testing (xss/sqli/idor/etc.) stays exploit_worker's job, unaffected.
+- Related cleanup in the same code path: `_run_detection`'s sensitive-file/CORS base-URL list had the same
+  per-promoted-URL-target duplication (producing nonsense concatenated paths like `/security.txt/.env` from
+  a promoted `/security.txt` target) — collapsed to one entry per origin there too.
+
+### Verified
+- Same program, three full pipeline re-runs as each bug was found and fixed. Final clean run: recon →
+  probe → vulnscan (10 findings, ~2.5 min, no timeout) → exploit (8 findings across 11 modules, 18 URLs
+  tested) → report, no manual intervention between stages. Final finding set (18 total, zero CORS/sensitive-
+  file noise): `prometheus-metrics` on `/metrics` (medium, confirmed — real), 8x missing-security-headers
+  (info, confirmed), `swagger-api` on `/api-docs/swagger.json` (info, confirmed), 5x NoSQL-body candidates on
+  `/api/v1-v3` + docs endpoints (medium, inconclusive), 3x HTTP method-switching candidates on `/profile`,
+  `/api-docs`, `/assets` (low, inconclusive). Backend bounty scope test suite green (28 tests).
+
+---
+
+## 2026-07-18 — Bug Bounty framework parity, Phase 4 (FINAL): smart classifier + HTML report
+
+Phase 4 of 4 — completes the framework-parity effort. Pure backend analysis over already-persisted data
+(no worker run, no schema change) plus a frontend surface.
+
+### Added
+- `backend/app/services/bounty_report.py`:
+  - `classify_program(urls, findings)` — the "smart classifier": severity/module/status counts, top findings,
+    and priority target buckets a researcher triages by (IDOR numeric/UUID/API-object, BAC admin/sensitive-
+    action/user-mgmt, auth/OAuth, upload, payment, webhook, debug, graphql), matched by regex over the
+    program's recon URLs + finding targets.
+  - `render_html(program, findings, summary)` — a standalone, self-contained, theme-aware HTML report
+    (stat cards, severity bars, findings table with confirmed/candidate status, priority-target table).
+- API: `GET /programs/{id}/summary` (classifier JSON) and `GET /programs/{id}/report.html` (the HTML report,
+  `text/html`), both computed on demand, admin-gated.
+- Frontend: a **Summary** tab (now the default) on the program detail — stat cards, severity distribution,
+  priority-target buckets, and an **Open HTML Report** button (fetches with auth, opens the report in a new
+  tab). New `bountyAPI.getSummary` / `getReportHtml`.
+
+### Deliberately not done
+- **Resume** (the reference's `.done`-file skip-completed) — intentionally skipped: the queue model already
+  exposes per-stage `stage_status` and re-runs are idempotent (recon upserts, findings are additive), so a
+  resume flag adds little here. Noted rather than silently dropped.
+
+### Verified
+- `classify_program` + `render_html` against the Phase-3 program's 15 real findings: summary returns correct
+  totals (15 findings / 12 confirmed / 3 candidates), severity distribution, module counts, and priority
+  buckets; the HTML report (7.8KB, valid) renders cleanly in a real browser (stat cards, severity bars,
+  findings table, priority targets). Frontend Summary tab renders the same data + working report download.
+  Backend suite green (311 tests), ruff clean, `tsc --noEmit` clean.
+
+### Framework-parity effort — complete
+All four phases done (recon breadth + gf classification → detection modules → aggressive exploit default-ON
+→ classifier + HTML report). The bounty pipeline now covers the reference framework's capabilities within
+this codebase's queue-worker architecture, with the scope gate absolute throughout and aggressive modules
+calibrated to detection/confirmation (never destructive). Tool substitutions (Python gf/qsreplace/LinkFinder/
+SecretFinder instead of the binaries; dalfox for XSStrike; custom fuzzing for LFISuite) are documented in
+their phase entries.
+
+---
+
+## 2026-07-18 — Bug Bounty framework parity, Phase 3: aggressive exploit modules (default-ON) + gf routing
+
+Phase 3 of 4 — the highest-stakes phase. Per the user's explicit choice (authorized bug-bounty operator):
+full framework, aggressive modules **default-ON**. The scope gate stays absolute (nothing outside
+`scope_rules` is ever touched, re-validated in the worker); intensity is calibrated to
+detection/confirmation like the reference framework itself (sqlmap level 1, dalfox --only-discovery, SSTI
+math-eval), never destructive/DoS.
+
+### Added (`workers/bounty/exploit_ext.py`, wired into the exploit worker)
+- **SSTI** (`run_ssti`) — `{{7*7}}`/`${7*7}`/`<%=7*7%>`/etc.; a hit requires the *evaluated* result to
+  appear and the raw payload not to (so reflection ≠ SSTI). Confirmed.
+- **NoSQL** (`run_nosql`) — Mongo-operator injection; flags NoSQL errors as inconclusive candidates.
+- **JSON body mutations** (`run_json_body_mutations`) — prototype pollution (`__proto__`), mass-assignment
+  (`role/is_admin`), NoSQL body (`$where/$gt/$ne`) POSTed to API endpoints; inconclusive candidates (real
+  impact needs an authenticated before/after the pipeline can't do).
+- **OAuth/JWT** (`check_oauth_jwt`) — token-in-URL (confirmed), JWT `alg:none` (confirmed, header-decoded),
+  OAuth missing-`state` (confirmed) / missing-PKCE (inconclusive), and `redirect_uri` open-redirect
+  (confirmed when the attacker URL is reflected into `Location`).
+- **IDOR/BAC** (`idor_bac_probe`) — unauthenticated privileged-endpoint access + HTTP method-switching, both
+  inconclusive candidates (BAC needs an authorized baseline).
+- **gf routing**: each param-injection module now runs on the URLs whose `classify_url` buckets match it
+  (xss→xss, sqli→sqli, ssti→ssti, …), falling back to all param URLs when a bucket is empty so coverage
+  never depends on classification. Body modules run on API-ish URLs; OAuth on OAuth-ish URLs.
+- **Default module set is now all 11** (xss/sqli/ssrf/lfi/idor/csrf/ssti/nosql/jsonbody/oauth/bac) — was
+  4 with sqli/ssrf opt-in. Still narrowable + tunable per program via `rules_of_engagement`.
+
+### Verified (against a fixture with each issue planted)
+- Direct: SSTI confirmed, OAuth open-redirect + missing-state confirmed, token-in-URL + JWT alg:none
+  confirmed, BAC method-switch inconclusive — all with correct confirmed/inconclusive status.
+- Full exploit stage: one run produced 15 findings across the routed modules (SSTI/OAuth/BAC + XSS/LFI/IDOR),
+  each persisted as ExploitAttempt with the right module/severity/status; nosql/jsonbody/sqli/ssrf correctly
+  produced nothing against a target without those flaws (no false positives). All findings on the in-scope
+  fixture — scope gate held.
+
+### Still to come
+Phase 4 (last): smart classifier (IDOR/BAC/OAuth priority lists + category buckets), HTML report, resume.
+
+---
+
+## 2026-07-18 — Bug Bounty framework parity, Phase 2: WAF, API/GraphQL discovery, sensitive files, CORS, 403-bypass
+
+Phase 2 of 4. High-signal, mostly-detection checks between recon and active exploit, mapped into the
+existing stages. New module `workers/bounty/detect.py` (stateless, bounded GET/POST against in-scope
+targets; workers persist).
+
+### Added
+- **WAF fingerprint** (`detect.run_wafw00f`) — run by the **probe** stage on alive targets (bounded to 15),
+  stored in the target's `probe_metadata.waf`.
+- **API/GraphQL discovery** — run by **recon**: OpenAPI/Swagger spec hunting (`discover_api_specs`, ~12
+  paths) + GraphQL introspection (`graphql_introspection`), recorded as `api_spec`/`graphql` BountyAssets
+  (GraphQL flagged with `introspection_open`). Plus **feroxbuster** recursive content discovery added to
+  path discovery (bounded to 2 hosts; ffuf still runs on 5).
+- **Sensitive-file exposure, CORS misconfiguration, 403-bypass** — run by **vulnscan** on target base URLs +
+  a bounded sample of in-scope recon URLs, persisted as `ExploitAttempt` findings (`module` =
+  exposure/cors/403bypass). Sensitive files require a content signature or a non-catch-all server; CORS
+  flags reflected-origin (high when credentials are allowed); 403-bypass tries path + header tricks.
+- New tools already batched into the image in Phase 1 (wafw00f, feroxbuster) are now wired in.
+
+### Fixed (surfaced during verification against the vuln-test fixture)
+- **Catch-all/SPA false positives** — a server that answers 200 for every path made signature-less
+  sensitive-file checks and path-mutation 403-bypasses fire spuriously (a very common real-world FP source).
+  Added `_is_catch_all_200` baseline: on a catch-all host, signature-less file checks are skipped and only
+  header-based 403 bypasses (which keep the exact path) are trusted. Verified: against the catch-all
+  fixture, detection collapses from 5 findings (3 bogus) to the 2 real ones (`/.env` exposure + reflected
+  CORS-with-credentials), and 403-bypass reports the real header bypass, not a path-mutation artifact.
+
+### Verified
+- `check_sensitive_files`/`check_cors`/`check_403_bypass`/`graphql_introspection` fire correctly against a
+  fixture with each planted issue, and detection findings persist through the vulnscan stage as
+  ExploitAttempt rows. WAF/feroxbuster are installed + wired (not exercised — the fixture has neither a WAF
+  nor a large content tree).
+
+### Still to come
+Phase 3 (aggressive exploit modules default-ON + gf routing), Phase 4 (classifier + HTML report + resume).
+
+---
+
+## 2026-07-18 — Bug Bounty framework parity, Phase 1: recon breadth + gf URL-classification
+
+User wants the bounty pipeline to match a full bug-bounty framework (reference: tanvirahmedcs/Bug-Framework
+`bug.sh`, ~17 modules), fully automated, aggressive modules default-ON, built in staged phases. This is
+Phase 1 of 4 (foundation): broaden recon and add the URL-classification that lets later exploit stages
+target the right URLs. The scope gate stays absolute throughout.
+
+### Added
+- **gf-style URL classification** (`recon_ext.py::classify_url`) done in Python from the canonical gf
+  parameter lists — no gf binary or pattern-repo dependency. Tags each URL with the buckets its query
+  params imply (xss/sqli/ssrf/lfi/idor/redirect/rce/ssti); stored in `BountyAsset.metadata.gf`. This is the
+  routing signal Phase 3's exploit modules will consume. (Verified: `?q=x&id=5` → `[idor,sqli,ssti,xss]`,
+  `?path=/etc/passwd` → `[lfi,ssrf]`, and the buckets round-trip to the DB.)
+- **Extra keyless subdomain sources**: urlscan.io, hackertarget, rapiddns (HTTP, no keys) + **alterx**
+  permutation expansion — alongside the existing subfinder/assetfinder/crt.sh/dnsx set.
+- **Extra URL sources**: waymore, hakrawler + **uro** near-duplicate dedup, on top of waybackurls/gau/katana.
+- **Richer JS mining** (`tools.py`): AWS/GCP/GitHub/Stripe/Slack/Twilio/Mailgun/S3/Firebase secret patterns
+  + DOM-XSS sink and declared API-base-URL extraction, recorded as `js_finding` intel per JS file.
+- New tools batched into `workers/Dockerfile` (one rebuild for all phases): hakrawler, getJS, alterx (go);
+  feroxbuster (installer); uro, waymore, wafw00f (pip). gf/qsreplace/LinkFinder/SecretFinder are done in
+  Python instead of as binaries.
+
+### Fixed (surfaced during real-target verification against example.com)
+- **Wildcard-DNS false positives**: example.com is wildcard, so alterx's ~2000 permutations all "resolved"
+  → 1253 junk subdomains that would've been auto-promoted and tested. Added a wildcard check
+  (`recon_worker._is_wildcard`, random-label probe); permutations are dropped for wildcard domains while
+  the real OSINT sources are kept. (Verified: `dropped=1998, permuted=0, confirmed=6` real subdomains.)
+- **`BountyAsset.source` truncation**: the merged subdomain source label (63 chars) exceeded the column's
+  `String(50)`, so persist failed with 0 assets saved. Shortened to `subdomain_enum` (the label can't name
+  a single source per host anyway, since candidates are a merge).
+
+### Still to come (Phases 2-4)
+WAF fingerprint, API/GraphQL discovery, sensitive-file exposure, CORS, 403-bypass, feroxbuster content
+discovery, nuclei multi-pronged (Phase 2); aggressive exploit modules default-ON + gf routing — SSTI,
+prototype pollution, NoSQL, mass-assignment, OAuth/JWT, richer IDOR/BAC (Phase 3); smart classifier +
+HTML report + resume (Phase 4).
+
+---
+
+## 2026-07-17 — Bug Bounty pipeline: full automation (one-click "Run Full Pipeline")
+
+User found the manual per-stage flow too tedious (they run real engagements, e.g. Underarmour on Bugcrowd)
+and wanted to define scope, hit one button, and have the whole pipeline run itself. Confirmed decisions
+(AskUserQuestion): full auto **with auto-promote** (in-scope recon findings become testable without manual
+review), **one "Run Full Pipeline" button** (not auto-on-activate), **on-demand only** (no scheduling yet).
+
+**The scope gate stays absolute.** `is_target_in_scope` (fail-closed, explicit-deny-wins) is still
+re-validated inside every worker; only in-scope things are ever auto-promoted or tested; nothing outside
+`scope_rules` is touched. What changed is only the human *review* step, not the scope boundary.
+`dos`/`destructive` stay excluded by default and `sqli`/`ssrf` stay opt-in (unchanged).
+
+### Added
+- **Recon seeds from scope** (`recon_worker.py::_scope_seed_domains`): recon now derives its seed domains
+  from the in-scope domain scope rules (wildcards stripped, `*.acme.com` → `acme.com`) unioned with any
+  manual domain targets — so a program only needs its scope defined to run recon; no separate manual target
+  entry required. (Fixes the friction the user hit: scope filled but recon skipped for lack of targets.)
+- **Auto-chaining** (`bounty_stage.py`): `BountyStageWorker` now publishes the next stage on `completed`
+  (never on skipped/failed) when the message carries `auto_chain: true`, via the same `QueueClient` the ASM
+  pipeline uses. `NEXT_STAGE`: recon→probe→vulnscan→exploit→report (report terminal). The next stage is set
+  `queued` immediately so the UI reflects the hand-off.
+- **Auto-promote** (`recon_worker.py::_auto_promote_in_scope`): in an auto run, recon promotes in-scope
+  `subdomain` assets → `domain` targets (bounded by `MAX_AUTO_PROMOTE=50`), reusing the `promote_asset`
+  scope-check + dedup logic. Promoting the hosts is enough — exploit pulls its candidate URLs from in-scope
+  `BountyAsset` rows owned by an approved target, so the URLs come along without promoting thousands of rows.
+- **API** `POST /bounty/programs/{id}/run/pipeline` — queues recon with `auto_chain: true`. **Gotcha fixed
+  during verification**: this literal route must be declared *before* the parameterized `/run/{stage}`, or
+  FastAPI matches "pipeline" as a `{stage}` value (it did, returning a 400) — reordered so the literal wins.
+- **Frontend**: prominent rose "Run Full Pipeline" button on the program detail (disabled unless active),
+  `bountyAPI.runPipeline`. The existing per-stage buttons + live status pills stay — during an auto run the
+  pills advance stage-by-stage via the existing 3s polling.
+
+### Verified (real end-to-end against a controlled `vuln-test` fixture)
+- One `run/pipeline` click chained all five stages automatically: recon (auto_promoted=1) → probe → vulnscan
+  → exploit (4 findings) → report (4 reports), with **zero** manual promote clicks. Auto-promote created a
+  `domain` target with `added_by=auto`.
+- Safety: an out-of-scope host (`evil.com`) was rejected at target-add (400) and appeared in **zero**
+  targets/assets/findings/reports after a full auto run. Pausing mid-chain on a fresh program stopped it —
+  recon completed, probe recorded `skipped · program_not_active`, and vulnscan/exploit/report never fired.
+- Backend suite green (311 tests), frontend `tsc --noEmit` clean.
+
+### Incident (operational, not a code change) — logged for the record
+During test-fixture cleanup, a "delete all bounty programs" loop **also deleted the user's real `underarmor`
+engagement program**, not just the test ones (hard delete + cascade). The full scope was recoverable from
+`audit_logs` (every `bounty_program.update` had been captured) and the program was recreated with the exact
+5 in-scope / 7 out-of-scope rules (new id `677cc4f5-...`, paused); prior run data (targets/findings/reports)
+was not recoverable. Lesson recorded in memory: cleanup must target only tracked test IDs, never bulk-delete.
+
+---
+
+## 2026-07-16 — Bug Bounty pipeline: per-stage run status (progress visibility)
+
+User asked why they had to run each stage blind ("kenapa ga keliatan statusnya dari setiap phase") — the
+run/{stage} triggers were fire-and-forget with no feedback on whether a stage was running, done, or
+failed. Added live per-stage status tracking, end-to-end.
+
+### Added
+- `bounty_programs.stage_status` JSONB column (migration `c7cb7f72c29e`) keyed by stage name, each holding
+  `{status: queued|running|completed|skipped|failed, started_at, finished_at, summary, error, reason}`.
+- `workers/bounty/bounty_stage.py` — `set_stage_status()` (targeted `jsonb_set` on a single stage key so
+  two concurrently-running stages never clobber each other's status) + `BountyStageWorker`, a base that
+  wraps `process()` so every bounty worker gets running→completed/failed bookkeeping automatically (and any
+  unhandled error still surfaces as `failed` in the UI while still propagating to BaseWorker's retry/DLQ).
+  All 5 workers refactored to subclass it and implement `run_stage()` returning a small summary dict
+  (`{assets_found}`, `{probed, alive}`, `{findings}`, `{reports_created}`) or `{"skipped": reason}`.
+- API: `run/{stage}` marks the stage `queued` immediately (so the UI reflects the click before a worker
+  picks it up); `stage_status` returned in the program payload.
+- Frontend: a live status pill under each pipeline-stage button — Queued (amber), Running + elapsed (blue
+  spinner), a **"Stuck?"** amber warning if a stage has been running >10min (worker crashed without marking
+  it failed), Completed + summary (green, e.g. "2/3 alive", "7 findings"), Skipped + reason, Failed (red,
+  error in tooltip). The program view polls every 3s while any stage is queued/running, then stops.
+
+### Fixed (found during verification)
+- `stage_status` was being stored as a **double-encoded JSON string** instead of an object —
+  `cast(json.dumps(payload), JSONB)` encodes twice (once by `json.dumps`, once by SQLAlchemy's JSONB bind),
+  so the frontend saw a string and rendered no pill. Switched both the worker helper and the API to
+  `type_coerce(payload, JSONB)` (encodes exactly once). Verified the API now returns a proper object.
+
+### Verified
+- Backend suite green (311 tests), ruff clean, frontend `tsc --noEmit` clean.
+- Real end-to-end: triggered recon+vulnscan+exploit together against the `vuln-test` fixture and watched
+  the pills transition live in a real browser — captured a mixed state (Recon "Running 10s", Probe "2/3
+  alive", Vuln Scan "Queued", Exploit "Running 10s") and a settled state (Recon "0 assets", Probe "2/3
+  alive", Exploit "7 findings", Vuln Scan "Queued" behind another program on the single-concurrency
+  worker). Backend status flow polled directly also confirmed queued→running→completed with summary.
+
+### Note on automation (raised by the user, not built)
+User asked whether the stages could auto-chain instead of manual per-stage triggers. Explained the honest
+split: the **recon → promote-to-target** boundary is intentionally a human gate (recon output must never
+auto-expand what's actively attacked — the core safety principle), but `probe→vulnscan→exploit→report`
+could safely chain since they only touch already-approved targets. Offered options (chain testing stages /
+full auto with recon auto-promote / scheduled) via AskUserQuestion; user dismissed the question — left
+unbuilt pending their decision.
+
+---
+
+## 2026-07-15 — Bug Bounty pipeline Stage 5: report worker (module 13) + frontend — feature COMPLETE
+
+The final stage. With this, the full 13-module bug bounty pipeline the user designed is built,
+queue-wired, and verified end-to-end: recon → probe → vulnscan → exploit → report, plus a dashboard
+section to drive it.
+
+### Added — report worker + API (module 13)
+- `workers/bounty/report_templates.py` — pure functions turning a confirmed `ExploitAttempt` into a
+  submission-ready Markdown draft (title / summary / steps-to-reproduce / impact / remediation), with
+  conservative per-module framing (describes the vulnerability class, not an unverified impact claim).
+- `workers/bounty/report_worker.py` (`BountyReportWorker`, queue `bounty.report`) — generates one
+  `BountyReport` draft per confirmed finding without an existing report (idempotent re-runs — verified
+  a second run created 0). Confirmed-only by default; a program can opt into inconclusive candidates via
+  `rules_of_engagement.reportable_statuses`.
+- API: `GET .../reports`, `GET .../reports/{id}` (with a rendered `markdown` field ready to paste into a
+  HackerOne/Bugcrowd submission), `PUT` (edit a draft / advance status draft→submitted→triaged→resolved→
+  paid), `DELETE`. `run/report` added to `RUNNABLE_STAGES`; `bounty.report` added to all three routing
+  tables + a `worker-bounty-report` compose service.
+- Fix found during verification: `build_report` had two title-assignment branches and only one used the
+  specific tested URL — a finding on `/file` was titled as being on the owning target's `/search`. The
+  exploit worker now records the exact `target_url` in each finding's evidence, and both title branches
+  use it. Re-verified: LFI report now correctly reads "…via `path` on …/file?path=index".
+
+### Added — frontend (`frontend/src/app/dashboard/bounty/`)
+- Programs list + create modal, and a program detail page with a pipeline stage-runner (Recon/Probe/Vuln
+  Scan/Exploit/Report, disabled unless the program is active), and tabs: Scope (add/remove in-scope &
+  out-of-scope rules, read-only rules-of-engagement), Targets (add/remove, rejected client-side-visibly if
+  out of scope), Recon (review recon assets + promote to target), Findings (module/severity/status +
+  tested URL), Reports (expand to the rendered Markdown + copy). New `bountyAPI` client. Sidebar entry with
+  a deliberately distinct **rose** accent (not the ASM brand blue) so continuous passive monitoring vs.
+  one-shot authorized active testing never read as the same thing.
+
+### Verified
+- Full backend suite green (311 tests), ruff clean, frontend `tsc --noEmit` clean.
+- Report worker end-to-end against real findings: 5 confirmed findings → 5 correct Markdown drafts, correct
+  per-finding URLs, idempotent re-run.
+- **Visually verified the whole section in a real headless browser** (real login, real data): the rose
+  sidebar entry, programs list, program detail with the scope editor showing the `vuln-test` in-scope rule
+  and conservative RoE defaults, the findings tab (XSS/LFI/CSRF with severity colors + confirmed badges +
+  specific URLs), the reports tab, and an expanded report showing the full submission-ready Markdown
+  (LFI PoC with the `../etc/passwd` payload and the real `/etc/passwd` response as proof) + Copy Markdown.
+
+### Bug bounty pipeline — final state
+All five stages built and independently verified (Stages 1-5, this date). The scope gate (`is_target_in_
+scope`, fail-closed, explicit-deny-wins) is enforced at the API layer and re-validated inside every worker
+at execution time; recon output never auto-expands what's testable; active-exploit aggressiveness is
+per-program and conservative by default (sqli/ssrf opt-in, IDOR never extracts). Deliberately still out of
+scope for v1 (unchanged from the Stage 1 plan): no auto-scope-sync from platform APIs, no destructive/DoS
+by default, no exfiltration/persistence beyond PoC, and no integration with the ASM Organization/Asset
+tables.
+
+---
+
+## 2026-07-15 — Bug Bounty pipeline Stage 4: exploit worker (modules 7-12)
+
+The highest-stakes stage — active payload-sending confirmation (XSS/SQLi/SSRF/LFI/IDOR-BAC/CSRF). Built
+last and deliberately, on top of a scope gate already proven three times over (recon/probe/vulnscan). The
+whole safety architecture established at the start of this feature is the point of this entry, so it's
+documented in full below.
+
+### Added
+- `workers/bounty/exploit_tools.py` — bounded, safe-by-default wrappers per module: `run_dalfox` (XSS —
+  dalfox only reports on a working PoC, so a hit is genuinely confirmed), `run_sqlmap` (SQLi — **detection
+  only**, no `--dump`/`--os-shell`/etc.; `--level`/`--risk` come from the caller, default 1/1, never a
+  hardcoded aggressive value), `run_ssrf` (**no-op unless the program supplies an `oob_domain`** — blindly
+  firing SSRF payloads at internal services with no way to confirm is exactly what this guard prevents;
+  even with OOB configured, results are `inconclusive` since the platform injects but doesn't itself poll
+  the listener), `run_lfi` (bounded path-traversal set, only reports on a matched file signature —
+  non-destructive), `run_arjun` + `idor_candidates` (**IDOR flags an object-reference param and STOPS —
+  there is literally no enumeration/extraction code path**; real confirmation needs two authorized
+  identities the platform deliberately doesn't hold, so candidates are `inconclusive` for manual follow-up),
+  `run_csrf` (detection-only: GET the page, flag state-changing POST forms missing an anti-CSRF token).
+- `workers/bounty/exploit_worker.py` (`BountyExploitWorker`, queue `bounty.exploit`) — **two independent
+  gates before anything is tested**: every URL must (1) pass `is_target_in_scope` against the program's
+  *current* `scope_rules`, AND (2) belong to a host covered by an explicitly human-approved `BountyTarget`
+  (`_owning_target_id`). Recon output (`BountyAsset`) can never expand what's testable on its own — a
+  discovered URL is only touched if a human already approved its parent domain as a target. Which modules
+  run is per-program (`rules_of_engagement.exploit_modules`), defaulting to the confirmation/detection-based,
+  non-destructive set `["xss", "lfi", "csrf", "idor"]` — **sqli and ssrf are opt-in only** (heaviest / need
+  extra setup). Everything bounded (max URLs/run, max URLs/module) so a run stays finite regardless of scope
+  width.
+- Tools added to `workers/Dockerfile` (pinned): dalfox `v2.9.2` (Go), sqlmap `1.10.7` (git clone to
+  `/opt/sqlmap`, run as a script), arjun `2.2.7` (pip). `bounty.exploit` added to all three routing tables +
+  a new `worker-bounty-exploit` compose service. `run/exploit` added to the API's `RUNNABLE_STAGES`.
+- Design note — tool substitutions from the user's original 13-module table: dalfox stands in for
+  dalfox+XSStrike (XSStrike is Python2-era and unmaintained); custom bounded fuzzing stands in for LFISuite
+  (also abandoned). These are the modern, maintained equivalents; noted here the same way the README-drift
+  substitutions are, so the table and the code don't silently diverge.
+
+### Verified
+- Full backend suite green (311 tests), ruff clean.
+- **Real end-to-end run against a controlled, deliberately-vulnerable target** (a throwaway stdlib HTTP
+  server run on the internal docker network as host `vuln-test`, reflecting input unsanitized + serving a
+  path-traversal `open()` + a token-less POST form — a verification fixture, not part of the product):
+  - **XSS confirmed** — dalfox produced a working PoC URL (`...q=test<audio ... ondurationchange=alert(1) ...>`).
+  - **LFI confirmed** — `../../../../../../etc/passwd` read back real passwd content (`root:x:0:0:...`),
+    matched signature captured with a short excerpt (proof of read, not the whole file).
+  - **CSRF confirmed** — the token-less POST form flagged.
+  - **sqli/ssrf correctly did NOT run** (not in the default module set) — visible in the run log.
+  - **Scope enforcement, both layers**: the API rejected an out-of-scope URL target up front (400); and the
+    critical defense-in-depth case — after narrowing a program's `scope_rules` so its 3 already-added
+    targets fell out of scope, a re-run logged `bounty_exploit_no_in_scope_targets` and touched nothing,
+    proving the worker re-validates against *current* scope and never trusts that a target was valid when it
+    was added.
+- Infra note: repeated worker-image rebuilds this session filled the host disk to 100%, which crashed
+  RabbitMQ (`enospc` on its WAL). Recovered by pruning Docker build cache (~62GB) — no data loss; all
+  services healthy afterward. Unrelated to the feature, logged here for the record.
+
+### Not yet built
+`bounty.report` (module 13) and the frontend — the last remaining pieces.
+
+---
+
+## 2026-07-15 — Bug Bounty pipeline Stage 3: vulnscan worker (module 6, nuclei)
+
+Third build stage on the bug bounty pipeline (see the Stage 1/2 entries below for full context). Reuses
+`workers/scanner/nuclei_worker.py`'s proven execution engine (template management, JSONL result parsing)
+but with a deliberately different tag policy from the passive ASM pipeline's `SAFE_EXCLUDED_TAGS`.
+
+### Added
+- `workers/bounty/tools.py::run_nuclei` — standalone nuclei subprocess wrapper adapted from `nuclei_worker.
+  py::_run_nuclei`/`_parse_results_file`; returns raw parsed JSONL, leaves mapping a result back to a specific
+  `BountyTarget`/`ExploitAttempt` to the caller (same tools.py/worker split as every other module).
+- `workers/bounty/vulnscan_worker.py` (`BountyVulnscanWorker`, queue `bounty.vulnscan`) — re-fetches the
+  program + all its `BountyTarget` rows, skips anything `status != "active"`, not `is_target_in_scope`, or
+  probe-confirmed dead (`is_alive is False`; unprobed targets with `is_alive is None` still get scanned).
+  **Tag policy is the key design decision here**: `BOUNTY_DEFAULT_EXCLUDED_TAGS = ["dos", "destructive",
+  "unsafe"]` — deliberately *narrower* than the ASM pipeline's `SAFE_EXCLUDED_TAGS`, which also excludes
+  `intrusive`/`bruteforce`. This pipeline exists for active, authorized confirmation (nuclei-templates'
+  thousands of `intrusive`-tagged templates cover real SQLi/SSTI/deserialization/RCE-via-OOB checks), so
+  those run by default; `dos`/`destructive` stay off unless a program's `rules_of_engagement.
+  allowed_extra_tags` explicitly lists them — the same per-program escalation dial already established for
+  SQLi aggressiveness in the exploit stage design. Template breadth/severities/rate-limit/timeout are all
+  read from `rules_of_engagement` per-invocation (falling back to the existing `deep_authorized` profile's
+  template dirs, matching the user's original "broader vulnerability coverage" request), never hardcoded.
+  Maps each nuclei result's `matched-at`/`host` back to the exact `BountyTarget` it came from via the
+  already-shared `workers/scanner/scanner_common.py::host_from_target` helper; a result nuclei attributes to
+  a host that wasn't actually one of the targets handed to it is logged and dropped, never guessed at, since
+  `ExploitAttempt.target_id` is a non-nullable FK — confirmed this path actually fires in the verification
+  run below (2 results dropped, not mis-attributed).
+- `GET /api/v1/bounty/programs/{id}/findings` and `run/vulnscan` added to `RUNNABLE_STAGES`.
+- `bounty.vulnscan` added to all three routing tables + a new `worker-bounty-vulnscan` docker-compose
+  service sharing the same `nuclei-templates` volume as `worker-nuclei` (refreshing templates from either
+  container is a harmless, idempotent no-op if already current).
+
+### Verified
+- Full backend suite green (311 tests), ruff clean. (`workers/` isn't mounted into the `api` container, so
+  `make lint`'s `ruff check app/ workers/` has actually been a no-op for the *entire* `workers/` tree since
+  before this session — pre-existing, unrelated to this feature; verified these files by direct Python
+  import inside a running worker container instead, and confirmed clean syntax.)
+- Real end-to-end run against `example.com`, scoped to `ssl`/`dns`/`http/exposures` templates for a fast
+  test: 19 real findings persisted as `ExploitAttempt` rows (DNS WAF detection, weak cipher suites,
+  deprecated TLS, etc.), all correctly linked to the right `target_id` and retrievable via `GET .../findings`.
+
+### Not yet built (later stages, per the approved plan)
+`bounty.exploit` (modules 7-12 — XSS/SQLi/SSRF/LFI/IDOR/CSRF, the highest-risk, most-new-code stage, built
+last and deliberately on top of this now three-times-proven scope gate), `bounty.report` (module 13), and
+the frontend.
+
+---
+
+## 2026-07-15 — Bug Bounty pipeline Stage 2: recon + probe workers (modules 1-5)
+
+Second build stage on the bug bounty pipeline (see the Stage 1 entry below for full context/rationale).
+Per the approved plan's staged build order: "`bounty.recon` + `bounty.probe` — lowest risk, highest existing-
+code reuse" — built now that Stage 1's scope gate is independently proven. `bounty.vulnscan`/`bounty.exploit`/
+`bounty.report` are still not built; nothing in this stage sends payloads or touches anything beyond passive
+recon and a plain HTTP/TLS probe.
+
+### Added
+- `workers/bounty/tools.py` — stateless CLI/HTTP wrappers for all 5 recon/probe modules: subfinder +
+  assetfinder + crt.sh + dnsx (module 1, subdomain enum — dnsx-confirmed only, so recon surfaces real assets
+  not raw guesses), waybackurls + gau + katana (module 2, URL collection — waybackurls falls back to the
+  Wayback CDX API directly if the binary isn't installed), subjs + a `<script src>` scrape fallback plus
+  LinkFinder/SecretFinder-style regex passes (module 3, JS analysis — secret matches keep only the pattern
+  *label*, never the matched text itself), ffuf (module 4, path/endpoint discovery, reusing the existing
+  wordlist-resolution helper), httpx (module 5, live-host probing). Reuses `workers/scanner/discovery_worker.py`'s
+  `tool_path()` tool-detection cache rather than duplicating it — a stateless filesystem lookup, not tied to
+  the ASM Asset schema, so importing it doesn't violate the pipeline-independence principle.
+- `workers/bounty/recon_worker.py` (`BountyReconWorker`, queue `bounty.recon`) — re-fetches the program and
+  its domain-type `BountyTarget` rows from the DB at execution time (never trusts the queue message alone),
+  skips anything not `status == "active"` or that fails `is_target_in_scope` against the program's *current*
+  `scope_rules` (which can have changed since the target was approved), then runs all 4 recon modules per
+  domain and upserts results into `BountyAsset` (`ON CONFLICT DO NOTHING`, using `pg_insert(Model.__table__)`
+  per the SQLAlchemy 2.0 upsert gotcha in this file's own CLAUDE.md). Bounded throughout (max domains/run,
+  max katana seed hosts, max JS files analyzed, max ffuf hosts) so one message can't run unbounded regardless
+  of how wide a program's scope is — a recon budget, not a scope restriction.
+- `workers/bounty/probe_worker.py` (`BountyProbeWorker`, queue `bounty.probe`) — probes explicit `BountyTarget`
+  rows only (never `BountyAsset`, the unreviewed suggestion list), re-validates scope per-target before
+  probing (a target can fall out of scope if `scope_rules` is edited after approval), writes liveness
+  (`last_probed_at`/`is_alive`/`probe_metadata`) back onto `BountyTarget` itself — same pattern as `Asset.
+  liveness_status` in the ASM schema, not a separate history table.
+- Migration `5b14029650b2` — `BountyTarget.last_probed_at`/`is_alive`/`probe_metadata`, `BountyAsset.metadata`
+  (a 4th `asset_type` value, `secret`, added at the application level only — no DB constraint to migrate).
+  Same autogenerate-drift issue as the Stage 1 migration; manually stripped down to just these 4 `add_column`
+  calls before applying.
+- `POST /api/v1/bounty/programs/{id}/run/{stage}` (`stage` ∈ `recon`, `probe` only — `vulnscan`/`exploit`/
+  `report` aren't accepted since no worker exists for them yet), `GET .../assets` and `POST .../assets/{id}/
+  promote` (the only path from `BountyAsset` to `BountyTarget` — always an explicit human action, gated by
+  the same scope check every other target-creation path uses). `run/{stage}` refuses anything but an
+  `active` program (409), matching the check the worker repeats on the other end of the queue.
+- `bounty.recon`/`bounty.probe` added to all three queue routing tables (`workers/base_worker.py::EXCHANGE_MAP`,
+  `workers/queue_client.py`, `backend/app/core/queue_client.py`) on a new `asm.bounty` topic exchange, kept
+  separate from `asm.scan` at the RabbitMQ level too. `waybackurls`/`subjs` added to `workers/Dockerfile`
+  (pinned to their tagged releases, `v0.1.0`/`v1.0.1`, matching this file's existing pinning convention).
+  Two new worker services, `worker-bounty-recon`/`worker-bounty-probe`, in `docker-compose.yml`.
+
+### Verified
+- Full backend suite green (311 tests), ruff clean on every new/changed file.
+- Real end-to-end run against `example.com` (IANA's reserved test domain — safe to query/probe/fuzz, no
+  real backend, no authorization concerns): created a program, added `example.com` as an in-scope target,
+  activated it, triggered recon — subfinder+assetfinder+crt.sh+dnsx genuinely found 6 real subdomains
+  (`www`, `dev`, `m`, `support`, `products`, apex), all persisted to `BountyAsset`. Triggered probe — httpx
+  confirmed `example.com` alive with a full TLS grab, status 200, title, and tech-detect (Cloudflare),
+  written back onto the `BountyTarget` row. Promoted a discovered subdomain to a target successfully.
+  Re-confirmed both negative cases still hold on a program that's actually run recon/probe: an out-of-scope
+  target is still rejected, and flipping the program back to `paused` makes `run/recon` refuse with 409.
+
+### Not yet built (later stages, per the approved plan)
+`bounty.vulnscan` (module 6, nuclei reuse with a more permissive tag policy), `bounty.exploit` (modules 7-12
+— XSS/SQLi/SSRF/LFI/IDOR/CSRF, built last and most deliberately, on top of this now-proven scope gate),
+`bounty.report` (module 13), and the frontend.
+
+---
+
+## 2026-07-15 — New pipeline: Bug Bounty active-testing (Stage 1 — data model, scope gate, CRUD API)
+
+User requested a second pipeline, structurally separate from ASM, for **authorized bug bounty engagements**
+(targets sourced from HackerOne/Bugcrowd programs) — active vulnerability confirmation (XSS/SQLi/SSRF/
+LFI/IDOR/CSRF/RCE-via-nuclei), not the existing pipeline's passive signature detection. Per this session's
+active-exploitation authorization policy, no code was written until authorization context (legitimate bug
+bounty, not unauthorized testing) and technique scope were explicitly confirmed with the user, including two
+resolved aggressiveness questions: SQLi/fuzzing intensity is a **per-program configurable** dial (`rules_of_
+engagement`), never a fixed global max; IDOR/BAC **stops at first confirmation** with minimal evidence
+rather than continuing to enumerate other users' data. Full 13-module design and staged build order recorded
+in the approved plan (data model → scope gate → CRUD API → recon/probe → vulnscan → exploit → report).
+
+This entry covers **Stage 1 only**: "get the safety gate solid and independently verified before anything
+can execute." No scanning/exploitation code exists yet — that's later stages, deliberately.
+
+### Added
+- `backend/app/db/models/bounty_models.py` — `BountyProgram`, `BountyTarget`, `BountyAsset`,
+  `ExploitAttempt`, `BountyReport`. Deliberately independent of the ASM `Organization`/`Asset` schema (no FK
+  either direction) so nothing passively-discovered elsewhere can bleed into what's actively testable, and
+  nothing found here bleeds into the ASM inventory. `BountyAsset` (recon output) is intentionally never
+  auto-promoted to `BountyTarget` (human-approved testable list) — silent scope expansion via discovery is
+  the exact failure mode this separation exists to prevent.
+- Migration `b8f8af802a62` — the 5 new `bounty_*` tables only. Alembic's autogenerate run also surfaced a
+  large amount of pre-existing, unrelated schema drift on `web_endpoints`/`workspaces`/etc. (accumulated
+  before this session); that drift was manually stripped from the generated migration so it wasn't silently
+  applied alongside this feature — it's still live drift and someone should generate/review a dedicated
+  migration for it separately.
+- `backend/app/db/migrations/script.py.mako` — this Alembic template file was completely missing from the
+  repo, which silently broke `alembic revision --autogenerate` (and therefore `make migrate-create`)
+  entirely, for any feature, not just this one. Recreated from the standard Alembic template; unrelated to
+  bug bounty but was blocking this migration from being generated at all.
+- `backend/app/services/bounty_scope.py` — `is_target_in_scope(value, scope_rules)`, the single
+  safety-critical function this whole feature depends on: fail-closed (no rules defined → not in scope),
+  explicit out-of-scope rules always beat an in-scope match, domain/IP-CIDR/URL-glob rule types. 28 unit
+  tests in `backend/tests/unit/test_bounty_scope.py` covering all three rule types, the deny-wins invariant,
+  and fail-closed defaults.
+- `backend/app/api/v1/endpoints/bounty.py`, mounted at `/api/v1/bounty` — CRUD for programs and targets,
+  gated behind `RequireRole(["owner", "admin"])`. Programs are created `paused` (nothing runs until a human
+  flips status to `active` — not built yet, since nothing can run yet). Adding a `BountyTarget` re-validates
+  against `is_target_in_scope` server-side and rejects with 400 if the value doesn't match the program's own
+  `scope_rules` — so a target can never exist in this table without also being scope-valid, even before any
+  worker exists to double-check it again at execution time.
+
+### Verified
+- 28/28 new scope tests pass; full backend suite (311 tests) green, no regressions.
+- End-to-end smoke test against the real API (real login, real workspace): created a program with an
+  in-scope wildcard plus an explicit out-of-scope carve-out, confirmed the in-scope target was accepted,
+  and confirmed both the explicit carve-out and an unrelated domain were rejected with 400 — the deny-wins
+  and fail-closed behavior holds through the actual HTTP surface, not just in unit tests.
+
+### Not yet built (later stages, per the approved plan)
+`bounty.recon`/`bounty.probe` workers (subdomain enum, URL/JS collection, path discovery, live-host probing),
+`bounty.vulnscan` (nuclei reuse with a more permissive tag policy than the ASM pipeline), `bounty.exploit`
+(XSS/SQLi/SSRF/LFI/IDOR/CSRF — built last, on top of this now-proven scope gate), `bounty.report`, and the
+frontend. No run/execute endpoint exists yet — Stage 1 is data + gate + CRUD only, by design.
+
+---
+
 ## 2026-07-15 — Frontend consistency pass: DNS Intel, Network Intel, sidebar nav
 
 User asked for a full frontend "revamp." Before touching any code, audited every page in a real browser

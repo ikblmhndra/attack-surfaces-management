@@ -45,7 +45,8 @@ export default function LoginPage() {
       const meResp = await authAPI.me();
 
       login(access_token, refresh_token, meResp.data);
-      router.push("/dashboard");
+      const products: string[] = meResp.data.enabled_products || ["asm"];
+      router.push(products.includes("asm") ? "/dashboard" : "/dashboard/bounty");
     } catch (err: any) {
       const status = err.response?.status;
       const detail = err.response?.data?.detail;

@@ -39,6 +39,13 @@ from app.db.models.models import (
     ThreatIntel,
     AssetRelationship,
 )
+from app.db.models.bounty_models import (
+    BountyProgram,
+    BountyTarget,
+    BountyAsset,
+    ExploitAttempt,
+    BountyReport,
+)
 
 __all__ = [
     "Base", "Workspace", "User", "APIKey", "AuditLog",
@@ -47,4 +54,5 @@ __all__ = [
     "ScanTargetSelection", "DiscoveredAsset", "OutboxEvent",
     "NotificationRule", "Notification", "Screenshot", "ThreatIntel",
     "WebEndpoint", "AssetRelationship",
+    "BountyProgram", "BountyTarget", "BountyAsset", "ExploitAttempt", "BountyReport",
 ]

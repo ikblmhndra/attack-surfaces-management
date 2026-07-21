@@ -248,6 +248,64 @@ require_admin   = RequireMinRole("admin")
 require_owner   = RequireRole(["owner"])
 
 
+# ── Product entitlement enforcement ───────────────────────────
+
+class RequireProduct:
+    """
+    Dependency factory for per-workspace product entitlement (ASM vs Bug
+    Bounty vs both -- chosen once at registration, see
+    Workspace.enabled_products). Complements RBAC (role), doesn't replace
+    it: a workspace not entitled to a product gets 403 regardless of the
+    requesting user's own role within it. Meant for router-level wiring
+    (`include_router(..., dependencies=[Depends(require_bounty_product)])`)
+    so an entire product's endpoint surface is gated in one place rather
+    than every individual endpoint.
+
+    A JWT bearer token carries its workspace's product list as a claim (set
+    at register/login/refresh -- see auth.py) so the common path costs no
+    extra query. An API key token doesn't carry that claim (it's long-
+    lived, so trusting a claim embedded at issue time would go stale if the
+    workspace's entitlement changes later) -- falls back to a fresh DB
+    lookup in that case.
+
+    Usage:
+        require_bounty_product = RequireProduct("bounty")
+
+        api_router.include_router(bounty.router, dependencies=[Depends(require_bounty_product)])
+    """
+
+    def __init__(self, product: str):
+        self.product = product
+
+    async def __call__(
+        self,
+        payload: dict = Depends(get_token_payload),
+        db: AsyncSession = Depends(get_db),
+    ) -> dict:
+        products = payload.get("products")
+        if products is None:
+            result = await db.execute(
+                select(Workspace.enabled_products).where(Workspace.id == payload.get("wid"))
+            )
+            products = result.scalar_one_or_none() or []
+        if self.product not in products:
+            log.warning(
+                "product_access_denied",
+                workspace_id=payload.get("wid"),
+                required_product=self.product,
+                enabled_products=products,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"This workspace isn't enabled for '{self.product}'. Enabled: {', '.join(products) or 'none'}",
+            )
+        return payload
+
+
+require_asm_product = RequireProduct("asm")
+require_bounty_product = RequireProduct("bounty")
+
+
 # ── Workspace isolation check ─────────────────────────────────
 
 async def verify_workspace_access(

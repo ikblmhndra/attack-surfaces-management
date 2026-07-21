@@ -147,6 +147,26 @@ services:
     cap_add:
       - NET_RAW
 
+  worker-bounty-recon:
+    <<: *worker-base
+    command: python -m workers.bounty.recon_worker
+    environment:
+      <<: *common-env
+      WORKER_TYPE: bounty-recon
+      BOUNTY_RECON_CONCURRENCY: ${BOUNTY_RECON_CONCURRENCY:-2}
+    cap_add:
+      - NET_RAW
+
+  worker-bounty-probe:
+    <<: *worker-base
+    command: python -m workers.bounty.probe_worker
+    environment:
+      <<: *common-env
+      WORKER_TYPE: bounty-probe
+      BOUNTY_PROBE_CONCURRENCY: ${BOUNTY_PROBE_CONCURRENCY:-2}
+    cap_add:
+      - NET_RAW
+
   worker-port:
     <<: *worker-base
     command: python -m workers.scanner.port_worker
@@ -199,6 +219,42 @@ services:
       - nuclei-templates:/root/nuclei-templates
     cap_add:
       - NET_RAW
+
+  worker-bounty-vulnscan:
+    <<: *worker-base
+    command: python -m workers.bounty.vulnscan_worker
+    environment:
+      <<: *common-env
+      WORKER_TYPE: bounty-vulnscan
+      NUCLEI_TEMPLATES_PATH: /root/nuclei-templates
+      BOUNTY_VULNSCAN_CONCURRENCY: ${BOUNTY_VULNSCAN_CONCURRENCY:-1}
+      BOUNTY_NUCLEI_RATE_LIMIT: ${BOUNTY_NUCLEI_RATE_LIMIT:-100}
+    volumes:
+      - ./workers:/app/workers
+      - ./backend/app:/app/app:ro
+      - worker-tmp:/tmp/asm-scans
+      - nuclei-templates:/root/nuclei-templates
+    cap_add:
+      - NET_RAW
+
+  worker-bounty-exploit:
+    <<: *worker-base
+    command: python -m workers.bounty.exploit_worker
+    environment:
+      <<: *common-env
+      WORKER_TYPE: bounty-exploit
+      BOUNTY_EXPLOIT_CONCURRENCY: ${BOUNTY_EXPLOIT_CONCURRENCY:-1}
+      SQLMAP_PATH: /opt/sqlmap/sqlmap.py
+    cap_add:
+      - NET_RAW
+
+  worker-bounty-report:
+    <<: *worker-base
+    command: python -m workers.bounty.report_worker
+    environment:
+      <<: *common-env
+      WORKER_TYPE: bounty-report
+      BOUNTY_REPORT_CONCURRENCY: ${BOUNTY_REPORT_CONCURRENCY:-2}
 
   worker-scanner:
     <<: *worker-base

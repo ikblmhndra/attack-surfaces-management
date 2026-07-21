@@ -85,6 +85,11 @@ class BaseWorker(ABC):
         "notify.send":         ("asm.notify", aio_pika.ExchangeType.TOPIC),
         "enrich.assets":       ("asm.enrich", aio_pika.ExchangeType.DIRECT),
         "asset.validate":      ("asm.asset", aio_pika.ExchangeType.DIRECT),
+        "bounty.recon":        ("asm.bounty", aio_pika.ExchangeType.TOPIC),
+        "bounty.probe":        ("asm.bounty", aio_pika.ExchangeType.TOPIC),
+        "bounty.vulnscan":     ("asm.bounty", aio_pika.ExchangeType.TOPIC),
+        "bounty.exploit":      ("asm.bounty", aio_pika.ExchangeType.TOPIC),
+        "bounty.report":       ("asm.bounty", aio_pika.ExchangeType.TOPIC),
     }
 
     def __init__(self):

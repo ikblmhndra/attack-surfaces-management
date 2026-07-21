@@ -14,20 +14,28 @@ import { useWorkspaceStore } from "@/store/workspace";
 import { cn } from "@/lib/utils";
 import { SeverityBadge } from "@/components/ui/SeverityBadge";
 
-export function DashboardHeader() {
+interface DashboardHeaderProps {
+  variant?: "asm" | "bounty";
+}
+
+export function DashboardHeader({ variant = "asm" }: DashboardHeaderProps) {
   const router = useRouter();
   const qc = useQueryClient();
   const { user, activeOrg, setActiveOrg, logout } = useWorkspaceStore();
+  const isBounty = variant === "bounty";
 
   const [orgDropdownOpen, setOrgDropdownOpen] = useState(false);
   const [notifOpen, setNotifOpen] = useState(false);
   const [userMenuOpen, setUserMenuOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
 
-  // Fetch organizations
+  // Organizations are an ASM-only concept (/organizations is gated behind
+  // RequireProduct("asm") server-side) -- skip the query entirely on a
+  // bounty-only workspace rather than firing a request that can only 403.
   const { data: orgs } = useQuery({
     queryKey: ["organizations", "dropdown"],
     queryFn: () => apiClient.get("/organizations?page_size=50").then(r => r.data),
+    enabled: !isBounty,
   });
 
   // Fetch unread notifications
@@ -73,7 +81,8 @@ export function DashboardHeader() {
   return (
     <header className="h-14 border-b border-border bg-surface-900/80 backdrop-blur-sm flex items-center px-4 gap-3 sticky top-0 z-30">
 
-      {/* Org selector */}
+      {/* Org selector -- an ASM-only concept, not shown on the Bug Bounty shell */}
+      {!isBounty && (
       <div className="relative" data-dropdown>
         <button
           onClick={() => setOrgDropdownOpen(!orgDropdownOpen)}
@@ -138,6 +147,7 @@ export function DashboardHeader() {
           )}
         </AnimatePresence>
       </div>
+      )}
 
       {/* Search */}
       <form onSubmit={handleSearch} className="flex-1 max-w-md">
@@ -146,7 +156,7 @@ export function DashboardHeader() {
           <input
             value={searchQuery}
             onChange={e => setSearchQuery(e.target.value)}
-            placeholder="Search assets, findings, CVEs..."
+            placeholder={isBounty ? "Search..." : "Search assets, findings, CVEs..."}
             className="w-full pl-9 pr-4 py-1.5 text-sm bg-surface-800 border border-border rounded-lg
                        text-foreground placeholder:text-muted-foreground
                        focus:outline-none focus:ring-1 focus:ring-brand-500"
@@ -160,8 +170,9 @@ export function DashboardHeader() {
       {/* Right side controls */}
       <div className="flex items-center gap-2 ml-auto">
 
-        {/* Quick scan */}
-        {activeOrg && (
+        {/* Quick scan -- ASM-only; guards against a stale persisted
+            activeOrg surviving a switch to the Bug Bounty shell */}
+        {!isBounty && activeOrg && (
           <button
             onClick={async () => {
               await apiClient.post(`/organizations/${activeOrg.id}/scans`, { scan_type: "quick" });

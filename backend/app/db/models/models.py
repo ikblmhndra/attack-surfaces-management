@@ -57,6 +57,16 @@ class Workspace(TimestampMixin, Base):
     max_assets = Column(Integer, nullable=False, default=1000)
     max_scans_per_day = Column(Integer, nullable=False, default=10)
 
+    # Which product(s) this workspace is entitled to -- chosen once at
+    # registration (a self-serve signup always creates a brand-new
+    # workspace, never joins an existing one, so this is a natural one-time
+    # choice, not a per-user setting). Values: "asm", "bounty". Enforced at
+    # the API layer (RequireProduct, backend/app/api/v1/dependencies/auth.py)
+    # and reflected in the JWT so the frontend can route/gate without an
+    # extra round trip. Existing workspaces predate Bug Bounty entirely, so
+    # they're backfilled to ["asm"] by the migration that adds this column.
+    enabled_products = Column(ARRAY(String), nullable=False, default=lambda: ["asm"])
+
     # Relationships
     users = relationship("User", back_populates="workspace", lazy="selectin")
     organizations = relationship("Organization", back_populates="workspace")

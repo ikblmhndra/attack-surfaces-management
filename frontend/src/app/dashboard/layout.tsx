@@ -13,9 +13,15 @@ import { useQueryClient } from "@tanstack/react-query";
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const pathname = usePathname();
-  const { isAuthenticated, isLoading, sidebarCollapsed, activeOrg } = useWorkspaceStore();
+  const { isAuthenticated, isLoading, sidebarCollapsed, activeOrg, hasProduct } = useWorkspaceStore();
   const queryClient = useQueryClient();
   const wsInitialized = useRef(false);
+
+  // Two fully separate products, two fully separate dashboard shells --
+  // which one renders is a pure function of the route, not a nav choice
+  // inside a shared sidebar. See Sidebar.tsx / Workspace.enabled_products.
+  const isBountyRoute = pathname.startsWith("/dashboard/bounty");
+  const variant = isBountyRoute ? "bounty" : "asm";
 
   // Auth guard
   useEffect(() => {
@@ -23,6 +29,19 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
       router.replace("/auth/login");
     }
   }, [isAuthenticated, isLoading, router]);
+
+  // Product entitlement guard -- UX-side mirror of the API's RequireProduct.
+  // A workspace not entitled to the product this route belongs to gets
+  // redirected to whichever product it IS entitled to (the API would 403
+  // any request anyway; this just avoids showing a broken page first).
+  useEffect(() => {
+    if (isLoading || !isAuthenticated) return;
+    const requiredProduct = isBountyRoute ? "bounty" : "asm";
+    if (!hasProduct(requiredProduct)) {
+      if (hasProduct("asm")) router.replace("/dashboard");
+      else if (hasProduct("bounty")) router.replace("/dashboard/bounty");
+    }
+  }, [pathname, isBountyRoute, isAuthenticated, isLoading, hasProduct, router]);
 
   // WebSocket connection
   useEffect(() => {
@@ -68,13 +87,16 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
   }
 
   if (!isAuthenticated) return null;
+  // Product guard redirect is in flight -- don't flash this route's content
+  // for a workspace that isn't entitled to it.
+  if (!hasProduct(isBountyRoute ? "bounty" : "asm")) return null;
 
   const mainPadding = sidebarCollapsed ? "pl-16" : "pl-56";
 
   return (
     <div className="min-h-screen bg-background">
       {/* Sidebar */}
-      <Sidebar />
+      <Sidebar variant={variant} />
 
       {/* Main content area */}
       <motion.div
@@ -83,7 +105,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
         className="min-h-screen flex flex-col"
       >
         {/* Header */}
-        <DashboardHeader />
+        <DashboardHeader variant={variant} />
 
         {/* Page content */}
         <main className="flex-1 overflow-auto">

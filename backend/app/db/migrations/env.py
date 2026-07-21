@@ -21,6 +21,7 @@ if config.config_file_name is not None:
 # Import all models for autogenerate support
 from app.core.config import settings
 from app.db.models.models import Base
+from app.db.models import bounty_models  # noqa: F401 -- registers bounty_* tables onto Base.metadata
 
 target_metadata = Base.metadata
 

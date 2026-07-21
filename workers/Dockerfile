@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     dnsutils \
     nmap \
     libpcap-dev \
+    tini \
     chromium \
     chromium-driver \
     fonts-liberation \
@@ -47,7 +48,29 @@ RUN go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@v2.14.0
     && go install -v github.com/ffuf/ffuf/v2@v2.1.0 \
     && go install -v github.com/PentestPad/subzy@v1.2.1 \
     && go install -v github.com/tomnomnom/assetfinder@v0.1.1 \
-    && go install -v github.com/owasp-amass/amass/v4/...@v4.2.0
+    && go install -v github.com/owasp-amass/amass/v4/...@v4.2.0 \
+    && go install -v github.com/tomnomnom/waybackurls@v0.1.0 \
+    && go install -v github.com/lc/subjs@v1.0.1 \
+    && go install -v github.com/hahwul/dalfox/v2@v2.9.2 \
+    && go install -v github.com/hakluke/hakrawler@latest \
+    && go install -v github.com/003random/getJS/v2@latest \
+    && go install -v github.com/projectdiscovery/alterx/cmd/alterx@latest
+
+# ── Bug bounty active-exploit tools (pinned) ───────────────────
+# sqlmap runs as a script (invoked via `python /opt/sqlmap/sqlmap.py`), not a
+# packaged binary; arjun is a pip tool. Both are consumed only by the bounty
+# pipeline's exploit worker, which re-validates scope before invoking them.
+RUN git clone --depth 1 --branch 1.10.7 https://github.com/sqlmapproject/sqlmap.git /opt/sqlmap
+ENV SQLMAP_PATH=/opt/sqlmap/sqlmap.py
+
+# ── Extended bug-bounty recon/discovery tools ──────────────────
+# feroxbuster (recursive content discovery) via the official installer; uro
+# (URL dedup), waymore (extra historical URL sources), wafw00f (WAF fingerprint)
+# are pip tools. gf-style URL classification and qsreplace-style payload
+# injection are done in Python (workers/bounty/*), not as binaries -- fewer
+# moving parts and no gf-pattern-repo dependency.
+RUN cd /usr/local/bin && curl -sL https://raw.githubusercontent.com/epi052/feroxbuster/main/install-nix.sh | bash
+RUN pip install --no-cache-dir uro==1.0.2 waymore==8.9 wafw00f==2.4.2
 
 # ── Nuclei templates ───────────────────────────────────────────
 RUN nuclei -update-templates -silent || true
@@ -74,7 +97,9 @@ RUN pip install --no-cache-dir --upgrade pip \
     && ln -sf /go/bin/gau /usr/local/bin/gau \
     && ln -sf /go/bin/ffuf /usr/local/bin/ffuf \
     && ln -sf /go/bin/subzy /usr/local/bin/subzy \
-    && ln -sf /go/bin/nuclei /usr/local/bin/nuclei
+    && ln -sf /go/bin/nuclei /usr/local/bin/nuclei \
+    && ln -sf /go/bin/dalfox /usr/local/bin/dalfox \
+    && pip install --no-cache-dir arjun==2.2.7
 
 # ── tldextract data ────────────────────────────────────────────
 RUN python -c "import tldextract; tldextract.extract('example.com')"
@@ -99,4 +124,9 @@ RUN pip install playwright \
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD find /tmp/worker_heartbeat -mmin -1 2>/dev/null | grep -q . || exit 1
 
+# tini as PID 1: headless Chromium (run_dom_xss, screenshot workers) forks a
+# process tree that's normally reaped by its parent -- without a real init,
+# a killed/crashed browser leaves those as permanent zombies here, since a
+# bare `python -m ...` PID 1 never reaps processes it didn't itself spawn.
+ENTRYPOINT ["tini", "--"]
 CMD ["python", "-m", "workers.discovery_worker"]

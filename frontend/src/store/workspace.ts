@@ -12,6 +12,11 @@ export interface User {
   full_name: string;
   role: "owner" | "admin" | "analyst" | "viewer";
   workspace_id: string;
+  // Which product(s) the user's workspace is entitled to -- "asm" and/or
+  // "bounty", chosen once at registration. See Workspace.enabled_products
+  // (backend/app/db/models/models.py) and RequireProduct (the API-side
+  // enforcement this UI-side check mirrors, not replaces).
+  enabled_products: string[];
   mfa_enabled: boolean;
   last_login?: string;
 }
@@ -40,6 +45,7 @@ interface WorkspaceState {
   // Workspace
   workspaceId: string | null;
   workspaceName: string | null;
+  enabledProducts: string[];
 
   // Active org (selected in UI)
   activeOrg: Organization | null;
@@ -67,6 +73,9 @@ interface WorkspaceState {
   hasRole: (roles: string[]) => boolean;
   canWrite: () => boolean;
   canAdmin: () => boolean;
+
+  // Product entitlement helper (mirrors RequireProduct server-side)
+  hasProduct: (product: string) => boolean;
 }
 
 export const useWorkspaceStore = create<WorkspaceState>()(
@@ -78,6 +87,7 @@ export const useWorkspaceStore = create<WorkspaceState>()(
       isLoading: true,
       workspaceId: null,
       workspaceName: null,
+      enabledProducts: ["asm"],
       activeOrg: null,
       sidebarCollapsed: false,
       theme: "dark",
@@ -100,6 +110,7 @@ export const useWorkspaceStore = create<WorkspaceState>()(
           isAuthenticated: true,
           isLoading: false,
           workspaceId: user.workspace_id,
+          enabledProducts: user.enabled_products?.length ? user.enabled_products : ["asm"],
         });
       },
 
@@ -116,6 +127,7 @@ export const useWorkspaceStore = create<WorkspaceState>()(
           isAuthenticated: false,
           workspaceId: null,
           workspaceName: null,
+          enabledProducts: ["asm"],
           activeOrg: null,
         });
         window.location.href = "/auth/login";
@@ -125,7 +137,12 @@ export const useWorkspaceStore = create<WorkspaceState>()(
       refreshUser: async () => {
         try {
           const { data } = await authAPI.me();
-          set({ user: data, isAuthenticated: true, isLoading: false });
+          set({
+            user: data,
+            isAuthenticated: true,
+            isLoading: false,
+            enabledProducts: data.enabled_products?.length ? data.enabled_products : ["asm"],
+          });
         } catch {
           set({ isLoading: false });
         }
@@ -136,6 +153,11 @@ export const useWorkspaceStore = create<WorkspaceState>()(
         const role = get().user?.role;
         return role ? roles.includes(role) : false;
       },
+
+      // Product entitlement helper -- mirrors RequireProduct server-side,
+      // this is UX gating only (route redirects, nav visibility), the API
+      // is what actually enforces it.
+      hasProduct: (product: string) => get().enabledProducts.includes(product),
 
       canWrite: () => {
         return get().hasRole(["owner", "admin", "analyst"]);
@@ -152,6 +174,7 @@ export const useWorkspaceStore = create<WorkspaceState>()(
         // Only persist non-sensitive state
         workspaceId: state.workspaceId,
         workspaceName: state.workspaceName,
+        enabledProducts: state.enabledProducts,
         activeOrg: state.activeOrg,
         sidebarCollapsed: state.sidebarCollapsed,
         theme: state.theme,
