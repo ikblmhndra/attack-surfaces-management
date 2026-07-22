@@ -4,6 +4,98 @@ All notable changes to this project are documented below, sorted newest-first.
 
 ---
 
+## 2026-07-21 — Full repo documentation rewrite, with diagrams
+
+The user asked for complete, well-organized, detailed documentation of the whole repo, diagrams
+included. `docs/ARCHITECTURE.md` and the root `README.md` both predated this project's Bug Bounty
+pipeline entirely and had accumulated real, known drift from the actual code (flagged in `CLAUDE.md`'s
+own "Docs vs. reality" section) — rather than write new docs on top of that drift, every claim below was
+re-verified against the current code before being written down.
+
+### Added
+- **`docs/ARCHITECTURE.md`** (rewritten) — system context diagram, container/network topology diagram
+  (both Mermaid `flowchart`), the full NGINX routing/rate-limit table, two `sequenceDiagram`s (JWT
+  dashboard-load flow, the transactional-outbox scan-creation flow), and why ASM/Bug Bounty are
+  deliberately separate schemas/pipelines rather than one.
+- **`docs/DATA_MODEL.md`** (new) — two Mermaid `erDiagram`s (ASM's 31 tables, Bug Bounty's 5) plus a
+  complete field-by-field reference table for every single table in both schemas, read directly from
+  `models.py`/`bounty_models.py` rather than summarized from memory.
+- **`docs/PIPELINES.md`** (new) — the authoritative queue-topology table (from
+  `workers/base_worker.py::EXCHANGE_MAP`), a Mermaid flowchart of the ASM scan pipeline
+  (discovery→port/crawl→nuclei/scanner→correlation→risk→notify, with the `task_coordinator` fan-in gate
+  shown explicitly), a Mermaid flowchart of the Bug Bounty pipeline
+  (recon→probe→vulnscan→exploit→report, `NEXT_STAGE`-driven auto-chain), a third flowchart specifically
+  for the two-gate exploit scope-safety model, and a table of all 12 exploit modules with their
+  confirmed-vs-inconclusive discipline.
+- **`docs/API_REFERENCE.md`** (new) — every endpoint on every router, extracted directly from the
+  `@router.*` decorators (exhaustive, not curated), the JWT/API-key auth model, and the product-gating
+  table (`RequireProduct`, wired at the router level) added earlier this week.
+- **`docs/FRONTEND.md`** (new) — App Router tree, the two-dashboard-shell split (`Sidebar`/
+  `DashboardHeader` `variant="asm"|"bounty"`) as a Mermaid flowchart, the Zustand store shape, and a
+  tab-by-tab breakdown of the Bug Bounty program-detail page including the Recon-tab subdomain-fetch fix
+  from earlier today.
+- **`docs/DEVELOPMENT.md`** (new) — full Makefile/command reference, the risk-scoring formula worked
+  through step by step (severity penalty → exponential decay → criticality multiplier → per-category cap
+  → weighted sum → letter grade, with every constant), and the complete incident-derived gotchas list.
+- **`docs/README.md`** (new) — index + suggested reading order for the above.
+- **Root `README.md`** — added a Bug Bounty overview/usage section (previously absent entirely),
+  corrected the threat-intel claims, fixed the "Adding Scanner/Enrichment Integrations" section to point
+  at the real extension points, and rewrote "Project Structure" to reflect the actual repo (including
+  that `backend/app/workers/` is a 0-byte stub package, not where workers actually live).
+- **`docs/PRD.md`** (new, follow-up same day) — product vision, personas, a status table per capability
+  (shipped / partial / not-started, e.g. `technical`/`compliance`/`custom` reports are currently aliases
+  with no real framework-mapping, `report.daily` is dead code) for both ASM and Bug Bounty, numbered
+  functional requirements, explicit non-goals, and the current roadmap/priorities pulled from the
+  project's own standing priority notes (core detection maturity first, platform self-security issues and
+  dependency CVEs deliberately deferred, Tenable ASM as the reference completeness bar). Extended same-day
+  after the user asked for "usecase dll" (use-case diagrams etc.): two use-case diagrams (ASM, Bug Bounty
+  — Mermaid has no native UML use-case notation, so actors are boxes and use cases are stadium/pill shapes
+  in a system-boundary subgraph, the standard workaround) plus 4 `stateDiagram-v2` entity-lifecycle
+  diagrams (Scan status, BountyProgram status, ASM Finding status, Bug Bounty `ExploitAttempt` status) —
+  each verified against the actual code driving that status field, not assumed (e.g. `Scan`'s
+  `ACTIVE_STATUSES`/`TERMINAL_STATUSES` read directly from `workers/scan_state.py`; confirmed
+  `BountyProgram.status` transitions are UI-convention-enforced only, not database-constrained, and said
+  so explicitly in the diagram's caption rather than overstating a strict state machine that isn't
+  actually there).
+- **`docs/TRD.md`** (new) — the non-functional requirements PRD's features must satisfy: security (the
+  Bug Bounty scope-gate treated explicitly as the single highest-priority security requirement in the
+  system), reliability (retry/DLQ/idempotent-upsert/graceful-shutdown requirements), performance/
+  scalability (per-worker concurrency defaults, per-module exploit-run bounds, indicative scan durations),
+  observability, infra, testing (including the standing `workers/` CI-lint-scope gap), and a consolidated
+  technical-debt list. Deliberately references ARCHITECTURE/DATA_MODEL/PIPELINES/API_REFERENCE for
+  implementation detail rather than duplicating them — states requirements, not a second copy of the
+  reference docs.
+
+### Fixed
+- **Two more docs-vs-reality gaps found while verifying facts, not previously flagged anywhere**:
+  `backend/app/workers/` (referenced in the old README's project-structure tree as "inline async
+  workers") is an empty stub package — real workers live entirely under top-level `workers/`. And the
+  risk-decay half-life: `CLAUDE.md` says "~30-day half-life", but `risk_engine.py`'s own docstring and
+  the actual math (`ln(2)/0.05 ≈ 13.9 days`) both say ~14 days — the new docs use the mathematically
+  verified value.
+- **Five broken Markdown tables** — several table cells were authored wrapped across two physical source
+  lines for my own editing readability, but GFM table rows must be a single physical line; a wrapped
+  continuation line with no leading `|` silently breaks that row's rendering. Found by scripting a check
+  (any `|`-initial line not also `|`-terminal) across every new/edited file rather than trusting a visual
+  read-through, which is exactly the kind of thing that's easy to eyeball past. Fixed in `README.md` (3
+  rows) and `docs/ARCHITECTURE.md` (2 rows).
+
+### Verified
+- Every Mermaid code fence across all 6 new/rewritten docs is balanced (`10` diagrams total: 4 in
+  ARCHITECTURE, 2 in DATA_MODEL, 3 in PIPELINES, 1 in FRONTEND) and no diagram leaked a stray arrow/dot
+  character outside a quoted label (both checked by script, not by eye — this environment has no Mermaid
+  renderer available to actually render-check them).
+- Ran the same broken-table-row check (any `|`-initial line not also `|`-terminal) against `PRD.md`/
+  `TRD.md` before considering them done — clean, no repeat of the earlier mistake.
+- Every fact underlying these docs was re-derived from the current code in this session (not carried
+  forward from the previous `ARCHITECTURE.md` or `README.md`): `docker-compose.yml`'s full service/port
+  list, `workers/base_worker.py::EXCHANGE_MAP`, every `models.py`/`bounty_models.py` column,
+  `workers/bounty/bounty_stage.py::NEXT_STAGE`, every `@router.*` decorator across all 17 endpoint files,
+  `infrastructure/nginx/nginx.conf`'s routing/rate-limit rules, and `risk_engine.py`'s exact weights/
+  penalties/multipliers/grade boundaries.
+
+---
+
 ## 2026-07-21 — Bug Bounty program detail page: readability redesign (+ a real grouping bug it exposed)
 
 The user flagged the Bug Bounty program detail page as "kurang enak dibaca" (uncomfortable to read). Root
