@@ -8,13 +8,14 @@ import { apiClient } from "@/lib/api";
 import { useWorkspaceStore } from "@/store/workspace";
 import { AssetRelationshipGraph } from "@/components/charts/AssetRelationshipGraph";
 import { NetworkClusters } from "@/components/charts/NetworkClusters";
+import { RiskHeatmap } from "@/components/charts/RiskHeatmap";
 import { SeverityBadge } from "@/components/ui/SeverityBadge";
 import { cn } from "@/lib/utils";
 import type { NetworkClustersResponse } from "@/types";
 
 export default function AttackSurfacePage() {
   const { activeOrg } = useWorkspaceStore();
-  const [view, setView] = useState<"clusters" | "graph">("clusters");
+  const [view, setView] = useState<"clusters" | "heatmap" | "graph">("clusters");
   const [selectedNode, setSelectedNode] = useState<any>(null);
   const [layout, setLayout] = useState<"cose" | "breadthfirst" | "circle">("cose");
   const [nodeTypes, setNodeTypes] = useState({
@@ -30,7 +31,7 @@ export default function AttackSurfacePage() {
       const { data } = await apiClient.get(`/organizations/${activeOrg!.id}/network-clusters`);
       return data;
     },
-    enabled: !!activeOrg?.id && view === "clusters",
+    enabled: !!activeOrg?.id && (view === "clusters" || view === "heatmap"),
     staleTime: 60_000,
   });
 
@@ -86,17 +87,17 @@ export default function AttackSurfacePage() {
         <div>
           <h1 className="text-xl font-semibold text-foreground">Attack Surface Map</h1>
           <p className="text-sm text-muted-foreground">
-            {view === "clusters"
-              ? clustersData
+            {view === "graph"
+              ? `${filteredGraph.nodes.length} nodes · ${filteredGraph.edges.length} relationships`
+              : clustersData
                 ? `${clustersData.summary.clusters_found} clusters · ${clustersData.summary.standalone_hosts} standalone hosts`
-                : "Grouped by shared infrastructure"
-              : `${filteredGraph.nodes.length} nodes · ${filteredGraph.edges.length} relationships`}
+                : "Grouped by shared infrastructure"}
             {activeOrg ? ` · ${activeOrg.name}` : ""}
           </p>
         </div>
         <div className="flex items-center gap-2">
           <div className="flex items-center gap-1 p-1 rounded-lg bg-surface-800 border border-surface-600">
-            {(["clusters", "graph"] as const).map((v) => (
+            {(["clusters", "heatmap", "graph"] as const).map((v) => (
               <button
                 key={v}
                 onClick={() => setView(v)}
@@ -105,12 +106,12 @@ export default function AttackSurfacePage() {
                   view === v ? "bg-brand-500/20 text-brand-400" : "text-muted-foreground hover:text-foreground"
                 )}
               >
-                {v === "clusters" ? "Clusters" : "Graph (legacy)"}
+                {v === "clusters" ? "Clusters" : v === "heatmap" ? "Heatmap" : "Graph (legacy)"}
               </button>
             ))}
           </div>
           <button
-            onClick={() => (view === "clusters" ? refetchClusters() : refetch())}
+            onClick={() => (view === "graph" ? refetch() : refetchClusters())}
             className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg bg-surface-700 hover:bg-surface-600 border border-surface-600 text-foreground"
           >
             <RefreshCw className="w-3 h-3" /> Refresh
@@ -118,7 +119,7 @@ export default function AttackSurfacePage() {
         </div>
       </div>
 
-      {view === "clusters" ? (
+      {view === "clusters" || view === "heatmap" ? (
         !activeOrg ? (
           <div className="glass-card flex items-center justify-center h-[400px]">
             <div className="text-center text-muted-foreground">
@@ -134,7 +135,7 @@ export default function AttackSurfacePage() {
             </div>
           </div>
         ) : clustersData ? (
-          <NetworkClusters data={clustersData} />
+          view === "heatmap" ? <RiskHeatmap data={clustersData} /> : <NetworkClusters data={clustersData} />
         ) : null
       ) : (
         <>

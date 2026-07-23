@@ -235,6 +235,34 @@
     @apply bg-gradient-to-r from-brand-300 to-brand-500 bg-clip-text text-transparent;
   }
 
+  /* HUD-style corner brackets -- a restrained technical accent (opt-in via
+     this class, not applied to .glass-card/.metric-card globally) for
+     surfaces that want to read as "ops/security tooling" rather than a
+     generic card. Uses currentColor so it always matches its text context
+     and needs no per-theme tuning. */
+  .hud-corners::before,
+  .hud-corners::after {
+    content: '';
+    position: absolute;
+    width: 8px;
+    height: 8px;
+    color: inherit;
+    opacity: 0.35;
+    pointer-events: none;
+  }
+  .hud-corners::before {
+    top: 3px;
+    left: 3px;
+    border-top: 1.5px solid currentColor;
+    border-left: 1.5px solid currentColor;
+  }
+  .hud-corners::after {
+    bottom: 3px;
+    right: 3px;
+    border-bottom: 1.5px solid currentColor;
+    border-right: 1.5px solid currentColor;
+  }
+
   /* Animated border */
   .border-animated {
     position: relative;
