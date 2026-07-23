@@ -128,6 +128,7 @@ export function Sidebar({ variant = "asm" }: SidebarProps) {
           <button
             onClick={() => router.push(isBounty ? "/dashboard" : "/dashboard/bounty")}
             title={collapsed ? `Switch to ${isBounty ? "ASM" : "Bug Bounty"}` : undefined}
+            aria-label={collapsed ? `Switch to ${isBounty ? "ASM" : "Bug Bounty"}` : undefined}
             className={cn(
               "w-full flex items-center gap-2 px-2.5 py-2 rounded-lg text-xs font-medium",
               "border border-border bg-surface-800 hover:bg-surface-700/70 text-muted-foreground hover:text-foreground transition-colors",
@@ -145,7 +146,11 @@ export function Sidebar({ variant = "asm" }: SidebarProps) {
         {navItems.map((item) => {
           const active = isActive(item.href, item.exact);
           return (
-            <Link key={item.href} href={item.href}>
+            <Link
+              key={item.href}
+              href={item.href}
+              aria-label={collapsed ? item.label : undefined}
+            >
               <motion.div
                 whileHover={{ x: 2 }}
                 className={cn(
@@ -186,7 +191,11 @@ export function Sidebar({ variant = "asm" }: SidebarProps) {
         {BOTTOM_ITEMS.map((item) => {
           const active = isActive(item.href);
           return (
-            <Link key={item.href} href={item.href}>
+            <Link
+              key={item.href}
+              href={item.href}
+              aria-label={collapsed ? item.label : undefined}
+            >
               <motion.div
                 whileHover={{ x: 2 }}
                 className={cn(
@@ -251,6 +260,7 @@ export function Sidebar({ variant = "asm" }: SidebarProps) {
         {/* Collapse button */}
         <button
           onClick={() => setSidebarCollapsed(!collapsed)}
+          aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
           className={cn(
             "w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-xs text-muted-foreground",
             "hover:text-foreground hover:bg-surface-700/50 transition-colors",

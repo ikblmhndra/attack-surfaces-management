@@ -1,12 +1,13 @@
 "use client";
 
 import { useState } from "react";
+import * as Dialog from "@radix-ui/react-dialog";
 import {
   X, Scan, Globe, Search, Settings, AlertTriangle,
   ChevronDown, ChevronRight, Zap, Camera, FileSearch,
   Loader2, Target
 } from "lucide-react";
-import { motion, AnimatePresence } from "framer-motion";
+import { motion } from "framer-motion";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { apiClient } from "@/lib/api";
@@ -116,23 +117,23 @@ export function ScanModal({ orgId, onClose }: ScanModalProps) {
   });
 
   return (
-    <AnimatePresence>
-      <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-        <motion.div
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          exit={{ opacity: 0 }}
-          className="absolute inset-0 bg-black/60 backdrop-blur-sm"
-          onClick={onClose}
-        />
+    <Dialog.Root open onOpenChange={(open) => { if (!open) onClose(); }}>
+      <Dialog.Portal>
+        <Dialog.Overlay asChild>
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm"
+          />
+        </Dialog.Overlay>
 
-        <motion.div
-          initial={{ opacity: 0, scale: 0.96, y: 8 }}
-          animate={{ opacity: 1, scale: 1, y: 0 }}
-          exit={{ opacity: 0, scale: 0.96, y: 8 }}
-          transition={{ duration: 0.2 }}
-          className="relative w-full max-w-lg bg-surface-900 border border-border rounded-2xl shadow-2xl overflow-hidden"
-        >
+        <Dialog.Content asChild>
+          <motion.div
+            initial={{ opacity: 0, scale: 0.96, y: 8 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            transition={{ duration: 0.2 }}
+            className="fixed left-1/2 top-1/2 z-50 w-[calc(100%-2rem)] max-w-lg -translate-x-1/2 -translate-y-1/2 bg-surface-900 border border-border rounded-2xl shadow-2xl overflow-hidden focus:outline-none"
+          >
           {/* Header */}
           <div className="flex items-center justify-between p-5 border-b border-border">
             <div className="flex items-center gap-3">
@@ -140,16 +141,22 @@ export function ScanModal({ orgId, onClose }: ScanModalProps) {
                 {activeTab === "manual" ? <Target className="w-4.5 h-4.5 text-brand-400" /> : <Scan className="w-4.5 h-4.5 text-brand-400" />}
               </div>
               <div>
-                <h2 className="text-sm font-semibold text-foreground">Run Scan</h2>
-                <p className="text-xs text-muted-foreground">Configure scan parameters</p>
+                <Dialog.Title asChild>
+                  <h2 className="text-sm font-semibold text-foreground">Run Scan</h2>
+                </Dialog.Title>
+                <Dialog.Description asChild>
+                  <p className="text-xs text-muted-foreground">Configure scan parameters</p>
+                </Dialog.Description>
               </div>
             </div>
-            <button
-              onClick={onClose}
-              className="w-8 h-8 flex items-center justify-center rounded-lg hover:bg-surface-700 text-muted-foreground hover:text-foreground"
-            >
-              <X className="w-4 h-4" />
-            </button>
+            <Dialog.Close asChild>
+              <button
+                aria-label="Close"
+                className="w-8 h-8 flex items-center justify-center rounded-lg hover:bg-surface-700 text-muted-foreground hover:text-foreground"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </Dialog.Close>
           </div>
 
           {/* Tabs */}
@@ -446,8 +453,9 @@ export function ScanModal({ orgId, onClose }: ScanModalProps) {
               </button>
             )}
           </div>
-        </motion.div>
-      </div>
-    </AnimatePresence>
+          </motion.div>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
   );
 }

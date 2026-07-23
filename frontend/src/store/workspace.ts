@@ -63,6 +63,8 @@ interface WorkspaceState {
   setActiveOrg: (org: Organization | null) => void;
   setSidebarCollapsed: (v: boolean) => void;
   setNotifications: (count: number) => void;
+  setTheme: (theme: "dark" | "light") => void;
+  toggleTheme: () => void;
 
   // Auth actions
   login: (accessToken: string, refreshToken: string, user: User) => void;
@@ -101,6 +103,8 @@ export const useWorkspaceStore = create<WorkspaceState>()(
       setActiveOrg: (org) => set({ activeOrg: org }),
       setSidebarCollapsed: (v) => set({ sidebarCollapsed: v }),
       setNotifications: (count) => set({ notifications: count }),
+      setTheme: (theme) => set({ theme }),
+      toggleTheme: () => set({ theme: get().theme === "dark" ? "light" : "dark" }),
 
       // Login: store tokens + user
       login: (accessToken, refreshToken, user) => {

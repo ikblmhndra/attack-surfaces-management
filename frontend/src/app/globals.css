@@ -5,6 +5,61 @@
 
 @layer base {
   :root {
+    /* Light theme (default -- no .dark class on <html>) */
+    --background: 210 40% 98%;
+    --foreground: 222 47% 11%;
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 47% 11%;
+    --primary: 201 96% 32%;
+    --primary-foreground: 210 40% 98%;
+    --secondary: 210 40% 96%;
+    --secondary-foreground: 222 47% 11%;
+    --muted: 210 40% 96%;
+    --muted-foreground: 215 16% 47%;
+    --accent: 210 40% 96%;
+    --accent-foreground: 222 47% 11%;
+    --destructive: 0 74% 42%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 214 32% 91%;
+    --input: 214 32% 91%;
+    --ring: 201 96% 32%;
+    --radius: 0.5rem;
+
+    /* Surface scale -- chrome fills (sidebar/header/cards/dropdowns), hover
+       states, borders. surface-950 is intentionally NOT themed here (see
+       tailwind.config.ts) -- it's only used for terminal/code panes and the
+       attack-surface graph canvas, which stay dark in both themes by design. */
+    --surface-900: 0 0% 100%;
+    --surface-800: 210 40% 96%;
+    --surface-700: 214 32% 91%;
+    --surface-600: 215 20% 65%;
+    --surface-500: 215 16% 47%;
+
+    /* Brand accent -- only the 400 stop (used as text/icon color) needs a
+       per-theme value; 40bdf8-family fills/tints stay the same hue in both
+       themes since they're used as backgrounds, not foreground text. */
+    --brand-400: 201 96% 32%;
+
+    /* Severity colors -- darker/richer shades so text clears 4.5:1 on a
+       light background; dark-theme values (moved to .dark below) are the
+       original lighter/more vibrant shades meant for text on a near-black bg. */
+    --severity-critical: 0 74% 42%;
+    --severity-high: 17 88% 40%;
+    --severity-medium: 32 81% 29%;
+    --severity-low: 224 76% 48%;
+    --severity-info: 215 14% 34%;
+
+    /* Grade colors */
+    --grade-a: 163 94% 24%;
+    --grade-b: 224 76% 48%;
+    --grade-c: 32 81% 29%;
+    --grade-d: 17 88% 40%;
+    --grade-f: 0 74% 42%;
+  }
+
+  .dark {
     --background: 222 47% 4%;
     --foreground: 210 40% 96%;
     --card: 222 47% 6%;
@@ -24,16 +79,21 @@
     --border: 217 33% 14%;
     --input: 217 33% 10%;
     --ring: 199 89% 48%;
-    --radius: 0.5rem;
 
-    /* Severity colors */
+    --surface-900: 221 44% 7%;
+    --surface-800: 222 47% 11%;
+    --surface-700: 217 33% 17%;
+    --surface-600: 215 25% 27%;
+    --surface-500: 215 19% 35%;
+
+    --brand-400: 198 93% 60%;
+
     --severity-critical: 0 84% 60%;
     --severity-high: 25 95% 53%;
     --severity-medium: 48 96% 53%;
     --severity-low: 217 91% 60%;
     --severity-info: 215 20% 55%;
 
-    /* Grade colors */
     --grade-a: 160 84% 39%;
     --grade-b: 217 91% 60%;
     --grade-c: 48 96% 53%;

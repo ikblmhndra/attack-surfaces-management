@@ -15,13 +15,16 @@ const config: Config = {
         display: ["var(--font-display)", "sans-serif"],
       },
       colors: {
-        // Brand
+        // Brand -- every stop is a fixed hue except 400 (used as text/icon
+        // color; needs a darker per-theme value to stay legible on a light
+        // background -- see --brand-400 in globals.css). Stops used only as
+        // fills/tints (500-900) keep one hue across both themes.
         brand: {
           50: "#f0f9ff",
           100: "#e0f2fe",
           200: "#bae6fd",
           300: "#7dd3fc",
-          400: "#38bdf8",
+          400: "hsl(var(--brand-400))",
           500: "#0ea5e9",
           600: "#0284c7",
           700: "#0369a1",
@@ -29,26 +32,28 @@ const config: Config = {
           900: "#0c4a6e",
           950: "#082f49",
         },
-        // Severity colors
-        critical: "#ef4444",
-        high: "#f97316",
-        medium: "#eab308",
-        low: "#3b82f6",
-        info: "#6b7280",
-        // Grades
-        "grade-a": "#10b981",
-        "grade-b": "#3b82f6",
-        "grade-c": "#eab308",
-        "grade-d": "#f97316",
-        "grade-f": "#ef4444",
-        // Surface colors for dark theme
+        // Severity colors (theme-aware, see globals.css)
+        critical: "hsl(var(--severity-critical))",
+        high: "hsl(var(--severity-high))",
+        medium: "hsl(var(--severity-medium))",
+        low: "hsl(var(--severity-low))",
+        info: "hsl(var(--severity-info))",
+        // Grades (theme-aware, see globals.css)
+        "grade-a": "hsl(var(--grade-a))",
+        "grade-b": "hsl(var(--grade-b))",
+        "grade-c": "hsl(var(--grade-c))",
+        "grade-d": "hsl(var(--grade-d))",
+        "grade-f": "hsl(var(--grade-f))",
+        // Surface scale, theme-aware except 950 (always dark -- terminal /
+        // code panes and the attack-surface graph canvas keep a fixed dark
+        // backdrop by design, see globals.css).
         surface: {
           950: "#030712",
-          900: "#0a0f1a",
-          800: "#0f172a",
-          700: "#1e293b",
-          600: "#334155",
-          500: "#475569",
+          900: "hsl(var(--surface-900))",
+          800: "hsl(var(--surface-800))",
+          700: "hsl(var(--surface-700))",
+          600: "hsl(var(--surface-600))",
+          500: "hsl(var(--surface-500))",
         },
         // Semantic
         background: "hsl(var(--background))",

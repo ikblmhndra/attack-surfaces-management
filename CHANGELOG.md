@@ -4,6 +4,84 @@ All notable changes to this project are documented below, sorted newest-first.
 
 ---
 
+## 2026-07-23 — Frontend: dashboard modal/dropdown accessibility fixes + light theme
+
+Ran a UI/UX audit of the frontend shell (Sidebar, DashboardHeader, modals, shared badge
+components) against the ui-ux-pro-max accessibility/style checklist, then fixed what it found and
+added a light theme on top of the same token layer.
+
+### Fixed (accessibility)
+- **`components/modals/ScanModal.tsx`, `components/modals/FindingDetailModal.tsx`, and the inline
+  "New Scan" modal in `app/dashboard/page.tsx`**: all three were hand-rolled `fixed inset-0` overlay
+  divs with no `role="dialog"`, no focus trap, no Escape-to-close, and no return-focus-on-close —
+  despite `@radix-ui/react-dialog` already being a dependency and unused anywhere in the app.
+  Rewired all three onto `Dialog.Root`/`Portal`/`Overlay`/`Content`/`Title`/`Description`/`Close`,
+  keeping the existing framer-motion enter animation via `asChild`. Bonus side-effect: since
+  `Dialog.Portal` renders into `document.body`, these modals are no longer nested under
+  `dashboard/layout.tsx`'s page-transition `motion.div` — a `position: fixed` element nested under
+  an ancestor with an active CSS `transform` is positioned relative to that ancestor, not the
+  viewport, so modal centering could have been subtly off during a route-change animation before.
+- **`components/layout/DashboardHeader.tsx`**: the org selector, notifications, and user-menu
+  dropdowns were custom `useState` + manual `mousedown` outside-click-listener divs (no
+  `role="menu"`, no arrow-key nav) — again despite `@radix-ui/react-dropdown-menu` being an unused
+  dependency. Rewired all three onto `DropdownMenu.Root`/`Trigger`/`Portal`/`Content`/`Item`, which
+  also let the manual outside-click `useEffect` be deleted entirely.
+- Added `aria-label` to icon-only controls that had none: notification bell, user-menu trigger,
+  sidebar collapse toggle, and every sidebar nav `Link` when the sidebar is collapsed (previously
+  relying on `title` alone, which isn't reliably picked up as an accessible name by screen readers,
+  and in the nav-item case wasn't even on the focusable `<a>` — it was on a non-interactive child
+  div).
+- **`components/layout/Providers.tsx`**: wrapped the app in framer-motion's
+  `<MotionConfig reducedMotion="user">`, so every existing motion animation (page transitions,
+  sidebar width, dropdown/modal enter) now respects the OS-level reduced-motion setting for free,
+  instead of having none of them do so.
+
+### Added (light theme)
+- Found the theme infrastructure already half-scaffolded and disconnected: `store/workspace.ts` had
+  an unused `theme: "dark" | "light"` field (persisted, but never read to toggle anything),
+  `tailwind.config.ts` had `darkMode: ["class"]` configured but no component ever used a `dark:`
+  variant, and `globals.css` already defined unused `--severity-*`/`--grade-*` CSS vars that nothing
+  consumed (`SeverityBadge.tsx` had its own third, independent copy of the same color mapping using
+  literal `red-500`/`orange-400`-style Tailwind classes instead).
+- Restructured `globals.css`'s `:root` to hold light-theme values by default, moved the existing
+  (unchanged, pixel-identical) dark palette under a `.dark` class block. Converted the `surface`
+  (900-600; 950 stays a fixed dark value on purpose, see below), `critical`/`high`/`medium`/`low`/
+  `info`, `grade-a..f`, and `brand.400` Tailwind color entries in `tailwind.config.ts` from static
+  hex to `hsl(var(--x))`, so every existing call site (`bg-surface-800`, `text-critical`,
+  `text-brand-400`, etc. — hundreds of them across the app) becomes theme-aware without editing the
+  call sites themselves. Picked new light-mode shades by actually computing WCAG contrast ratios
+  (not eyeballing) — e.g. severity/grade text uses 700-weight-equivalent shades in light mode
+  (`red-700`-ish, `emerald-700`-ish, etc.) since the original 400-weight shades measured 1.5–2.8:1 on
+  white, well under the 4.5:1 AA minimum for 12px badge text.
+- `surface-950` (terminal/code-pane background in `.terminal`, the attack-surface graph canvas, and
+  the login/register hero splash) was deliberately left un-themed / always-dark — code panes and a
+  dark marketing-style auth splash are common conventions to keep dark regardless of app theme, and
+  this was a scope call, not an oversight.
+- Rewired `components/ui/SeverityBadge.tsx` (`SeverityBadge`, `StatusBadge`, `GradeRing`,
+  `ScorePill`, `KEVBadge`, `EPSSBadge`, `ConfidenceIndicator`) onto the newly theme-aware tokens
+  instead of their hardcoded literal classes — this one file is used on nearly every dashboard page,
+  so it was the highest-leverage place to make theming actually show up in real content.
+- Added a theme toggle (Sun/Moon button) to `DashboardHeader`, wired to a new `setTheme`/
+  `toggleTheme` action in `store/workspace.ts`. `app/layout.tsx` gained a small blocking inline
+  script that applies the persisted theme class before first paint (reads the same
+  `localStorage["asm-workspace"]` key zustand's persist middleware writes) to avoid a flash of the
+  wrong theme on reload.
+
+### Explicitly not in scope for this pass
+- Per-page one-off accent colors (e.g. a handful of `cyan-400`/`purple-400`/`rose-300` usages
+  scattered across individual dashboard pages) were not hunted down and converted — only the shared
+  token layer and components used everywhere were made theme-aware. Some rarely-visited pages may
+  still have an isolated low-contrast color in light mode.
+- The dashboard shell has no mobile/responsive layout at all (fixed-width sidebar, no drawer) —
+  noted in the audit as a separate, larger finding, not addressed here.
+- Verified via `tsc --noEmit`, `next lint`, and `next build` (all clean, no new warnings/errors) plus
+  a dev-server smoke test (`/auth/login`, `/dashboard` both compile and return 200). Not verified:
+  actual visual appearance in a browser — no screenshot/browser-automation tool was available in
+  this session, so the light theme's look was reasoned about via computed contrast ratios and
+  careful token tracing, not eyeballed.
+
+---
+
 ## 2026-07-22 — Fixed silent Telegram notification failures on titles with Markdown syntax
 
 User asked to verify the Telegram notification channel actually works end-to-end. Channel wiring itself

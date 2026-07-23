@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
+import * as Dialog from "@radix-ui/react-dialog";
 import {
   Shield, AlertTriangle, Globe, Cpu, TrendingDown, TrendingUp,
   RefreshCw, Scan, Bell, ChevronRight, Activity, Layers,
@@ -11,7 +12,7 @@ import {
   PolarGrid, PolarAngleAxis, ResponsiveContainer,
   XAxis, YAxis, CartesianGrid, Tooltip, Cell, PieChart, Pie
 } from "recharts";
-import { motion, AnimatePresence } from "framer-motion";
+import { motion } from "framer-motion";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { formatDistanceToNow } from "date-fns";
 import { apiClient } from "@/lib/api";
@@ -620,14 +621,27 @@ export default function DashboardPage() {
 
       {/* Scan Modal */}
       {showScanModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={() => setShowScanModal(false)}>
-          <motion.div
-            initial={{ opacity: 0, scale: 0.95 }}
-            animate={{ opacity: 1, scale: 1 }}
-            className="bg-surface-800 border border-border rounded-xl p-5 w-full max-w-md space-y-4 shadow-2xl"
-            onClick={e => e.stopPropagation()}
-          >
-            <h2 className="text-base font-semibold text-foreground">New Scan</h2>
+        <Dialog.Root open onOpenChange={(open) => { if (!open) setShowScanModal(false); }}>
+          <Dialog.Portal>
+            <Dialog.Overlay asChild>
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm"
+              />
+            </Dialog.Overlay>
+            <Dialog.Content asChild>
+              <motion.div
+                initial={{ opacity: 0, scale: 0.95 }}
+                animate={{ opacity: 1, scale: 1 }}
+                className="fixed left-1/2 top-1/2 z-50 w-[calc(100%-2rem)] max-w-md -translate-x-1/2 -translate-y-1/2 bg-surface-800 border border-border rounded-xl p-5 space-y-4 shadow-2xl focus:outline-none"
+              >
+            <Dialog.Title asChild>
+              <h2 className="text-base font-semibold text-foreground">New Scan</h2>
+            </Dialog.Title>
+            <Dialog.Description asChild>
+              <span className="sr-only">Configure and launch a new scan for an organization</span>
+            </Dialog.Description>
 
             <div className="space-y-3">
               <div>
@@ -705,8 +719,10 @@ export default function DashboardPage() {
                 Start Scan
               </button>
             </div>
-          </motion.div>
-        </div>
+              </motion.div>
+            </Dialog.Content>
+          </Dialog.Portal>
+        </Dialog.Root>
       )}
     </div>
   );

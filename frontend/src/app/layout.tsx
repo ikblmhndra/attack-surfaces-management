@@ -15,10 +15,29 @@ export const metadata: Metadata = {
 };
 
 export const viewport: Viewport = {
-  themeColor: "#030712",
+  themeColor: [
+    { media: "(prefers-color-scheme: light)", color: "#f8fafc" },
+    { media: "(prefers-color-scheme: dark)", color: "#030712" },
+  ],
   width: "device-width",
   initialScale: 1,
 };
+
+// Applies the persisted theme class before first paint so switching themes
+// doesn't flash the wrong one on reload. Reads the same localStorage key
+// zustand's persist middleware writes (store/workspace.ts) directly, since
+// this has to run before React/zustand hydrate.
+const THEME_INIT_SCRIPT = `
+  (function () {
+    try {
+      var raw = localStorage.getItem("asm-workspace");
+      var theme = raw ? JSON.parse(raw).state.theme : "dark";
+      if (theme !== "light") document.documentElement.classList.add("dark");
+    } catch (e) {
+      document.documentElement.classList.add("dark");
+    }
+  })();
+`;
 
 export default function RootLayout({
   children,
@@ -26,7 +45,10 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en" className="dark" suppressHydrationWarning>
+    <html lang="en" suppressHydrationWarning>
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }} />
+      </head>
       <body className={`${GeistSans.variable} ${GeistMono.variable} font-sans antialiased bg-background`}>
         <Providers>{children}</Providers>
       </body>

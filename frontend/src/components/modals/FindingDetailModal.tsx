@@ -1,11 +1,12 @@
 "use client";
 
 import { useState } from "react";
+import * as Dialog from "@radix-ui/react-dialog";
 import {
   X, ExternalLink, Copy, CheckCircle, XCircle, AlertTriangle,
   ChevronDown, ChevronRight, Clock, Shield, Code, Globe, Link2
 } from "lucide-react";
-import { motion, AnimatePresence } from "framer-motion";
+import { motion } from "framer-motion";
 import { formatDistanceToNow, format } from "date-fns";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -56,25 +57,25 @@ export function FindingDetailModal({ finding, onClose }: FindingDetailModalProps
   ];
 
   return (
-    <AnimatePresence>
-      <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+    <Dialog.Root open onOpenChange={(open) => { if (!open) onClose(); }}>
+      <Dialog.Portal>
         {/* Backdrop */}
-        <motion.div
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          exit={{ opacity: 0 }}
-          className="absolute inset-0 bg-black/60 backdrop-blur-sm"
-          onClick={onClose}
-        />
+        <Dialog.Overlay asChild>
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm"
+          />
+        </Dialog.Overlay>
 
         {/* Modal */}
-        <motion.div
-          initial={{ opacity: 0, scale: 0.96, y: 8 }}
-          animate={{ opacity: 1, scale: 1, y: 0 }}
-          exit={{ opacity: 0, scale: 0.96, y: 8 }}
-          transition={{ duration: 0.2 }}
-          className="relative w-full max-w-3xl max-h-[90vh] flex flex-col bg-surface-900 border border-border rounded-2xl shadow-2xl overflow-hidden"
-        >
+        <Dialog.Content asChild>
+          <motion.div
+            initial={{ opacity: 0, scale: 0.96, y: 8 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            transition={{ duration: 0.2 }}
+            className="fixed left-1/2 top-1/2 z-50 w-[calc(100%-2rem)] max-w-3xl max-h-[90vh] -translate-x-1/2 -translate-y-1/2 flex flex-col bg-surface-900 border border-border rounded-2xl shadow-2xl overflow-hidden focus:outline-none"
+          >
           {/* Header */}
           <div className="flex items-start justify-between p-5 border-b border-border flex-shrink-0">
             <div className="flex-1 min-w-0 pr-4">
@@ -90,9 +91,14 @@ export function FindingDetailModal({ finding, onClose }: FindingDetailModalProps
                   <CVEBadge key={cve} cveId={cve} />
                 ))}
               </div>
-              <h2 className="text-base font-semibold text-foreground leading-tight">
-                {finding.title}
-              </h2>
+              <Dialog.Title asChild>
+                <h2 className="text-base font-semibold text-foreground leading-tight">
+                  {finding.title}
+                </h2>
+              </Dialog.Title>
+              <Dialog.Description asChild>
+                <span className="sr-only">Finding details</span>
+              </Dialog.Description>
               {finding.affected_url && (
                 <div className="flex items-center gap-1.5 mt-1.5">
                   <Globe className="w-3 h-3 text-muted-foreground flex-shrink-0" />
@@ -110,12 +116,14 @@ export function FindingDetailModal({ finding, onClose }: FindingDetailModalProps
                 </div>
               )}
             </div>
-            <button
-              onClick={onClose}
-              className="w-8 h-8 flex items-center justify-center rounded-lg hover:bg-surface-700 text-muted-foreground hover:text-foreground flex-shrink-0"
-            >
-              <X className="w-4 h-4" />
-            </button>
+            <Dialog.Close asChild>
+              <button
+                aria-label="Close"
+                className="w-8 h-8 flex items-center justify-center rounded-lg hover:bg-surface-700 text-muted-foreground hover:text-foreground flex-shrink-0"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </Dialog.Close>
           </div>
 
           {/* Tabs */}
@@ -382,8 +390,9 @@ export function FindingDetailModal({ finding, onClose }: FindingDetailModalProps
               </div>
             </div>
           )}
-        </motion.div>
-      </div>
-    </AnimatePresence>
+          </motion.div>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
   );
 }
