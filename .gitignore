@@ -11,3 +11,4 @@ PLAN.md
 /frontend/.next
 /graphify-out/
 /frontend/graphify-out/
+infrastructure/nginx/conf.d/.htpasswd

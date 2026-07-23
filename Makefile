@@ -8,13 +8,15 @@
         clean clean-all backup restore \
         nuclei-update scan-org generate-ssl \
         workers-up workers-scale prod-deploy \
-        changelog
+        changelog htpasswd
 
 SHELL := /bin/bash
 DOCKER := docker
 COMPOSE := docker compose
 ENV_FILE := .env
 COMPOSE_FILE := docker-compose.yml
+HTPASSWD_FILE := infrastructure/nginx/conf.d/.htpasswd
+USER := admin
 
 # Colors
 RED    := \033[0;31m
@@ -58,6 +60,20 @@ generate-ssl: ## Generate self-signed SSL certificate for development
 	else \
 		echo "$(YELLOW)SSL certificate already exists$(NC)"; \
 	fi
+
+htpasswd:
+	@PASS=$$(openssl rand -base64 18 | tr -d '=+/' | cut -c1-20); \
+	HASH=$$(openssl passwd -apr1 "$$PASS"); \
+	echo "$(USER):$$HASH" > $(HTPASSWD_FILE); \
+	echo ""; \
+	echo "======================================"; \
+	echo "Generated credentials"; \
+	echo "======================================"; \
+	echo "Username : $(USER)"; \
+	echo "Password : $$PASS"; \
+	echo ""; \
+	echo "Contents of $(HTPASSWD_FILE):"; \
+	cat $(HTPASSWD_FILE)
 
 # ── Start/Stop ─────────────────────────────────────────────────
 up: ## Start all services
