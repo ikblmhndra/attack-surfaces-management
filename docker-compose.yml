@@ -484,6 +484,11 @@ services:
       - "--storage.tsdb.path=/prometheus"
       - "--storage.tsdb.retention.time=30d"
       - "--web.enable-lifecycle"
+      # Reverse-proxied at /prometheus/ by nginx -- external-url so
+      # generated links include the subpath, route-prefix=/ so Prometheus
+      # itself still serves unprefixed paths (nginx does the path mapping).
+      - "--web.external-url=/prometheus/"
+      - "--web.route-prefix=/"
     volumes:
       - ./infrastructure/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
@@ -501,6 +506,9 @@ services:
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost:3001}
+      # Reverse-proxied at /grafana/ by nginx (see nginx.conf) -- required
+      # so Grafana's own generated asset/redirect URLs include the subpath.
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
     volumes:
       - grafana-data:/var/lib/grafana
       - ./infrastructure/grafana/provisioning:/etc/grafana/provisioning:ro

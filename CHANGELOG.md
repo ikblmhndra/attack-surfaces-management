@@ -4,6 +4,185 @@ All notable changes to this project are documented below, sorted newest-first.
 
 ---
 
+## 2026-07-23 — Grafana dashboard tuning: removed dead panels, fixed RabbitMQ per-queue metrics
+
+User asked for the Grafana dashboard (`infrastructure/grafana/dashboards/asm-overview.json`) to be tuned
+for clarity after noticing several panels showing "No data." Queried every panel's PromQL expression
+directly against Prometheus to tell genuinely-broken panels apart from panels that were just quiet.
+
+### Removed
+- **PostgreSQL Connections** and **Redis Memory Usage** panels -- both depend on `postgres-exporter`/
+  `redis-exporter`, which don't exist in `docker-compose.yml` (same gap identified in the earlier
+  Prometheus/OpenSearch infra audit below). A permanently-empty panel is worse than no panel; removed
+  rather than left blank. Panels 7 and 9 widened to fill the freed space.
+
+### Fixed
+- **RabbitMQ Queue Depth**: the panel's own `legendFormat` was `{{queue}}` and its query filtered
+  `{vhost="/"}`, but RabbitMQ's Prometheus plugin only exposes a single cluster-wide aggregate by
+  default -- `rabbitmq_queue_messages` had *no* `queue`/`vhost` labels at all, so the panel had been
+  wired for per-queue data it could never receive. Added `prometheus.return_per_object_metrics = true`
+  to `infrastructure/rabbitmq/rabbitmq.conf` (~24 queues, so the added cardinality is small) and changed
+  the query to `sum by (queue) (rabbitmq_queue_messages_ready)`.
+- **Failed Messages (DLQ)**: a workspace with zero failures ever and a workspace with a broken metric
+  looked identical (both rendered as an empty panel). Wrapped the query with `or on() vector(0)` so zero
+  failures now renders as an explicit flat 0 line.
+- **API P99 Latency**: 35 handler series crammed into one legend was unreadable. Wrapped in
+  `topk(8, ...)` to show only the 8 slowest endpoints.
+- **Worker Processing Time (p99)**: widened the `rate()` window from 5m to 15m -- during low-traffic
+  windows a worker with zero processed messages produced a 0/0 `histogram_quantile`, rendering as a NaN
+  gap in the graph.
+- Corrected the `reqps` (HTTP-request-flavored) unit on the Worker Messages Processed / Error Rate /
+  Failed Messages panels to `ops`, since these count queue messages, not HTTP requests.
+
+### Verified
+- Restarted RabbitMQ; all 9 workers reconnected automatically and all Prometheus targets stayed `up`
+  (no pipeline disruption). Confirmed `rabbitmq_queue_messages_ready` now returns 32 labeled series (one
+  per real queue + DLQ, matching `EXCHANGE_MAP`).
+- Queried every changed panel's expression directly against `/api/v1/query` and confirmed real,
+  non-empty results (topk(8) latency handlers, per-queue depths, the DLQ `vector(0)` fallback).
+- Confirmed via Grafana's own dashboard API (`/api/dashboards/uid/asm-platform-overview`) that the
+  file-provisioned dashboard auto-reloaded to the new panel set (version bumped 1 -> 2) with no manual
+  restart needed.
+
+---
+
+## 2026-07-23 — nginx: fixed bare-origin 404, reverse-proxied Grafana + Prometheus
+
+User reported `https://<host>/` (no path) 404ing, and asked to have it redirect to the dashboard when
+logged in / to the login form otherwise -- and to route Grafana and Prometheus through nginx instead of
+their direct host ports, while investigating.
+
+### Fixed
+- **`frontend/src/app/page.tsx`** (new): the root route had no `page.tsx` at all -- Next.js App Router
+  was correctly 404ing on `/` by its own design, nginx's `error_page 404 = @fallback` block was never the
+  problem (it just re-proxied to the same upstream). New root page waits on `useWorkspaceStore`'s
+  `isLoading`/`isAuthenticated` (already resolved on app boot by `Providers.tsx`) and forwards to
+  `/dashboard` (or `/dashboard/bounty`, mirroring the login page's own product check) or `/auth/login`.
+- **Grafana reverse-proxy redirect loop**: initially proxied `/grafana/` with a trailing-slash
+  `proxy_pass http://grafana:3000/;`, which strips the `/grafana` prefix before forwarding -- but Grafana
+  is running with `GF_SERVER_SERVE_FROM_SUB_PATH=true` and expects that prefix preserved, so it kept
+  redirecting back to `/grafana/` forever. Fixed by dropping the trailing slash so the full path forwards
+  unchanged (the documented-correct pattern for reverse-proxying Grafana under a subpath).
+  - **`GRAFANA_ROOT_URL`** in `.env` was still the literal placeholder `https://your-domain.com/grafana`,
+    which would have made Grafana redirect to a domain that doesn't resolve. Updated to the real address
+    in use, `https://172.25.1.77/grafana/`.
+- **Grafana/Prometheus assets 404ing through nginx ("failed to load application files" / blank page)**:
+  root cause was location-matching precedence, not either app -- an existing regex location
+  (`~* \.(js|css|...)$`) in `nginx.conf` matches *any* static-asset request and, per nginx's rules, always
+  wins over a plain prefix location, so every `/grafana/public/...` and `/prometheus/static/...` request
+  was being routed to the frontend Next.js upstream instead, 404ing there. Added the `^~` modifier to
+  both new locations (matching the same pattern already used for `location ^~ /storage/`) so they stop
+  the regex fallthrough for anything under their prefix.
+- **`prometheus.yml`/`docker-compose.yml` reload not taking effect via the `/-/reload` HTTP endpoint**:
+  in this environment, Prometheus's bind-mounted config file only picked up host-side edits after a full
+  `docker compose restart`, not the `--web.enable-lifecycle` reload API (confirmed via mismatched
+  inode/device/mtime between the host file and the file the running container actually read). Worth
+  remembering for future infra config edits in this environment.
+
+### Added
+- **`location ^~ /grafana/`** in `nginx.conf`, proxying to `grafana:3000` -- protected by Grafana's own
+  login (no separate nginx-side auth needed).
+- **`location ^~ /prometheus/`**, proxying to `prometheus:9090` -- protected by nginx Basic Auth
+  (`auth_basic` + `infrastructure/nginx/conf.d/.htpasswd`), since Prometheus has no login of its own.
+  Credentials generated and shared out-of-band with the user (not committed to the repo).
+- **`docker-compose.yml`**: `GF_SERVER_SERVE_FROM_SUB_PATH: "true"` on the `grafana` service;
+  `--web.external-url=/prometheus/` + `--web.route-prefix=/` added to the `prometheus` command args --
+  both required for each app to generate correct links/assets under its nginx subpath.
+
+### Verified
+- `curl`-tested every path end to end after each fix: `/` now 200s and serves the spinner+redirect page
+  (confirmed via rebuilt frontend image, `docker.compose build frontend` -- required since it's a
+  `target: production` Next.js build, no hot-reload); `/grafana/` 302s to `/grafana/login` (200);
+  `/prometheus/` 401s with no credentials, 302s to `/prometheus/graph` (200) with them; static assets
+  under both prefixes (`.js`/`.css`) return 200 instead of 404.
+- Flagged, not fixed (user's call): `GRAFANA_PASSWORD` in `.env` is still the placeholder
+  `CHANGE_ME_grafana_password` -- now that Grafana is reachable from the same public-facing domain as
+  the app, this should be rotated to a real password before relying on it.
+
+---
+
+## 2026-07-23 — Infra audit: orphaned Docker volumes reclaimed, Prometheus/OpenSearch cruft trimmed
+
+User asked whether `infrastructure/`'s observability stack (Grafana, Prometheus, OpenSearch) was actually
+used or just carried along unused, specifically to find safe storage wins. Audited every scrape target,
+dashboard panel, and OpenSearch index against real, live data rather than assuming from config alone.
+
+### Findings
+- **OpenSearch itself: genuinely used.** `asm-findings` (2,349 docs) and `asm-assets` (3,673 docs) are
+  real, live-indexed data (`correlation_worker.py::_index_to_opensearch`, read back by `GET /search`).
+- **OpenSearch Dashboards (the Kibana-like UI on :5601): never actually used.** Its `.kibana_1` index has
+  0 saved objects since the service was first added (`git log` shows `infrastructure/grafana/` -- and by
+  the same token this service -- untouched since the first commit). Stopped the container
+  (`docker compose stop opensearch-dashboards`, not removed from `docker-compose.yml` -- data lives in
+  the shared `opensearch-data` volume regardless, so nothing is lost and it's a one-command restart if
+  ever needed).
+- **Prometheus: half its scrape targets were dead config, never real containers.** Live `/api/v1/targets`
+  showed 6 of 11 jobs healthy (`asm-api`, `asm-workers` x9, `rabbitmq`, `prometheus` self) and 5
+  permanently down: `postgres-exporter`/`redis-exporter`/`nginx-exporter`/`node-exporter` (containers
+  that were never added to `docker-compose.yml` -- DNS lookup failures, not a recent regression) and
+  `minio` (403, no auth configured) plus a `scheduler` target that can never work since `ScanScheduler`
+  doesn't subclass `BaseWorker` and never calls `start_http_server()`.
+- **Orphaned volumes from an old/renamed project instance**: `docker volume ls` turned up 10 volumes
+  prefixed `asm-platform-by-claude-ilalaelah18_*` with no matching `docker compose ls` project and no
+  container (running or stopped) referencing them -- ~362MB, entirely dead.
+- **`prometheus-data` itself: 895MB**, the single largest volume in the live project. TSDB stats showed
+  `erlang_vm_allocators` (RabbitMQ's Erlang VM internals, exposed by the `rabbitmq_prometheus` plugin)
+  alone accounted for 912 of ~3,456 total series -- high-cardinality detail nothing dashboards or alerts
+  on, accumulating under the 30-day retention window for no benefit.
+
+### Fixed / Removed
+- Deleted the 10 orphaned `asm-platform-by-claude-ilalaelah18_*` volumes (user ran this directly --
+  `docker volume rm` is blocked from automated execution by this environment's auto-mode classifier).
+- `infrastructure/prometheus/prometheus.yml`: removed the 5 scrape jobs pointing at exporters that don't
+  exist (`postgres`, `redis`, `nginx`, `node`, `minio`) and the `scheduler` target from the `asm-workers`
+  job; added a `metric_relabel_configs` drop rule for `erlang_vm_allocators.*` on the `rabbitmq` job
+  (confirmed the existing Grafana panel only ever queried `rabbitmq_queue_messages`, never this metric,
+  so nothing else was affected).
+- Stopped `opensearch-dashboards`.
+
+### Verified
+- Confirmed all 10 orphaned volumes gone (`docker volume ls` no longer lists them), all `attack-
+  surfaces-management_*` volumes untouched.
+- Reloaded Prometheus (discovered along the way: its `/-/reload` HTTP endpoint didn't actually refresh
+  the bind-mounted config in this environment -- a full `docker compose restart prometheus` did; see the
+  nginx entry above for the same discovery recurring). Confirmed via `/api/v1/targets` the dead jobs are
+  gone and the live ones (`asm-api`, `asm-workers`, `rabbitmq`, `prometheus`) stayed healthy throughout;
+  confirmed `erlang_vm_allocators` dropped to 0 series and `rabbitmq_queue_messages` (the panel's actual
+  dependency) unaffected.
+- Left `prometheus-data`'s existing 895MB untouched (ages out naturally over the 30d retention window)
+  rather than deleting the volume outright, per the user's choice not to reset historical data.
+
+---
+
+## 2026-07-23 — Frontend: risk heatmap view on Attack Surface Map (additive, no old view touched)
+
+Follow-up to the design-recommendation pass below. User was explicit that any new-design work had
+to stay additive -- old views stay reachable, nothing gets replaced.
+
+### Added
+- **`components/charts/RiskHeatmap.tsx`** (new): a third view on `dashboard/attack-surface/page.tsx`
+  (`Clusters` / `Heatmap` / `Graph (legacy)` toggle -- the existing two are byte-for-byte unchanged).
+  Reuses the same already-fetched `NetworkClustersResponse` the `Clusters` view uses (no new API
+  call) and renders every cluster + standalone host as a grid cell, colored on a continuous cool
+  (emerald) → hot (red) gradient by a weighted-severity score (critical=4/high=3/medium=2/low=1),
+  normalized against the highest-risk cell in the current dataset. Zero-finding cells render neutral
+  rather than "cool-green" (a heatmap where "nothing happening" competes visually with real signal
+  is the wrong call -- matches the GitHub-contribution-graph convention of gray-for-none). Clicking a
+  cell expands the same severity-count + top-findings detail the cluster list already shows.
+  Color uses the app's existing severity hues (emerald ~160°/amber ~48°/red 0°) as translucent tints
+  over the existing surface color, not solid fills -- same technique the severity badges already use,
+  so it didn't need separate light/dark contrast tuning per cell.
+- **`globals.css`**: added `.hud-corners`, an opt-in utility (small corner-bracket accent via
+  `::before`/`::after`, `currentColor`-based so it needs no per-theme color) -- applied only to the
+  new heatmap's cells, not retrofitted onto `.glass-card`/`.metric-card` globally.
+- Wired up `bg-grid-pattern`/`bg-grid` as the heatmap grid's backdrop texture -- both were already
+  defined in `tailwind.config.ts` but unused anywhere in the app until now.
+- Verified via `tsc --noEmit`, `next lint`, `next build` (all clean; `/dashboard/attack-surface`
+  bundle grew 10.3kB → 11.5kB for the new view). Visual appearance not eyeballed in a browser (no
+  screenshot tool available this session), same caveat as the entry below.
+
+---
+
 ## 2026-07-23 — Frontend: dashboard modal/dropdown accessibility fixes + light theme
 
 Ran a UI/UX audit of the frontend shell (Sidebar, DashboardHeader, modals, shared badge

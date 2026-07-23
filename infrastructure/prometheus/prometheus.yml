@@ -32,6 +32,8 @@ scrape_configs:
         replacement: "asm-api"
 
   # ── ASM Workers ───────────────────────────────────────────
+  # `scheduler` deliberately excluded: ScanScheduler doesn't subclass
+  # BaseWorker, so it never calls start_http_server() and has no /metrics.
   - job_name: "asm-workers"
     static_configs:
       - targets:
@@ -44,20 +46,7 @@ scrape_configs:
           - "worker-correlation:8001"
           - "worker-risk:8001"
           - "worker-notification:8001"
-          - "scheduler:8001"
     metrics_path: "/metrics"
-    scrape_interval: 15s
-
-  # ── PostgreSQL ────────────────────────────────────────────
-  - job_name: "postgres"
-    static_configs:
-      - targets: ["postgres-exporter:9187"]
-    scrape_interval: 30s
-
-  # ── Redis ─────────────────────────────────────────────────
-  - job_name: "redis"
-    static_configs:
-      - targets: ["redis-exporter:9121"]
     scrape_interval: 15s
 
   # ── RabbitMQ ──────────────────────────────────────────────
@@ -65,22 +54,22 @@ scrape_configs:
     static_configs:
       - targets: ["rabbitmq:15692"]
     scrape_interval: 15s
+    metric_relabel_configs:
+      # erlang_vm_allocators alone is 900+ series of BEAM VM internals
+      # nothing here dashboards or alerts on -- dropped to stop it from
+      # dominating TSDB storage under the 30d retention window.
+      - source_labels: [__name__]
+        regex: "erlang_vm_allocators.*"
+        action: drop
 
-  # ── NGINX ─────────────────────────────────────────────────
-  - job_name: "nginx"
-    static_configs:
-      - targets: ["nginx-exporter:9113"]
-    scrape_interval: 15s
-
-  # ── Node / host metrics ───────────────────────────────────
-  - job_name: "node"
-    static_configs:
-      - targets: ["node-exporter:9100"]
-    scrape_interval: 15s
+  # ── Postgres / Redis / NGINX / host metrics ──────────────
+  # No postgres-exporter / redis-exporter / nginx-exporter / node-exporter
+  # container exists in docker-compose.yml -- these were scrape targets
+  # for exporters that were never actually deployed. Re-add a job here
+  # if/when the matching exporter container is added for real.
 
   # ── MinIO ─────────────────────────────────────────────────
-  - job_name: "minio"
-    metrics_path: "/minio/v2/metrics/cluster"
-    static_configs:
-      - targets: ["minio:9000"]
-    scrape_interval: 30s
+  # minio:9000/minio/v2/metrics/cluster requires an authenticated Prometheus
+  # bearer token (MinIO admin API) that was never configured -- scraping it
+  # unauthenticated always 403s. Re-add once MINIO_PROMETHEUS_AUTH_TYPE /
+  # a scrape bearer_token_file is actually wired up.
