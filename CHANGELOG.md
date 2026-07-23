@@ -4,6 +4,43 @@ All notable changes to this project are documented below, sorted newest-first.
 
 ---
 
+## 2026-07-22 — Fixed silent Telegram notification failures on titles with Markdown syntax
+
+User asked to verify the Telegram notification channel actually works end-to-end. Channel wiring itself
+was already complete (`_send_telegram()` in `workers/notification/notification_worker.py`, `TELEGRAM_BOT_TOKEN`/
+`TELEGRAM_CHAT_ID` already declared in `docker-compose.yml`'s `worker-notification` service, `POST
+/notifications/rules` already accepts `channels: ["telegram"]` + per-rule `config` override), but tracing
+the actual message-send path surfaced a real bug: `_send_telegram()` interpolates `org_name` and finding
+titles/change messages directly into a `parse_mode: "Markdown"` (Telegram's strict legacy mode) payload.
+Real finding titles in the DB contain unescaped syntax characters (`Drupal User Enumeration [Redirect]`) —
+`[` triggers Telegram's link-parsing and, unbalanced, makes the whole `sendMessage` call fail with `can't
+parse entities`. `_dispatch()`'s per-channel try/except swallows that error silently (just a log line), so
+a workspace with a Telegram rule configured would have real alerts vanish exactly when a finding title
+happened to contain `_ * \` [`, with zero visible indication anything went wrong — the same silent-no-op
+shape as the SMTP env-var gap below.
+
+### Fixed
+- **`workers/notification/notification_worker.py`**: added `_escape_telegram_md()` (escapes `_ * \` [`
+  per Telegram legacy Markdown's special-character set) and applied it to `org_name`, the change type
+  label, and the change message before they're interpolated into the Telegram payload text. Hand-written
+  formatting markup (the bold/italic wrapping we add ourselves) is untouched — only the dynamic/user-derived
+  segments are escaped.
+
+### Verified
+- Confirmed the concrete real-data trigger first: `SELECT DISTINCT title FROM findings WHERE title ~
+  '[_*\`\[\]]'` returned real unescaped titles (`Drupal User Enumeration [Redirect]`, `Drupal User
+  Enumration [Ajax]`, `Apache mod_negotiation - Pseudo Directory Listing`) confirming this isn't
+  theoretical.
+- Confirmed network egress from the `worker-notification` container to `api.telegram.org` works (200 OK).
+- Restarted `worker-notification`; came up clean, no errors.
+- Dry-run message construction (real title + `org_name` containing `&`/`[`) confirmed correct escaping
+  output (`\[`, `\_`) with formatting markup intact.
+- **Not done**: a live send test against a real Telegram bot — `.env`'s `TELEGRAM_BOT_TOKEN`/
+  `TELEGRAM_CHAT_ID` are unset and no `NotificationRule` exists yet for the real workspace; user opted to
+  defer the live-send test until real bot credentials are available rather than have one fabricated.
+
+---
+
 ## 2026-07-21 — Full repo documentation rewrite, with diagrams
 
 The user asked for complete, well-organized, detailed documentation of the whole repo, diagrams

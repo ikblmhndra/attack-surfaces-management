@@ -5,6 +5,7 @@ Evaluates notification rules and dispatches alerts across channels.
 import asyncio
 import json
 import os
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -17,6 +18,17 @@ from workers.base_worker import BaseWorker
 from workers.db import get_session
 
 log = structlog.get_logger()
+
+# Legacy Telegram "Markdown" parse_mode treats _ * ` [ as syntax -- an
+# unbalanced one anywhere in interpolated text (real example: a finding
+# titled "Drupal User Enumeration [Redirect]") makes the whole sendMessage
+# call fail with "can't parse entities", which _dispatch()'s try/except
+# then swallows silently. Escape dynamic text before interpolating.
+_TELEGRAM_MD_SPECIAL_RE = re.compile(r"([_*`\[])")
+
+
+def _escape_telegram_md(text: str) -> str:
+    return _TELEGRAM_MD_SPECIAL_RE.sub(r"\\\1", text)
 
 SEVERITY_PRIORITY = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 SEVERITY_EMOJI = {
@@ -309,13 +321,15 @@ class NotificationWorker(BaseWorker):
         if not bot_token or not chat_id:
             return
 
-        lines = [f"🛡️ *ASM Alert — {org_name}*", f"_{len(changes)} change(s) detected_", ""]
+        lines = [f"🛡️ *ASM Alert — {_escape_telegram_md(org_name)}*", f"_{len(changes)} change(s) detected_", ""]
 
         for change in changes[:8]:
             sev = change.get("severity", "info")
             emoji = SEVERITY_EMOJI.get(sev, "⚪")
-            lines.append(f"{emoji} *{change.get('type', '').replace('_', ' ').title()}*")
-            lines.append(f"  {change.get('message', '')}")
+            change_type = _escape_telegram_md(change.get("type", "").replace("_", " ").title())
+            change_message = _escape_telegram_md(change.get("message", ""))
+            lines.append(f"{emoji} *{change_type}*")
+            lines.append(f"  {change_message}")
 
         if len(changes) > 8:
             lines.append(f"_...and {len(changes) - 8} more_")
