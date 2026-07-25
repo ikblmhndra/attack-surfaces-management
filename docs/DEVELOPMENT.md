@@ -141,6 +141,30 @@ for non-prod), and if a *worker* needs it, also add it under that service's `env
   change needs `docker compose build frontend && docker compose up -d --no-deps frontend` before it's
   visible, even though the dev-mode `npm run dev` workflow doesn't need this.
 - **Migration autogenerate noise** — see [Migrations](#migrations) above.
+- **NGINX regex static-asset location beats plain prefix locations** — `nginx.conf` has a
+  `location ~* \.(js|css|png|...)$` block for long-cache static assets, and by NGINX's own matching
+  rules a regex location always wins over a plain prefix location unless that prefix uses the `^~`
+  modifier. Any new reverse-proxied service that serves its own `.js`/`.css` (Grafana, Prometheus, a
+  future one) needs `location ^~ /whatever/`, not just `location /whatever/` — without it, every JS/CSS
+  request for that service silently gets routed to the frontend upstream instead and 404s there
+  (surfaced as Grafana's own "failed to load application files" screen / a blank Prometheus page — see
+  `CHANGELOG.md`, 2026-07-23).
+- **Grafana behind a subpath needs `GF_SERVER_SERVE_FROM_SUB_PATH=true` *and* no trailing slash on
+  `proxy_pass`** — with the env var set, Grafana expects the `/grafana` prefix still present on the
+  incoming request path; a trailing-slash `proxy_pass http://grafana:3000/;` strips that prefix before
+  forwarding, and Grafana redirects back to `/grafana/` to "correct" it — an infinite redirect loop.
+  `proxy_pass http://grafana:3000;` (no trailing slash) forwards the full path unchanged instead.
+- **Prometheus's `/-/reload` (`--web.enable-lifecycle`) didn't actually refresh the bind-mounted config
+  in this environment** — editing `prometheus.yml` and hitting the reload endpoint returned 200, but the
+  running container kept reading stale content (confirmed via mismatched inode/mtime between the host
+  file and what the container saw). A full `docker compose restart prometheus` did pick up the change.
+  Worth trying a full restart first if a config edit doesn't seem to take effect, rather than assuming
+  the edit itself was wrong.
+- **RabbitMQ's Prometheus plugin has no per-queue labels by default** — `rabbitmq_queue_messages` (and
+  similar) only exposes one cluster-wide aggregate unless `prometheus.return_per_object_metrics = true`
+  is set in `rabbitmq.conf` (~24 queues here, so the added series count is small). Without it, any
+  dashboard panel expecting a `queue`/`vhost` label (e.g. `legendFormat: "{{queue}}"`) silently renders
+  nothing, indistinguishable from a broken query.
 
 ## Registration → workspace → product entitlement (for anyone extending auth)
 

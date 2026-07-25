@@ -4,6 +4,15 @@ Base path: `/api/v1` (behind NGINX, see [ARCHITECTURE.md](./ARCHITECTURE.md#ngin
 endpoint list below was extracted directly from the router decorators in
 `backend/app/api/v1/endpoints/*.py` on 2026-07-21 — this is exhaustive, not a curated subset.
 
+**Interactive reference**: `/api/docs` serves a self-hosted [Scalar](https://scalar.com) UI generated
+live from the real OpenAPI schema (`/api/openapi.json`) — request/response shapes, try-it-out, and
+generated code samples in several languages/tools. This document stays useful for the auth model and
+product-gating notes below that the schema alone doesn't capture; `/api/docs` is the source of truth for
+exact request/response shapes. Note: most endpoints don't declare a Pydantic `response_model` yet, so
+response schemas in the generated reference are often generic — request bodies are typed accurately
+where a Pydantic model is used (most POST/PUT endpoints), but treat undocumented response fields as
+"see the endpoint code," not as an exhaustive contract.
+
 ## Authentication
 
 Two auth methods, both resolved by `get_token_payload` (`backend/app/api/v1/dependencies/auth.py`):
@@ -127,7 +136,7 @@ A request to a gated router from a workspace lacking that product gets `403` wit
 
 | Method | Path | Notes |
 |---|---|---|
-| POST | `/reports/generate` | Synchronous, `BackgroundTasks`-driven (not queue-based) — `executive` format is summary-only, `technical`/`compliance`/`custom` get the full finding list (the latter two are currently aliases, no real framework-mapping built yet). `format="pdf"` renders via WeasyPrint and uploads to the MinIO `reports` bucket. |
+| POST | `/reports/generate` | Synchronous, `BackgroundTasks`-driven (not queue-based) — `executive` format is summary-only, `technical`/`compliance`/`custom` get the full finding list. `compliance` reports do have real framework mapping now: `backend/app/services/compliance_mapping.py::get_cis_mapping()` maps every `Finding.category` to a CIS Controls v8 Control + Safeguard (display-only — doesn't affect scoring); `custom` is still a plain alias of `technical` with no section-picker built. Every report type also gets a deterministic executive narrative paragraph (`report_narrative.py::build_executive_narrative()` — templated from already-computed fields, not an LLM call, so every sentence traces back to a real number in the report). `format="pdf"` renders via WeasyPrint and uploads to the MinIO `reports` bucket. |
 | GET | `/reports`, `/reports/{report_id}`, `/reports/{report_id}/download` | |
 
 ## `screenshots` — ASM only

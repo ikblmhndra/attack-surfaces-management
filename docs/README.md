@@ -12,7 +12,7 @@ something here corrects a previously-wrong claim, it says so explicitly rather t
 | [ARCHITECTURE.md](./ARCHITECTURE.md) | System context diagram, container/network topology, NGINX routing, the outbox request-flow pattern, why ASM and Bug Bounty are two separate pipelines, known docs-vs-reality drift |
 | [DATA_MODEL.md](./DATA_MODEL.md) | Full ERD (both schemas) + a complete field-by-field reference table for all 36 tables |
 | [PIPELINES.md](./PIPELINES.md) | Queue topology table, the ASM scan pipeline flowchart, the Bug Bounty pipeline flowchart, the two-gate scope-safety model, the exploit-module reference table |
-| [API_REFERENCE.md](./API_REFERENCE.md) | Every endpoint, every router, the auth model (JWT claims / RBAC / product entitlement), which routers are gated to which product |
+| [API_REFERENCE.md](./API_REFERENCE.md) | Every endpoint, every router, the auth model (JWT claims / RBAC / product entitlement), which routers are gated to which product — see also the live interactive reference at `/api/docs` |
 | [FRONTEND.md](./FRONTEND.md) | App Router structure, the two-dashboard-shell split, Zustand store shape, the Bug Bounty program-detail page's tab-by-tab UI patterns |
 | [DEVELOPMENT.md](./DEVELOPMENT.md) | Makefile commands, migration gotchas, the risk-scoring formula worked through step by step, the full incident-derived gotchas list |
 

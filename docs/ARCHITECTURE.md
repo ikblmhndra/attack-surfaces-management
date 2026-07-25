@@ -98,7 +98,13 @@ single ingress point) and `asm-internal` (everything else, including `nginx` its
 `api`/`frontend`). Nothing except NGINX is directly reachable from outside the host in a production
 deployment; port publishes on other services (`postgres:5432`, `rabbitmq:15672`, `minio:9001`,
 `opensearch-dashboards:5601`, `prometheus:9090`, `grafana:3001`) exist for local development/ops access,
-not for the application's own runtime traffic.
+not for the application's own runtime traffic. Grafana and Prometheus are *also* reverse-proxied through
+NGINX now (`/grafana/`, `/prometheus/` — see the routing table below), so both a direct-port path and an
+NGINX-fronted path work simultaneously; the direct ports weren't removed, the NGINX routes were added on
+top. `opensearch-dashboards` is stopped by default (its own UI was found unused in a storage audit — see
+`CHANGELOG.md`, 2026-07-23) but the container definition is still there; `docker compose up -d
+opensearch-dashboards` brings it back with no other setup needed, since its data lives in the shared
+`opensearch-data` volume regardless of whether the UI container is running.
 
 ```mermaid
 flowchart LR
@@ -125,6 +131,8 @@ flowchart LR
     nginx --> api
     nginx --> frontend
     nginx -.->|"/storage/*"| minio
+    nginx -.->|"/grafana/*"| grafana
+    nginx -.->|"/prometheus/*"| prometheus
     api --> postgres & redis & rabbitmq & opensearch & minio
     w1 --> postgres & redis & rabbitmq & minio & opensearch
     scheduler --> postgres & rabbitmq
@@ -149,6 +157,9 @@ in dev.
 | `/api/*` (everything else) | `api` — 200r/m, burst 50 | `api:8000` | The zone whose burst limit motivated building a real bulk-promote endpoint for Bug Bounty asset promotion instead of pacing client-side loops — see `CHANGELOG.md` |
 | `/ws`, `/ws/*` | `global` | `api:8000/api/v1/ws/` | WebSocket upgrade, live scan/notification events |
 | `/storage/*` | — | `minio:9000` | Direct proxy to object storage (screenshots, PDFs) |
+| `/api/docs`, `/api/openapi.json` | `api` — 200r/m, burst 50 | `api:8000` | Self-hosted Scalar API reference (no CDN — see `CHANGELOG.md`, 2026-07-26); falls under the generic `/api/*` rule above, not a separate location |
+| `/grafana/*` | — | `grafana:3000` | `location ^~ /grafana/`, no trailing slash on `proxy_pass` — both required (redirect loop + regex-location hijack otherwise, see `DEVELOPMENT.md` gotchas). Protected by Grafana's own login, no extra NGINX auth |
+| `/prometheus/*` | — | `prometheus:9090` | `location ^~ /prometheus/`. Prometheus has no login of its own, so this one *is* additionally gated by NGINX `auth_basic` (`infrastructure/nginx/conf.d/.htpasswd`, gitignored, never committed) |
 | `/health`, `/metrics` | — | `api:8000` | `/metrics` restricted to internal ranges |
 | `/` (default) | `global` — 100r/m, burst 100 | `frontend:3000` | Next.js standalone server |
 

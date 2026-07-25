@@ -54,6 +54,9 @@ a request that could only 403).
 
 ```
 frontend/src/app/
+├── page.tsx                       # bare "/" — no content of its own, waits on
+│                                   # Providers.tsx's auth resolution then redirects
+│                                   # to /dashboard(/bounty) or /auth/login
 ├── auth/
 │   ├── login/page.tsx
 │   ├── register/page.tsx        # product picker (ASM / Bug Bounty / both) lives here
@@ -63,7 +66,7 @@ frontend/src/app/
 │   ├── page.tsx                  # ASM overview
 │   ├── organizations/            # ASM
 │   ├── assets/                   # ASM
-│   ├── attack-surface/           # ASM — graph visualization
+│   ├── attack-surface/           # ASM — Clusters / Heatmap / Graph (legacy), see below
 │   ├── findings/                 # ASM
 │   ├── risks/                    # ASM — risk score detail
 │   ├── scans/                    # ASM
@@ -84,6 +87,19 @@ frontend/src/app/
 └── api/                           # (Next.js route handlers, if any — thin)
 ```
 
+## Attack Surface Map (`dashboard/attack-surface/page.tsx`)
+
+Three views behind one `view: "clusters" | "heatmap" | "graph"` toggle, defaulting to `"clusters"`:
+
+| View | Data source | Notes |
+|---|---|---|
+| **Clusters** | `GET /organizations/{id}/network-clusters` | Default. Groups subdomains by shared resolved IP — replaced the node-link graph as the primary view (see `CHANGELOG.md`, 2026-07-15) since the graph became unreadable at real density. |
+| **Heatmap** (`components/charts/RiskHeatmap.tsx`) | Same `network-clusters` query as Clusters — no separate API call | Additive third view, added on top without touching the other two (`CHANGELOG.md`, 2026-07-23). Every cluster/standalone host is a grid cell, colored on a continuous emerald→red gradient by a weighted-severity score (critical=4/high=3/medium=2/low=1) normalized against the highest-risk cell in the dataset. Zero-finding cells render neutral rather than "cool green" — matches the GitHub-contribution-graph convention so "nothing happening" doesn't visually compete with real signal. |
+| **Graph (legacy)** | `GET /organizations/{id}/attack-surface-graph`, only fetched when this tab is actually selected | The original node-link view (Cytoscape), kept reachable rather than deleted; tech/finding node-type toggles default off to start topology-focused. |
+
+`Clusters` and `Heatmap` share one query (`enabled: view === "clusters" || view === "heatmap"`), so
+switching between them is instant with no refetch; `Graph`'s query only runs once that tab is selected.
+
 ## `store/workspace.ts` (Zustand)
 
 Single global store covering auth + workspace + UI state:
@@ -101,6 +117,25 @@ Persisted subset (`localStorage`, key `asm-workspace`): `workspaceId`, `workspac
 `enabledProducts`, `activeOrg`, `sidebarCollapsed`, `theme`. The JWT itself lives separately
 (`lib/api.ts::tokenStorage`, keys `asm_access_token`/`asm_refresh_token`) so a page reload only needs
 `Providers.tsx` to call `refreshUser()` once on mount if a token is present.
+
+## Theming and accessibility
+
+Light/dark theme is `store/workspace.ts`'s `theme` field, applied as a `.dark` class on `<html>`
+(`Providers.tsx` toggles it on change; a blocking inline script in `app/layout.tsx` sets it before first
+paint using the same persisted `localStorage` key, to avoid a flash of the wrong theme on reload). Both
+themes are defined as CSS custom properties in `globals.css` — light is `:root`'s default, the
+(unchanged, pixel-identical) original dark palette moved under a `.dark` class block. `SeverityBadge.tsx`
+and every severity/grade color reference in the app read the same `--severity-*`/`--grade-*` tokens
+rather than each maintaining its own literal Tailwind color mapping.
+
+Modals (`ScanModal.tsx`, `FindingDetailModal.tsx`, the inline "New Scan" modal in `dashboard/page.tsx`)
+and header dropdowns (`DashboardHeader.tsx`'s org selector/notifications/user menu) are built on
+`@radix-ui/react-dialog` / `@radix-ui/react-dropdown-menu` — both were already dependencies, unused,
+before hand-rolled `fixed inset-0` divs and manual outside-click listeners were replaced with them
+(focus trap, Escape-to-close, return-focus-on-close, `role="dialog"`/`role="menu"` all come from Radix,
+not reimplemented). `Providers.tsx` wraps the app in framer-motion's `<MotionConfig
+reducedMotion="user">`, so every existing animation (page transitions, sidebar width, dropdown/modal
+enter) respects the OS-level reduced-motion setting.
 
 ## Bug Bounty program detail page (`dashboard/bounty/[id]/page.tsx`)
 

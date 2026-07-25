@@ -4,6 +4,102 @@ All notable changes to this project are documented below, sorted newest-first.
 
 ---
 
+## 2026-07-26 — Documentation catch-up: 6 files drifted since the 2026-07-21 rewrite
+
+User flagged that the full documentation rewrite from 2026-07-21 seemed incomplete. Re-audited every
+doc against current code (same discipline as the original rewrite) instead of guessing what was
+missing, and found real drift across 6 files — one of them an outright factual error, not just an
+omission.
+
+### Fixed
+- **`docs/API_REFERENCE.md`**: the `reports` endpoint row claimed "no real framework-mapping built yet"
+  for `compliance`/`custom` reports — flatly wrong now; `backend/app/services/compliance_mapping.py`
+  has real CIS Controls v8 mapping, added 2026-07-15. Corrected, and added the executive-narrative
+  feature (`report_narrative.py`) that was also undocumented.
+- **`docs/PRD.md`**: the roadmap still listed a suspected cross-tenant data leak as "flagged as high
+  priority but not yet actioned" — it was actually investigated exhaustively on 2026-07-22 (every
+  endpoint file, the auth/JWT layer, the correlation worker's cross-org queries) and not found.
+  Corrected to reflect that only 2 of the original 3 self-security issues are still real
+  (workspace-invite stub, SMTP env-var gap — both confirmed still unfixed while writing this), plus a
+  new low-priority hardening nit the audit surfaced (`findings.py::bulk_action`'s UPDATE statements
+  don't re-assert `workspace_id`, though not currently exploitable).
+
+### Added
+- **`docs/ARCHITECTURE.md`**: `/grafana/` and `/prometheus/` added to the NGINX routing table and the
+  container-topology diagram (missing entirely — the reverse-proxy work landed after this doc was
+  written); noted `opensearch-dashboards` is stopped by default now.
+- **`docs/FRONTEND.md`**: the Attack Surface Map's `attack-surface/` entry was still described as just
+  "graph visualization" — added a real section on all 3 views (Clusters/Heatmap/Graph legacy) and which
+  data source each uses; added a "Theming and accessibility" section (the Radix UI modal/dropdown
+  rewrite, light theme, `MotionConfig reducedMotion`) that had no coverage at all; added the new root
+  `page.tsx` to the App Router tree.
+- **`docs/DEVELOPMENT.md`**: 4 new gotchas from the infra work that weren't captured anywhere — the
+  NGINX regex-static-asset-location-beats-plain-prefix bug (`^~` requirement), Grafana's subpath
+  trailing-slash redirect-loop trap, Prometheus's `/-/reload` not actually refreshing its bind-mounted
+  config in this environment (full restart does), and RabbitMQ needing
+  `prometheus.return_per_object_metrics = true` before any per-queue metric exists at all.
+- **`docs/PIPELINES.md`**: a short note that ASM reporting is deliberately not a queue pipeline stage
+  (synchronous `BackgroundTasks`, not chained), with a pointer to the compliance-mapping/narrative
+  detail now in API_REFERENCE.md.
+
+### Verified
+- Grepped every changed doc for the specific gap terms (`/grafana/`, `Heatmap`, `Theming`,
+  `return_per_object`, `CIS Controls`, etc.) to confirm each landed exactly once in the intended file,
+  not zero and not duplicated.
+- Re-ran the same broken-GFM-table-row check used during the original rewrite (a `|`-initial line not
+  also `|`-terminal) against all 6 changed files — clean.
+- Confirmed the 2 "still open" self-security claims directly against current code before writing them
+  down, rather than trusting the earlier investigation's memory: `workspaces.py::invite_member` is
+  still a bare `return {"message": "Invitation sent"}`, and `docker-compose.yml`'s `worker-notification`
+  environment block still has no `SMTP_*` vars.
+
+---
+
+## 2026-07-26 — Interactive API reference at `/api/docs` (self-hosted Scalar)
+
+User asked for OpenAPI-backed API docs (OpenAPI + Scalar or Swagger UI), explicitly asking to check
+which fits before building. Investigation found: `main.py` already had `docs_url`/`redoc_url`/
+`openapi_url` wired up, but all three were conditionally disabled whenever `ENVIRONMENT=production`
+(the live value in `.env`) -- so none of `/api/docs`, `/api/redoc`, `/api/openapi.json` were reachable
+at all. Router tags were already clean (`Authentication`, `Bug Bounty`, etc., set at
+`include_router(..., tags=[...])` in `router.py`), a good foundation either way. The deciding factor
+between the two options: FastAPI's built-in Swagger UI, and every common Scalar integration, both
+default to loading their JS/CSS from `cdn.jsdelivr.net` -- which nginx's existing CSP (`script-src
+'self'`) blocks outright, so either choice needed self-hosting regardless, not just picking the
+"easier" one. Chose Scalar for the nicer UI/DX given roughly equal self-hosting effort either way.
+
+### Added
+- **`backend/app/static/scalar/standalone-1.63.0.js`**: Scalar's standalone browser bundle, vendored
+  locally at a pinned version (not `@latest`, not loaded from jsdelivr at request time) — downloaded
+  once, verified byte-identical against the pinned CDN URL, then committed as a local asset.
+- **`GET /api/docs`** (`backend/app/main.py`): returns an HTML page with a `<script id="api-reference"
+  data-url="/api/openapi.json">` tag followed by the vendored bundle inlined directly in a `<script>`
+  block — no separate static-file route needed, which also sidesteps the location-precedence bug the
+  Grafana/Prometheus nginx work found (an `/api/static/...` route would otherwise get hijacked by
+  nginx's regex `.js`/`.css` location, same class of bug fixed there).
+- `openapi_url="/api/openapi.json"` is now always on regardless of `ENVIRONMENT` — it's read-only API
+  shape, not live data, and the same surface is already fully documented in
+  `docs/API_REFERENCE.md`, which is already in the repo. `docs_url`/`redoc_url` stay permanently
+  disabled (`None`) since Scalar replaces both.
+- Cross-linked from `docs/API_REFERENCE.md` and `docs/README.md`; the API_REFERENCE.md doc now also
+  notes the real limitation the schema exposes: most endpoints don't declare a Pydantic
+  `response_model`, so generated response schemas are often generic (request bodies are accurately
+  typed, since most POST/PUT endpoints do use Pydantic request models).
+
+### Verified
+- `curl`-tested through nginx (no nginx.conf changes needed at all — both paths flow through the
+  existing `/api/` proxy block): `/api/openapi.json` 200s with 85 real paths across all 16 expected
+  tags; `/api/docs` 200s, full 3.7MB bundle present in the response body, gzip applied
+  (`content-encoding: gzip`) so actual wire size is much smaller.
+- Real-browser check via Playwright (run inside the `worker-screenshot` container, which already has
+  it installed, against the live nginx-fronted URL): page title, sidebar tag groups (confirmed both
+  "Authentication" and "Bug Bounty" render), and the client-code-sample panel all populated correctly
+  from the real schema. 14 console errors, all the same known/accepted CSP font-blocks
+  (`fonts.scalar.com` blocked by `font-src 'self'`) — cosmetic only, falls back to system fonts,
+  deliberately not loosening the CSP for it.
+
+---
+
 ## 2026-07-23 — Grafana dashboard tuning: removed dead panels, fixed RabbitMQ per-queue metrics
 
 User asked for the Grafana dashboard (`infrastructure/grafana/dashboards/asm-overview.json`) to be tuned

@@ -3,13 +3,14 @@ ASM Platform — FastAPI Application Entry Point
 """
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import structlog
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from prometheus_fastapi_instrumentator import Instrumentator
 
 from app.api.v1.router import api_router
@@ -23,6 +24,16 @@ from app.core.minio_client import init_minio
 from app.services.outbox_service import start_outbox_dispatcher, stop_outbox_dispatcher
 
 log = structlog.get_logger()
+
+# Scalar's standalone bundle, vendored locally (not loaded from its default
+# jsdelivr CDN) so the API reference page works under the same strict CSP
+# (script-src 'self') everything else in nginx.conf enforces. Read once at
+# import time and inlined directly into the docs page -- no extra static
+# file route needed, which also sidesteps the location-precedence bug the
+# Grafana/Prometheus reverse-proxy work just found (nginx's regex .js/.css
+# location would otherwise hijack a separate /api/static/... route).
+_SCALAR_JS_PATH = Path(__file__).parent / "static" / "scalar" / "standalone-1.63.0.js"
+_SCALAR_JS = _SCALAR_JS_PATH.read_text()
 
 
 @asynccontextmanager
@@ -56,9 +67,14 @@ def create_application() -> FastAPI:
         title="ASM Platform API",
         description="Attack Surface Management & External Security Posture Management Platform",
         version=settings.VERSION,
-        docs_url="/api/docs" if settings.ENVIRONMENT != "production" else None,
-        redoc_url="/api/redoc" if settings.ENVIRONMENT != "production" else None,
-        openapi_url="/api/openapi.json" if settings.ENVIRONMENT != "production" else None,
+        # Swagger UI / ReDoc disabled outright -- /api/docs below is a
+        # self-hosted Scalar reference instead (see _SCALAR_JS above). The
+        # raw schema stays on regardless of environment: it's read-only API
+        # shape, not live data, and docs/API_REFERENCE.md already documents
+        # the same surface in the repo.
+        docs_url=None,
+        redoc_url=None,
+        openapi_url="/api/openapi.json",
         lifespan=lifespan,
     )
 
@@ -116,6 +132,23 @@ def create_application() -> FastAPI:
 
     # ── Routes ────────────────────────────────────────────────
     app.include_router(api_router, prefix="/api/v1")
+
+    # ── API reference (Scalar, self-hosted) ───────────────────
+    @app.get("/api/docs", include_in_schema=False)
+    async def api_docs():
+        return HTMLResponse(f"""<!doctype html>
+<html lang="en">
+<head>
+    <title>ASM Platform API Reference</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex, nofollow" />
+</head>
+<body>
+    <script id="api-reference" data-url="/api/openapi.json"></script>
+    <script>{_SCALAR_JS}</script>
+</body>
+</html>""")
 
     # ── Health check ──────────────────────────────────────────
     @app.get("/health", tags=["health"], include_in_schema=False)

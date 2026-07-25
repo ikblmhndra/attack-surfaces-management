@@ -98,6 +98,16 @@ Named, reusable template-directory sets (`backend/app/services/scan_profiles.py`
 rather than hardcoded: `web_baseline`, `endpoint_high_signal`, `network_safe`, `tls_dns`, `takeover`,
 `cloud_exposure`, `exposure_misconfig`.
 
+### Reporting is deliberately not a queue stage
+
+`POST /reports/generate` runs synchronously via FastAPI `BackgroundTasks`, not chained onto the pipeline
+above — a report is requested on demand against whatever data already exists, not produced as a
+terminal pipeline stage. `compliance` reports map every `Finding.category` to a CIS Controls v8
+Control + Safeguard (`backend/app/services/compliance_mapping.py`, display-only, no scoring effect);
+every report also gets a deterministic executive-narrative paragraph
+(`report_narrative.py::build_executive_narrative()`, templated from already-computed fields, not an LLM
+call). See [API_REFERENCE.md](./API_REFERENCE.md) for the full endpoint contract.
+
 ## Bug Bounty pipeline
 
 ```mermaid

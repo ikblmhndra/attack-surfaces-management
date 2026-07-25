@@ -294,9 +294,17 @@ As of the most recent internal roadmap discussion:
    finding validity/triage correctness, exploit-intelligence accuracy (EPSS/KEV/SSVC), tool parameter
    tuning (rate limits, timeouts, concurrency, flags) over "is the tool wired at all."
 2. **Deferred, explicitly not dropped**:
-   - Platform self-security issues found during an earlier full-repo assessment (workspace-invite stub,
-     email notification breakage, cross-tenant leak) — flagged as high priority but not yet actioned;
-     worth resurfacing once core-feature work reaches a natural pause.
+   - Platform self-security issues found during an earlier full-repo assessment: **2 of the original 3
+     confirmed still open, not yet actioned** — `POST /workspaces/invite` is still a complete no-op stub
+     (`backend/app/api/v1/endpoints/workspaces.py`), and `worker-notification`'s `docker-compose.yml`
+     environment block still omits every `SMTP_*` var, so email notifications silently never send
+     regardless of `.env` config. The third item, a suspected cross-tenant data leak, was
+     **investigated exhaustively (2026-07-22) and not found** — every endpoint file, the auth/JWT
+     dependency layer, and the correlation worker's cross-org shared-IP query were all checked and
+     confirmed properly scoped by `workspace_id`. One related hardening nit surfaced during that audit:
+     `findings.py::bulk_action`'s bulk UPDATE statements don't re-assert `workspace_id` in their own
+     `WHERE` clause (only the pre-check SELECT does) — not currently exploitable, but inconsistent with
+     the defense-in-depth pattern used everywhere else; still on the list, low priority.
    - Dependency/library CVE remediation — deferred until features are stable.
 3. **Frontend changes**: small display/readability fixes can proceed without asking; anything that
    amounts to a visual revamp needs a heads-up first (this document included — see the Bug Bounty
