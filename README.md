@@ -9,7 +9,7 @@ Self-hosted · API-First · Multi-Tenant · Containerized · Enterprise-Ready
 ## Overview
 
 ASM Platform ships **two products from one codebase**, gated per-workspace at registration
-(`Workspace.enabled_products`, chosen once, at signup — see [docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md#registration--workspace--product-entitlement)):
+(`Workspace.enabled_products`, chosen once, at signup — see [docs/EXPLANATION.md](./docs/EXPLANATION.md#why-product-entitlement-is-chosen-once-at-registration)):
 
 1. **Attack Surface Management (ASM)** — continuous, passive discovery and monitoring of an
    organization's internet-facing footprint, nuclei-based vulnerability scanning, correlation, weighted
@@ -368,7 +368,7 @@ so old imports don't break. The real extension points:
 - **New scan tool/stage**: add a file to `workers/scanner/` or `workers/crawler/`, one file per
   tool/stage, wired directly into the queue chain (`workers/base_worker.py::EXCHANGE_MAP` +
   `workers/queue_client.py::ROUTING_CONFIG` + `backend/app/core/queue_client.py::ROUTING_CONFIG` — all
-  three, see [`docs/DEVELOPMENT.md`](./docs/DEVELOPMENT.md#gotchas-from-real-incidents--see-changelogmd-for-the-full-stories)).
+  three, see [`docs/HOWTO.md`](./docs/HOWTO.md#how-to-add-a-new-worker-queue)).
 - **New Bug Bounty exploit module**: add a check function to `workers/bounty/exploit_tools.py` /
   `exploit_ext.py` / a new file, dispatch it from `workers/bounty/exploit_worker.py`, follow the
   existing confirmed-vs-inconclusive status discipline (see
@@ -403,7 +403,7 @@ asm-platform/
 │   │   │   ├── models/          # models.py (ASM, 31 tables) + bounty_models.py (Bug Bounty, 5 tables)
 │   │   │   └── migrations/      # Alembic
 │   │   ├── integrations/        # scanners/ and enrichment/ are empty stub packages — dead, not the
-│   │   │                        # real extension point, see docs/ARCHITECTURE.md "Docs vs. reality"
+│   │   │                        # real extension point, see docs/EXPLANATION.md "Docs vs. reality"
 │   │   ├── services/            # Business logic: risk_engine.py, scan_service.py, bounty_scope.py,
 │   │   │                        # bounty_report.py, outbox_service.py, ...
 │   │   └── workers/              # Empty stub package (0-byte __init__.py) — NOT where workers live

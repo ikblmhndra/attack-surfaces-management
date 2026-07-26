@@ -4,6 +4,61 @@ All notable changes to this project are documented below, sorted newest-first.
 
 ---
 
+## 2026-07-26 — Restructured docs/ around the Diátaxis framework, added an executive summary
+
+User asked whether the documentation followed any recognized standard, then asked to restructure it to
+match Diátaxis (Tutorial / How-to / Reference / Explanation, kept separate rather than mixed in one
+file) as closely as reasonably possible, plus a separate executive summary.
+
+Audited every doc against the framework first: Reference and Explanation content existed but were
+tangled together in the same files (a routing *table* sitting next to *why the architecture is shaped
+this way* prose, in the same document); there was no Tutorial at all; the closest thing to a How-to
+guide (`DEVELOPMENT.md`'s command lists and gotchas) read like a reference lookup, not a goal-oriented
+task walkthrough.
+
+### Added
+- **`docs/TUTORIAL.md`** (new) — hands-on, narrated first run: bring the stack up, register, create an
+  organization, trigger a scan, read the resulting risk score. Written in second person with explicit
+  checkpoints, not a bare command list.
+- **`docs/HOWTO.md`** (new) — task-oriented guides: run the test suite, add a migration, add an env var,
+  add a new worker queue, reverse-proxy a new internal service through NGINX (codifying the three
+  Grafana/Prometheus lessons from 2026-07-23 into one coherent checklist instead of three separate
+  gotchas), scale workers.
+- **`docs/EXPLANATION.md`** (new) — every "why" consolidated in one place: why two pipelines, the scope
+  gate's safety property, why recon needs a real browser for SPA apps, why the two dashboard shells are
+  separate, why the light theme/Radix/reduced-motion work happened, why Scalar is self-hosted instead of
+  CDN-loaded, why product entitlement is chosen once at registration, what the platform self-security
+  audit found and didn't find, and the running "docs vs. reality" correction log.
+- **`docs/EXECUTIVE_SUMMARY.md`** (new) — half-page, non-technical: what the product does, why
+  self-hosted, where it stands, pointers to PRD/full docs for more detail.
+
+### Changed
+- **`docs/ARCHITECTURE.md`**, **`docs/PIPELINES.md`**, **`docs/FRONTEND.md`**: stripped of the
+  discursive "why" prose that used to sit next to their reference tables/diagrams (moved to
+  EXPLANATION.md, with a pointer left behind); what remains is closer to pure Reference — structural
+  facts, tables, diagrams as diagrams, not argument.
+- **`docs/DEVELOPMENT.md`**: narrowed to Reference (Makefile command table, the risk-scoring formula's
+  exact numbers, config wiring, a trimmed factual "known quirks" list) — the actionable "how do I do X"
+  content moved to HOWTO.md, the "why" content moved to EXPLANATION.md.
+- **`docs/PRD.md`**, **`docs/TRD.md`**: left as-is structurally (both are product-planning documents,
+  not user/developer system documentation, so they sit outside Diátaxis's four modes on purpose) but
+  each got a short note saying so, plus a link from PRD.md to the new executive summary. Also fixed a
+  second instance of the same stale compliance-report claim corrected in API_REFERENCE.md a few days
+  ago (PRD.md's product-scope table still said "no real framework-mapping built yet" for `compliance`
+  reports — missed in that earlier pass).
+- **`docs/README.md`**: rewritten as a Diátaxis-labeled index (which mode each doc is, plus a separate
+  "outside the four modes" group for PRD/TRD/Executive Summary) with reading-order guidance per audience.
+
+### Verified
+- Re-ran the broken-GFM-table-row check across every doc file plus the root `README.md` — clean.
+- Grepped for every anchor link that moved as part of the split (`ARCHITECTURE.md#why-two-pipelines-not-one`,
+  `ARCHITECTURE.md#docs-vs-reality`, `DEVELOPMENT.md`'s old gotchas/registration anchors,
+  `PIPELINES.md`'s old scope-gate anchor) across the whole repo, not just `docs/` — found and fixed 9
+  stale cross-references left dangling by the restructure, including 2 in the root `README.md` that
+  predated this session's work entirely.
+
+---
+
 ## 2026-07-26 — Documentation catch-up: 6 files drifted since the 2026-07-21 rewrite
 
 User flagged that the full documentation rewrite from 2026-07-21 seemed incomplete. Re-audited every

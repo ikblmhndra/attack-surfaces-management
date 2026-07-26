@@ -1,9 +1,9 @@
 # Architecture
 
 > Ground truth for this document was verified against the actual code (`docker-compose.yml`,
-> `workers/base_worker.py`, `backend/app/main.py`, `infrastructure/nginx/nginx.conf`) on 2026-07-21,
-> not copied from the previous version of this file. See [Docs vs. reality](#docs-vs-reality) at the
-> bottom for what was wrong before and why.
+> `workers/base_worker.py`, `backend/app/main.py`, `infrastructure/nginx/nginx.conf`), not copied from
+> the previous version of this file. See [EXPLANATION.md's "Docs vs. reality"](./EXPLANATION.md#docs-vs-reality)
+> for what was wrong before and why.
 
 ## What this is
 
@@ -16,7 +16,8 @@ per-workspace at registration time:
    notifications.
 2. **Bug Bounty** — authorized, scope-gated *active* testing (recon → probe → vulnerability scan →
    exploit confirmation → report drafting) for bug bounty engagements. A deliberately separate data
-   model and pipeline from ASM — see [Why two pipelines, not one](#why-two-pipelines-not-one).
+   model and pipeline from ASM — see [EXPLANATION.md](./EXPLANATION.md#why-two-pipelines-not-one) for
+   why.
 
 A `Workspace` is entitled to one or both products (`Workspace.enabled_products`), chosen once at
 registration (self-serve signup always creates a brand-new workspace — see
@@ -215,38 +216,16 @@ sequenceDiagram
 `outbox_service.py`'s dispatcher is started/stopped in `main.py`'s FastAPI `lifespan`. The Bug Bounty
 `POST /programs/{id}/run/{stage}` and `run/pipeline` endpoints use the exact same outbox path.
 
-## Why two pipelines, not one
+## Known drift and dead code, factually
 
-`BountyProgram`/`BountyTarget`/`BountyAsset`/`ExploitAttempt`/`BountyReport` (see
-[DATA_MODEL.md](./DATA_MODEL.md)) never reference `Organization`/`Asset` at all — a deliberate schema
-split, not an oversight: ASM is passive, continuous, monitoring-oriented, and its Asset rows can appear
-without a human ever explicitly approving each one. Bug Bounty is active testing against real, live
-targets and must never let passive discovery silently expand what's touched — a `BountyAsset`
-(recon suggestion) is never auto-promoted to a `BountyTarget` (the human-approved, actually-testable
-list), and every worker in the exploit chain re-validates scope at execution time regardless of what an
-earlier stage already checked. See [PIPELINES.md](./PIPELINES.md) for the full scope-gate model.
-
-## Docs vs. reality
-
-Known drift this rewrite corrects, and a couple of new gotchas worth keeping visible:
-
-- The previous version of this file (and the root `README.md`) implied Shodan/VirusTotal/AbuseIPDB/OTX
-  threat-intel integration. **This was never true.** `backend/app/integrations/enrichment/engine.py` is
-  explicitly a no-op plugin engine kept for import compatibility; the real enrichment path
-  (`workers/enrichment/enrichment_worker.py`) is keyless ASN/RDAP/network-baseline only, by design —
-  there are no intel API keys in `.env.example`. Don't reintroduce provider-keyed enrichment without
-  checking this decision with the project owner first.
-- Neither doc previously mentioned Bug Bounty at all — it's now roughly half the platform's endpoint
-  surface and worker fleet (5 of 17 workers, 6 of the frontend's dashboard tabs).
-- `README.md`'s "Adding Scanner/Enrichment Integrations" section describes a `BaseScannerPlugin`/
-  `BaseEnrichmentPlugin` interface that doesn't exist in code (`backend/app/integrations/scanners/` is
-  an empty package). The real extension point is `workers/scanner/*.py` / `workers/crawler/` — one file
-  per tool/stage, wired directly into the queue chain.
-- `report.daily` (published on a schedule by `workers/scheduler/scheduler.py`) has no consumer anywhere
-  — `EXCHANGE_MAP` doesn't declare it, so nothing binds a queue to receive it. Scheduled daily-summary
-  reports are silently dropped; treat them as dead code until a consumer exists. On-demand reports
-  (`POST /reports/generate`) are unaffected — separate, synchronous `BackgroundTasks` path.
-- Three separate queue routing tables can drift from each other: `workers/base_worker.py::EXCHANGE_MAP`,
+- **`report.daily`** (published on a schedule by `workers/scheduler/scheduler.py`) has no consumer
+  anywhere — `EXCHANGE_MAP` doesn't declare it, so nothing binds a queue to receive it. Scheduled
+  daily-summary reports are silently dropped; treat them as dead code until a consumer exists. On-demand
+  reports (`POST /reports/generate`) are unaffected — separate, synchronous `BackgroundTasks` path.
+- **Three separate queue routing tables can drift from each other**: `workers/base_worker.py::EXCHANGE_MAP`,
   `workers/queue_client.py::ROUTING_CONFIG`, `backend/app/core/queue_client.py::ROUTING_CONFIG`. As of
   this writing `backend/app/core/queue_client.py` is missing `scan.scanner` — publishing to it from
   backend/API code would `KeyError`. When adding/renaming a queue, update all three.
+
+For the reasoning behind past documentation corrections (what earlier versions of these docs got wrong,
+and why), see [EXPLANATION.md#docs-vs-reality](./EXPLANATION.md).

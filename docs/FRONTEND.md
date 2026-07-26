@@ -19,9 +19,9 @@ standalone server with **no hot reload** — a `.tsx` change requires
 
 ## Two dashboards, one codebase
 
-The single biggest structural fact about this frontend: **ASM and Bug Bounty are two fully separate
-dashboard shells**, not one shared sidebar with a Bug Bounty item mixed in. `dashboard/layout.tsx`
-picks the variant purely from the route:
+ASM and Bug Bounty are two fully separate dashboard shells. `dashboard/layout.tsx` picks the variant
+purely from the route — see [EXPLANATION.md](./EXPLANATION.md#why-asm-and-bug-bounty-are-two-fully-separate-dashboard-shells)
+for why this split exists instead of one shared sidebar:
 
 ```mermaid
 flowchart TD
@@ -36,19 +36,13 @@ flowchart TD
     asmProduct -->|yes| asmShell["Sidebar variant='asm'<br/>+ DashboardHeader variant='asm'"]
 ```
 
-This is a **UX-side mirror** of the API's `RequireProduct` — the redirect just avoids flashing a
-route's content before the API would 403 it anyway; the API remains the actual enforcement boundary
-(see [API_REFERENCE.md](./API_REFERENCE.md#product-entitlement)).
-
 `components/layout/Sidebar.tsx` takes a `variant: "asm" | "bounty"` prop selecting an entirely
 different nav tree (`ASM_NAV_ITEMS` vs. `BOUNTY_NAV_ITEMS`) and branding (icon/title/accent — rose for
-Bug Bounty throughout, matching its "one-shot authorized active testing" mental model being visually
-distinct from ASM's "continuous passive monitoring"). A **product switcher** ("Switch to ASM"/"Switch
-to Bug Bounty") appears in the sidebar only when `enabledProducts` contains both.
-`components/layout/DashboardHeader.tsx` takes the same `variant` prop — the organization selector and
-"Quick Scan" button are ASM-only concepts and are hidden entirely on the Bug Bounty shell (and the
-underlying `/organizations` query is `enabled: !isBounty`, not just visually hidden, so it never fires
-a request that could only 403).
+Bug Bounty throughout). A **product switcher** ("Switch to ASM"/"Switch to Bug Bounty") appears in the
+sidebar only when `enabledProducts` contains both. `components/layout/DashboardHeader.tsx` takes the
+same `variant` prop — the organization selector and "Quick Scan" button are ASM-only concepts and are
+hidden entirely on the Bug Bounty shell (and the underlying `/organizations` query is `enabled:
+!isBounty`, not just visually hidden, so it never fires a request that could only 403).
 
 ## App Router structure
 
@@ -118,24 +112,24 @@ Persisted subset (`localStorage`, key `asm-workspace`): `workspaceId`, `workspac
 (`lib/api.ts::tokenStorage`, keys `asm_access_token`/`asm_refresh_token`) so a page reload only needs
 `Providers.tsx` to call `refreshUser()` once on mount if a token is present.
 
-## Theming and accessibility
+## Theming and accessibility (structural facts)
 
-Light/dark theme is `store/workspace.ts`'s `theme` field, applied as a `.dark` class on `<html>`
-(`Providers.tsx` toggles it on change; a blocking inline script in `app/layout.tsx` sets it before first
-paint using the same persisted `localStorage` key, to avoid a flash of the wrong theme on reload). Both
-themes are defined as CSS custom properties in `globals.css` — light is `:root`'s default, the
-(unchanged, pixel-identical) original dark palette moved under a `.dark` class block. `SeverityBadge.tsx`
-and every severity/grade color reference in the app read the same `--severity-*`/`--grade-*` tokens
-rather than each maintaining its own literal Tailwind color mapping.
+- **Theme**: `store/workspace.ts`'s `theme: "dark" | "light"` field, applied as a `.dark` class on
+  `<html>`. `Providers.tsx` toggles it on change; a blocking inline script in `app/layout.tsx` sets it
+  before first paint from the same persisted `localStorage` key, to avoid a flash of the wrong theme on
+  reload. Both palettes are CSS custom properties in `globals.css` (`:root` = light default, `.dark`
+  class = dark). `SeverityBadge.tsx` and every severity/grade color reference read the same
+  `--severity-*`/`--grade-*` tokens.
+- **Modals**: `ScanModal.tsx`, `FindingDetailModal.tsx`, the inline "New Scan" modal in
+  `dashboard/page.tsx` — all built on `@radix-ui/react-dialog`.
+- **Header dropdowns**: `DashboardHeader.tsx`'s org selector/notifications/user menu — built on
+  `@radix-ui/react-dropdown-menu`.
+- **Reduced motion**: `Providers.tsx` wraps the app in framer-motion's `<MotionConfig
+  reducedMotion="user">`, applying to every animation in the app (page transitions, sidebar width,
+  dropdown/modal enter) at once.
 
-Modals (`ScanModal.tsx`, `FindingDetailModal.tsx`, the inline "New Scan" modal in `dashboard/page.tsx`)
-and header dropdowns (`DashboardHeader.tsx`'s org selector/notifications/user menu) are built on
-`@radix-ui/react-dialog` / `@radix-ui/react-dropdown-menu` — both were already dependencies, unused,
-before hand-rolled `fixed inset-0` divs and manual outside-click listeners were replaced with them
-(focus trap, Escape-to-close, return-focus-on-close, `role="dialog"`/`role="menu"` all come from Radix,
-not reimplemented). `Providers.tsx` wraps the app in framer-motion's `<MotionConfig
-reducedMotion="user">`, so every existing animation (page transitions, sidebar width, dropdown/modal
-enter) respects the OS-level reduced-motion setting.
+See [EXPLANATION.md#theming-and-accessibility](./EXPLANATION.md) for why these exist and what they
+replaced.
 
 ## Bug Bounty program detail page (`dashboard/bounty/[id]/page.tsx`)
 

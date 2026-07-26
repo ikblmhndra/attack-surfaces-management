@@ -130,7 +130,7 @@ A request to a gated router from a workspace lacking that product gets `403` wit
 
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/intel` | Reads `ThreatIntel` rows — keyless ASN/RDAP data, not third-party threat feeds; see [ARCHITECTURE.md](./ARCHITECTURE.md#docs-vs-reality). |
+| GET | `/intel` | Reads `ThreatIntel` rows — keyless ASN/RDAP data, not third-party threat feeds; see [EXPLANATION.md](./EXPLANATION.md#docs-vs-reality). |
 
 ## `reports` — ASM only
 

@@ -4,6 +4,11 @@
 aspirational pre-build spec. Where a requirement is met, it says so; where it isn't yet, it's marked
 explicitly rather than implied.
 
+> A product-planning document, not user- or developer-facing system documentation — it sits outside the
+> [Diátaxis](https://diataxis.fr) Tutorial/How-to/Reference/Explanation structure the rest of `docs/`
+> follows (see [README.md](./README.md)), deliberately, rather than being forced into one of those
+> modes. For the half-page, non-technical version, see [EXECUTIVE_SUMMARY.md](./EXECUTIVE_SUMMARY.md).
+
 ## 1. Vision
 
 A self-hosted platform a security team fully owns and controls — no data leaves their infrastructure,
@@ -15,7 +20,7 @@ no per-seat SaaS pricing — that covers both sides of external security posture
    enough and a real bug bounty engagement calls for active testing (Bug Bounty).
 
 The two are related but intentionally not the same product wearing two hats — see
-[docs/ARCHITECTURE.md#why-two-pipelines-not-one](./ARCHITECTURE.md#why-two-pipelines-not-one). A
+[docs/EXPLANATION.md#why-two-pipelines-not-one](./EXPLANATION.md#why-two-pipelines-not-one). A
 workspace picks one or both at signup.
 
 ## 2. Problem statement
@@ -123,11 +128,11 @@ would offer, not just internal consistency.
 | CVSS + EPSS + CISA KEV + SSVC-informed exploit-likelihood boosting | ✅ shipped (4-stage risk-engine redesign) |
 | End-of-life software detection | ✅ shipped |
 | Screenshots | ✅ shipped |
-| Enrichment | ✅ shipped, **keyless only** (ASN/RDAP/network baseline) — see [ARCHITECTURE.md's threat-intel note](./ARCHITECTURE.md#docs-vs-reality) |
+| Enrichment | ✅ shipped, **keyless only** (ASN/RDAP/network baseline) — see [EXPLANATION.md's threat-intel note](./EXPLANATION.md#docs-vs-reality) |
 | Notifications (email/Slack/Discord/Telegram/webhook) | ✅ shipped, on-demand triggers only |
-| Scheduled/recurring daily-summary reports | ❌ dead code — `report.daily` has no consumer, see [ARCHITECTURE.md](./ARCHITECTURE.md#docs-vs-reality) |
+| Scheduled/recurring daily-summary reports | ❌ dead code — `report.daily` has no consumer, see [ARCHITECTURE.md](./ARCHITECTURE.md#known-drift-and-dead-code-factually) |
 | Continuous/passive monitoring without a manual scan trigger | ❌ not started — bigger architecture lift, explicitly deferred |
-| PDF/CSV reports (executive/technical/compliance/custom) | ⚠️ partial — `executive` is real; `technical`/`compliance`/`custom` are currently aliases of the full finding list with no real framework-mapping built yet |
+| PDF/CSV reports (executive/technical/compliance/custom) | ✅ shipped — `executive`/`technical` are real; `compliance` maps every finding to a CIS Controls v8 Control + Safeguard (display-only); `custom` is still a plain alias of `technical`, no section-picker built |
 
 ### 6.2 Bug Bounty
 

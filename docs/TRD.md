@@ -1,5 +1,10 @@
 # Technical Requirements Document (TRD)
 
+> A product-planning document, not user- or developer-facing system documentation — it sits outside the
+> [Diátaxis](https://diataxis.fr) Tutorial/How-to/Reference/Explanation structure the rest of `docs/`
+> follows (see [README.md](./README.md)), deliberately, rather than being forced into one of those
+> modes.
+
 Companion to [PRD.md](./PRD.md) — that document says *what* the product must do and for whom; this one
 says what the *system* must satisfy to deliver it. Implementation detail (exact schemas, exact
 endpoints, exact diagrams) lives in [ARCHITECTURE.md](./ARCHITECTURE.md), [DATA_MODEL.md](./DATA_MODEL.md),
@@ -24,7 +29,7 @@ requirements those documents fulfill, not a second copy of them.
 
 - **No central pipeline orchestrator.** Each worker is responsible for publishing its own next-stage
   message; adding a stage means adding a worker + a queue entry, not touching an orchestrator. Trade-off
-  accepted: the queue-routing-table triplication gotcha (see [ARCHITECTURE.md](./ARCHITECTURE.md#docs-vs-reality))
+  accepted: the queue-routing-table triplication gotcha (see [ARCHITECTURE.md](./ARCHITECTURE.md#known-drift-and-dead-code-factually))
   is the direct cost of this choice and must be watched, not solved by adding an orchestrator later
   without a deliberate decision to do so.
 - **Every pipeline-triggering write goes through a transactional outbox**, never a direct publish on the
@@ -43,7 +48,9 @@ requirements those documents fulfill, not a second copy of them.
 
 - **Scope-gate is the highest-priority security requirement in the whole system.** Every URL the Bug
   Bounty exploit stage touches passes two independent, execution-time-re-validated checks (scope rules +
-  approved-target ownership) — see [PIPELINES.md](./PIPELINES.md#the-scope-gate-the-load-bearing-safety-property-of-this-whole-pipeline).
+  approved-target ownership) — see [PIPELINES.md](./PIPELINES.md#the-scope-gate) for the diagram and
+  [EXPLANATION.md](./EXPLANATION.md#the-scope-gate-the-load-bearing-safety-property-of-the-whole-bug-bounty-pipeline)
+  for why it's built this way.
   This must be re-verified, not assumed still-true, after any change to `bounty_scope.py`,
   `exploit_worker.py`, or any new exploit module.
 - **Product entitlement is enforced server-side**, not just hidden in the UI — `RequireProduct` at the
@@ -70,7 +77,7 @@ requirements those documents fulfill, not a second copy of them.
   backoff, then dead-letter to `{queue}.dlq` and mark the owning scan/program `failed` — never silently
   drop a failed unit of work.
 - **Idempotent-safe upserts** where a worker might reprocess a message (`pg_insert(Model.__table__)`
-  pattern, not `pg_insert(Model)` — see [DEVELOPMENT.md](./DEVELOPMENT.md#gotchas-from-real-incidents--see-changelogmd-for-the-full-stories)).
+  pattern, not `pg_insert(Model)` — see [DEVELOPMENT.md](./DEVELOPMENT.md#known-quirks)).
 - **Graceful shutdown**: `BaseWorker` drains in-flight tasks on SIGTERM/SIGINT rather than dropping them
   mid-processing.
 - **Health checks** on every long-running service (`docker-compose.yml` `healthcheck:` blocks) plus a
@@ -205,9 +212,9 @@ make health                   # verify container health
 
 ## 9. Technical constraints & known limitations
 
-Carried forward from [ARCHITECTURE.md's drift notes](./ARCHITECTURE.md#docs-vs-reality) and
-[DEVELOPMENT.md's gotchas](./DEVELOPMENT.md#gotchas-from-real-incidents--see-changelogmd-for-the-full-stories),
-consolidated here as standing technical debt:
+Carried forward from [ARCHITECTURE.md's drift notes](./ARCHITECTURE.md#known-drift-and-dead-code-factually)
+and [DEVELOPMENT.md's known quirks](./DEVELOPMENT.md#known-quirks), consolidated here as standing
+technical debt:
 
 1. Three independent copies of the queue routing table can silently drift from each other.
 2. `report.daily` messages are published on a schedule but have no consumer — silently dropped.

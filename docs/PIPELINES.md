@@ -35,7 +35,7 @@ dead-letters it and marks the owning scan/program `failed`.
 
 ⚠️ **Three separate copies of this table exist in code** (`workers/base_worker.py::EXCHANGE_MAP`,
 `workers/queue_client.py::ROUTING_CONFIG`, `backend/app/core/queue_client.py::ROUTING_CONFIG`) and can
-drift — see [ARCHITECTURE.md's drift notes](./ARCHITECTURE.md#docs-vs-reality).
+drift — see [ARCHITECTURE.md's drift notes](./ARCHITECTURE.md#known-drift-and-dead-code-factually).
 
 ## ASM scan pipeline
 
@@ -138,7 +138,7 @@ triggering message carried `auto_chain: true`, the worker publishes the next sta
 same as the ASM pipeline's chaining. Manual single-stage runs (`POST run/{stage}`) don't set
 `auto_chain`, so they never cascade — the two trigger modes are additive, not exclusive.
 
-### The scope gate (the load-bearing safety property of this whole pipeline)
+### The scope gate
 
 ```mermaid
 flowchart TB
@@ -152,13 +152,10 @@ flowchart TB
     e -->|yes| f(["tested"])
 ```
 
-Two independent gates on every single URL the exploit stage ever touches: **(1)**
-`is_target_in_scope(url, program.scope_rules)` — explicit out-of-scope rules always beat an in-scope
-match, fail-closed; **(2)** the URL's host must belong to a `BountyTarget` a human explicitly approved
-(`_owning_target_id`). Recon output (`BountyAsset`) can never expand what's testable on its own — a
-discovered URL is only ever touched if a human already approved its parent domain/URL as a target. This
-is re-validated inside the worker at execution time on *every* stage, not trusted from upstream, so
-narrowing `scope_rules` mid-program takes effect immediately.
+Two independent gates, both re-checked at execution time on every stage rather than trusted from
+upstream: `is_target_in_scope` (fail-closed) and target ownership (`_owning_target_id`). See
+[EXPLANATION.md#the-scope-gate](./EXPLANATION.md) for why this is the load-bearing safety property of
+the whole pipeline.
 
 ### Exploit module reference
 
@@ -185,15 +182,10 @@ program's scope is. Candidate URLs are priority-sorted (`_priority_score` / `PRI
 paths first) before truncation, so a pile of CSS/JS assets never crowds out the handful of endpoints
 actually worth testing.
 
-### Vulnerable to SPA-only client-side rendering — and how recon compensates
+### Recon and SPA-only client-side rendering
 
-Every static crawler (katana, waybackurls, gau) only parses HTML/JS text — none of them execute
-JavaScript, so a modern SPA's real routes and API calls (built entirely client-side, often carrying
-real per-user resource IDs) are invisible to them. `browser_crawl.py` drives a real headless browser
-instead: loads the app, passively captures every network request it fires, clicks through internal
-links (`a[href]`/`[routerlink]` only — never a plain button, to avoid triggering a state-changing
-action), and — as of the most recent recon work — also types into any search-style input it finds and
-captures the resulting URL, since a hash-routed SPA's `#/search?q=...` route is built entirely
-client-side and never touches the network at all. `exploit_dom.py`'s param injection correspondingly
-parses query params from *either* the real query string or a hash-fragment-embedded one, for the same
-reason.
+`browser_crawl.py` drives a real headless browser (not just static parsing) specifically to see routes
+and API calls that only exist client-side — see
+[EXPLANATION.md#recon-vs-modern-client-side-apps](./EXPLANATION.md) for why static crawlers alone miss
+this entirely, and how `exploit_dom.py`'s param injection correspondingly handles hash-fragment-embedded
+query strings.
