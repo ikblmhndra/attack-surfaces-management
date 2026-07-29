@@ -19,6 +19,7 @@ import { apiClient } from "@/lib/api";
 import { useRealtimeEvents } from "@/lib/useRealtimeEvents";
 import { useWorkspaceStore } from "@/store/workspace";
 import { SeverityBadge, GradeRing } from "@/components/ui/SeverityBadge";
+import { DialogOverlay } from "@/components/ui/Dialog";
 import { cn } from "@/lib/utils";
 
 const STAGGER = 0.05;
@@ -623,18 +624,13 @@ export default function DashboardPage() {
       {showScanModal && (
         <Dialog.Root open onOpenChange={(open) => { if (!open) setShowScanModal(false); }}>
           <Dialog.Portal>
-            <Dialog.Overlay asChild>
-              <motion.div
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm"
-              />
-            </Dialog.Overlay>
+            <DialogOverlay />
             <Dialog.Content asChild>
+              <div className="fixed left-1/2 top-1/2 z-50 -translate-x-1/2 -translate-y-1/2">
               <motion.div
                 initial={{ opacity: 0, scale: 0.95 }}
                 animate={{ opacity: 1, scale: 1 }}
-                className="fixed left-1/2 top-1/2 z-50 w-[calc(100%-2rem)] max-w-md -translate-x-1/2 -translate-y-1/2 bg-surface-800 border border-border rounded-xl p-5 space-y-4 shadow-2xl focus:outline-none"
+                className="w-[calc(100vw-2rem)] max-w-md bg-surface-800 border border-border rounded-xl p-5 space-y-4 shadow-2xl focus:outline-none"
               >
             <Dialog.Title asChild>
               <h2 className="text-base font-semibold text-foreground">New Scan</h2>
@@ -720,6 +716,7 @@ export default function DashboardPage() {
               </button>
             </div>
               </motion.div>
+              </div>
             </Dialog.Content>
           </Dialog.Portal>
         </Dialog.Root>

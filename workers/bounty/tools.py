@@ -355,6 +355,13 @@ async def run_gau(domain: str, timeout: int = 90) -> Set[str]:
     return set()
 
 
+# Punctuation that never appears in a real URL path but does appear verbatim
+# when -jc's JS-string extraction lifts a template-expression / string-
+# concatenation fragment out of bundled script source instead of an actual
+# route (e.g. "'+L(i[8])+'", or the decoded form of "%7B%7Bhref%7D%7D").
+_JS_EXPR_PUNCT_RE = re.compile(r"[+(){}\[\]]")
+
+
 async def run_katana(
     urls: List[str], tmpdir: Path, timeout: int = 120, extra_headers: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Set[str]]:
@@ -403,6 +410,14 @@ async def run_katana(
                 line = line.replace(artifact, "")
             if not line.startswith("http"):
                 continue
+            # -jc's JS-string extraction also picks up template-expression /
+            # string-concatenation fragments (e.g. "'+L(i[8])+'") that were
+            # never a route -- verified live these reach the exploit stage as
+            # full url-type targets otherwise. _persist() rejects these too
+            # (defense in depth), but skipping here avoids wasting the rest
+            # of recon (JS analysis, path discovery) on them as well.
+            if _JS_EXPR_PUNCT_RE.search(line.split("?")[0]):
+                continue
             if line.split("?")[0].endswith(".js"):
                 js_files.add(line)
             else:
@@ -415,7 +430,10 @@ async def run_katana(
 _SCRIPT_SRC_RE = re.compile(r'<script[^>]+src=["\']([^"\']+\.js[^"\']*)["\']', re.IGNORECASE)
 
 # LinkFinder-style: quoted path-like strings, filtered down in analyze_js_file.
-ENDPOINT_PATTERN = re.compile(r'''["'](/[a-zA-Z0-9_\-/{}.]{2,120}?)["']''')
+# "{}" deliberately excluded from the char class (unlike an earlier version) --
+# verified live that this matched Angular template-expression fragments (e.g.
+# "{{href}}") embedded in bundled JS verbatim, which aren't a route at all.
+ENDPOINT_PATTERN = re.compile(r'''["'](/[a-zA-Z0-9_\-/.]{2,120}?)["']''')
 _ENDPOINT_ASSET_EXTENSIONS = (".png", ".jpg", ".jpeg", ".css", ".svg", ".woff", ".woff2", ".gif", ".ico")
 
 # SecretFinder-style. Only the matched *label* is ever kept (see

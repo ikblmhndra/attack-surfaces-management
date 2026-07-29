@@ -21,10 +21,12 @@ parses XML/SVG/DOCX/XLSX). Both stay strictly detection-only:
 See CHANGELOG.md.
 """
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import aiohttp
 import structlog
 
+from workers.bounty.detect import CatchAllCache, _is_catch_all_200
 from workers.bounty.exploit_tools import LFI_SIGNATURES
 
 log = structlog.get_logger()
@@ -47,14 +49,26 @@ _XXE_PAYLOAD = (
 
 async def check_unrestricted_upload(
     url: str, timeout: int = 20, extra_headers: Optional[Dict[str, str]] = None,
+    catch_all_cache: Optional[CatchAllCache] = None,
 ) -> List[Dict[str, Any]]:
     """POST a small, inert file carrying a dangerous extension via
     multipart/form-data across a few common field names; a 2xx acceptance
     (rather than the 4xx a properly-validated endpoint should return) is the
     candidate signal. Stops at first acceptance -- same "stop at first
-    confirmation" discipline as every other candidate-flagging module here."""
+    confirmation" discipline as every other candidate-flagging module here.
+
+    Skipped entirely on a catch-all-200 host: verified live that a server
+    which 200s any request regardless of method/body also 200s this upload
+    POST, making "acceptance" meaningless -- same guard check_sensitive_files
+    already applies, added here since this was the other main false-positive
+    source alongside jsonbody/bac."""
     headers = {**_UA, **(extra_headers or {})}
+    parsed = urlparse(url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout), headers=headers) as s:
+        catch_all, _ = await _is_catch_all_200(s, origin, cache=catch_all_cache)
+        if catch_all:
+            return []
         for filename, content, content_type in _UPLOAD_TEST_FILES:
             for field in _UPLOAD_FIELD_NAMES:
                 form = aiohttp.FormData()

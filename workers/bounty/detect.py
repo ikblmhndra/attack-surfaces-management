@@ -19,7 +19,7 @@ import re
 import shutil
 import string
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
@@ -29,18 +29,51 @@ log = structlog.get_logger()
 
 _UA = {"User-Agent": "Mozilla/5.0 (compatible; ASM-Bounty/1.0)"}
 
+CatchAllCache = Dict[str, Tuple[bool, str]]
 
-async def _is_catch_all_200(session: aiohttp.ClientSession, base_url: str) -> bool:
-    """True if a definitely-nonexistent path still returns 200 -- i.e. the
-    server answers 200 for everything (SPA / catch-all). Without this guard,
-    signature-less sensitive-file checks and path-mutation 403 bypasses fire
-    on every such host (a very common false-positive source in the wild)."""
+
+async def _is_catch_all_200(
+    session: aiohttp.ClientSession, base_url: str, cache: Optional[CatchAllCache] = None,
+) -> Tuple[bool, str]:
+    """(is_catch_all, baseline_body) for this exact base_url -- a nonexistent
+    path either 404s normally, or the server answers 200 for everything under
+    this base (SPA / catch-all route), in which case baseline_body is that
+    catch-all's own content. Catch-all is a property of the specific base, not
+    necessarily the whole origin: a site's root can 200 with its SPA shell
+    while a deeper base (e.g. a static-file route matched by prefix) 200s with
+    different, non-HTML content for any suffix under it -- so this must be
+    re-checked per base, not assumed from the origin alone.
+    Without this guard, signature-less sensitive-file checks and path-mutation
+    403 bypasses fire on every such host (a very common false-positive source
+    in the wild). `cache`, if given, is a dict the caller owns for one worker
+    run, keyed by the exact base string, so repeat callers asking about the
+    same base within a run issue the nonce probe once."""
+    base = base_url.rstrip("/")
+    if cache is not None and base in cache:
+        return cache[base]
     nonce = "".join(random.choices(string.ascii_lowercase + string.digits, k=16))
+    result: Tuple[bool, str] = (False, "")
     try:
-        async with session.get(f"{base_url.rstrip('/')}/asm-probe-{nonce}", allow_redirects=False) as r:
-            return r.status == 200
+        async with session.get(f"{base}/asm-probe-{nonce}", allow_redirects=False) as r:
+            if r.status == 200:
+                result = (True, (await r.content.read(20000)).decode(errors="ignore"))
     except Exception:
+        pass
+    if cache is not None:
+        cache[base] = result
+    return result
+
+
+def _bodies_match(candidate: str, baseline: str) -> bool:
+    """Exact match, or whitespace-collapsed match (defends against a catch-all
+    page injecting a per-request timestamp/nonce into otherwise-identical
+    markup). An empty baseline (probe errored / wasn't itself 200) never
+    counts as a match."""
+    if not baseline:
         return False
+    if candidate == baseline:
+        return True
+    return " ".join(candidate.split()) == " ".join(baseline.split())
 
 
 # ── WAF fingerprint (probe stage) ──────────────────────────────
@@ -99,12 +132,13 @@ SENSITIVE_FILES: Dict[str, Optional[str]] = {
 
 async def check_sensitive_files(
     base_url: str, timeout: int = 20, max_bytes: int = 20000, extra_headers: Optional[Dict[str, str]] = None,
+    catch_all_cache: Optional[CatchAllCache] = None,
 ) -> List[Dict[str, Any]]:
     findings: List[Dict[str, Any]] = []
     base = base_url.rstrip("/")
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout), headers={**_UA, **(extra_headers or {})}) as s:
-            catch_all = await _is_catch_all_200(s, base)
+            catch_all, baseline_body = await _is_catch_all_200(s, base, cache=catch_all_cache)
             for path, signature in SENSITIVE_FILES.items():
                 url = base + path
                 try:
@@ -116,10 +150,12 @@ async def check_sensitive_files(
                     continue
                 if len(body) < 5:
                     continue
-                # Weak signatures like "=" (.env) or ":" (.htpasswd) trivially match any HTML
-                # page's markup, so this must run before the signature check, not instead of it.
-                if catch_all and ("<html" in body.lower() or "<!doctype" in body.lower()):
-                    continue  # SPA/catch-all shell page, not the real file
+                # Weak signatures like "=" (.env) or ":" (.htpasswd) trivially match any
+                # catch-all page's content (HTML shell OR plain text -- e.g. a base whose
+                # own catch-all is a non-HTML page like a security.txt-style route matched
+                # by prefix), so this must run before the signature check, not instead of it.
+                if catch_all and _bodies_match(body, baseline_body):
+                    continue  # this base's own catch-all content, not the real file
                 if signature and signature.lower() not in body.lower():
                     continue  # signature required -> avoids generic-200/SPA false positives
                 if not signature and catch_all:
@@ -197,7 +233,9 @@ _403_HEADER_TRICKS = [
 ]
 
 
-async def check_403_bypass(url: str, timeout: int = 15) -> List[Dict[str, Any]]:
+async def check_403_bypass(
+    url: str, timeout: int = 15, catch_all_cache: Optional[CatchAllCache] = None,
+) -> List[Dict[str, Any]]:
     parsed = urlparse(url)
     path = parsed.path.lstrip("/")
     base = f"{parsed.scheme}://{parsed.netloc}"
@@ -216,7 +254,7 @@ async def check_403_bypass(url: str, timeout: int = 15) -> List[Dict[str, Any]]:
             # Path mutations returning 200 are meaningless on a catch-all-200
             # server -- only try them when a random path does NOT 200. Header
             # bypasses keep the exact path, so they stay reliable either way.
-            catch_all = await _is_catch_all_200(s, base)
+            catch_all, _ = await _is_catch_all_200(s, base, cache=catch_all_cache)
             if not catch_all:
                 for trick in _403_PATH_TRICKS:
                     test = base + "/" + trick.format(p=path).lstrip("/")
@@ -434,3 +472,112 @@ async def run_feroxbuster(
             if rec.get("type") == "response" and rec.get("url"):
                 discovered.add(rec["url"])
     return discovered
+
+
+# ── Vulnerable/outdated frontend JS component detection (vulnscan stage) ──
+# retire.js-style: most bundlers/minifiers still preserve a library's own
+# `/*! Name vX.Y.Z */`-style banner comment even when everything else is
+# minified -- match that against a small, curated table of known-vulnerable
+# version thresholds. Deliberately a SMALL, high-confidence starting set
+# (widely-cited, extremely well-documented CVEs only) rather than a full
+# retire.js-scale database -- easy to extend with more (name, pattern,
+# ranges) tuples later without touching the check logic itself.
+def _parse_version(s: str) -> Optional[Tuple[int, int, int]]:
+    parts = s.split(".")[:3]
+    try:
+        nums = [int(p) for p in parts]
+    except ValueError:
+        return None
+    while len(nums) < 3:
+        nums.append(0)
+    return (nums[0], nums[1], nums[2])
+
+
+# (library_name, banner_pattern (must capture version in group 1), ranges)
+# ranges: list of (max_vulnerable_version, cve_ids, severity, description,
+# same_major_only), ordered highest-value/most-recent fix first -- the first
+# range the detected version fails to meet is reported (avoids piling up
+# every historical advisory for one old copy of a library into a wall of
+# findings). same_major_only=True restricts a range to installs on that same
+# major version -- required for a project like Bootstrap that maintains
+# parallel major branches with their own separate backported fix (a 3.x site
+# should be told to reach 3.4.1, never "upgrade to 4.3.1", a different major
+# entirely). False (jQuery/AngularJS here) means the advisory is cumulative
+# across the whole version line -- there's one continuously-maintained
+# series, so "upgrade to the latest fixed version" is correct regardless of
+# how old the detected copy is.
+LIBRARY_VERSION_SIGNATURES: List[Tuple[str, "re.Pattern", List[Tuple[Tuple[int, int, int], List[str], str, str, bool]]]] = [
+    ("jquery", re.compile(r"jQuery(?: JavaScript Library)? v(\d+\.\d+\.\d+)"), [
+        ((3, 5, 0), ["CVE-2020-11022", "CVE-2020-11023"], "medium",
+         "jQuery < 3.5.0: untrusted HTML passed to .html()/.append()/etc. containing <option> or "
+         "style attributes can execute injected JS (jQuery.htmlPrefilter regex XSS).", False),
+        ((3, 4, 0), ["CVE-2019-11358"], "medium",
+         "jQuery < 3.4.0: $.extend(true, {}, ...) on untrusted JSON can pollute Object.prototype.", False),
+        ((1, 9, 0), ["CVE-2015-9251"], "medium",
+         "jQuery < 1.9.0: cross-domain Ajax responses are executed as script even for non-script "
+         "dataType, allowing a compromised/MITM'd third-party endpoint to run arbitrary JS.", False),
+    ]),
+    ("bootstrap", re.compile(r"Bootstrap v(\d+\.\d+\.\d+)"), [
+        ((4, 3, 1), ["CVE-2019-8331"], "medium",
+         "Bootstrap < 4.3.1: tooltip/popover data-template/title/content options aren't sanitized "
+         "-> XSS if any of those ever come from untrusted input.", True),
+        ((3, 4, 1), ["CVE-2018-14040", "CVE-2018-14041", "CVE-2018-14042"], "medium",
+         "Bootstrap < 3.4.1: XSS via tooltip/popover data-viewport, scrollspy/affix href, and "
+         "collapse data-target attributes when sourced from untrusted input.", True),
+    ]),
+    ("angularjs", re.compile(r"AngularJS v(\d+\.\d+\.\d+)"), [
+        ((1, 6, 0), [], "high",
+         "AngularJS (1.x) < 1.6.0: predates the 1.6 removal of the $parse expression sandbox, which "
+         "had a long-running series of documented bypasses (client-side template-injection-style "
+         "RCE-in-the-browser) that the AngularJS team ultimately deemed unfixable -- see NVD/GHSA "
+         "for the specific AngularJS sandbox-bypass advisories.", False),
+    ]),
+]
+
+
+async def check_vulnerable_components(js_url: str, timeout: int = 15, max_bytes: int = 60000) -> List[Dict[str, Any]]:
+    """Fetch a JS asset (bounded to its first max_bytes -- library version
+    banners are always at the very top of a bundle, never worth reading a
+    multi-MB file for this) and match it against LIBRARY_VERSION_SIGNATURES.
+    Confirmed -- a version number is either below the documented fixed-in
+    threshold or it isn't, no judgement call needed. Skips anything that
+    isn't actually JS content (an HTML catch-all/SPA-shell served at a URL
+    that merely looks like a .js path would otherwise never match a library
+    banner regex in practice, but checking explicitly is cheap and avoids
+    ever wasting a finding slot on a misclassified target)."""
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout), headers=_UA) as s:
+            async with s.get(js_url, allow_redirects=False) as r:
+                if r.status != 200:
+                    return []
+                text = (await r.content.read(max_bytes)).decode(errors="ignore")
+    except Exception as exc:
+        log.warning("bounty_vulnerable_components_error", url=js_url, error=str(exc)[:150])
+        return []
+    if not text or text.lstrip()[:15].lower().startswith(("<!doctype", "<html")):
+        return []
+
+    findings: List[Dict[str, Any]] = []
+    for lib_name, pattern, ranges in LIBRARY_VERSION_SIGNATURES:
+        m = pattern.search(text)
+        if not m:
+            continue
+        version = _parse_version(m.group(1))
+        if version is None:
+            continue
+        for max_vulnerable, cve_ids, severity, description, same_major_only in ranges:
+            if same_major_only and version[0] != max_vulnerable[0]:
+                continue
+            if version < max_vulnerable:
+                findings.append({
+                    "technique": f"vulnerable-component/{lib_name}",
+                    "severity": severity,
+                    "status": "confirmed",
+                    "evidence": {
+                        "url": js_url, "library": lib_name, "version": m.group(1),
+                        "fixed_in": ".".join(str(p) for p in max_vulnerable),
+                        "cve_ids": cve_ids, "note": description,
+                    },
+                })
+                break  # most relevant (first/highest) matching threshold is enough per library
+    return findings

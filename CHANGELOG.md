@@ -4,6 +4,226 @@ All notable changes to this project are documented below, sorted newest-first.
 
 ---
 
+## 2026-07-28 — Fixed modals rendering off-center (framer-motion clobbered Tailwind centering)
+
+Follow-up to the same-day overlay-blur fix: user reported the modal itself "still isn't centered."
+Separate bug — the overlay fix only ever touched `Dialog.Overlay`, never `Dialog.Content`. Investigated
+fresh (Explore agent, retried once after a transient API disconnect) before touching code.
+
+Root cause: all three modals (`FindingDetailModal.tsx`, `ScanModal.tsx`, the inline "New Scan" modal in
+`dashboard/page.tsx`) put both framer-motion's animated `scale`/`y` props and Tailwind's
+`-translate-x-1/2 -translate-y-1/2` centering classes on the *same* `motion.div`. framer-motion (11.2)
+composes its tracked values into a single `transform` written as an inline style every frame; since
+inline `style` always outranks a class selector, that completely overwrote Tailwind's centering
+transform rather than merging with it — `left-1/2`/`top-1/2` (plain `left`/`top`, unaffected) still
+pinned the box's top-left corner to viewport center, but the `-50%/-50%` corrective shift was gone,
+leaving every modal shifted down-and-right by roughly half its own size.
+
+Ruled out first, with evidence, before landing on the real cause: the new shared `DialogOverlay`
+component (only touches the backdrop), `Dialog.Portal` container scoping (all three are bare, so they
+already render to `document.body`, unaffected by the sidebar's padding offset), and an ancestor-transform
+escape issue (already fixed once, 2026-07-23, and confirmed still intact).
+
+### Fixed
+- **`FindingDetailModal.tsx`, `ScanModal.tsx`, `dashboard/page.tsx`**: split the single `motion.div` into
+  an outer plain `div` (owns only `fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2`, no
+  framer-motion props, so nothing ever overwrites its transform) wrapping an inner `motion.div` (keeps
+  the entrance animation and all existing visual styling, no positioning classes of its own). Also
+  switched each modal's `w-[calc(100%-2rem)]`-style width to `w-[calc(100vw-2rem)]` — with the width now
+  resolving against the new wrapper (an auto-sized `fixed` box) instead of directly against the viewport,
+  a percentage-based `calc()` would no longer reliably resolve; `vw` sidesteps that entirely.
+
+### Verified
+- `tsc --noEmit` and `next lint` clean.
+- Rebuilt and redeployed the frontend; API needed a manual restart after (an unrelated, transient
+  RabbitMQ-connection-refused race on boot, not caused by this change — same recovery as the last
+  redeploy).
+- Real-browser check via Playwright, reusing/creating disposable test accounts: measured each modal's
+  actual DOM bounding box against the viewport's true center programmatically (not just eyeballing a
+  screenshot) for both the "New Scan" modal and `ScanModal` (via a real organization's Run Scan dialog)
+  — both landed at exactly `(0.0, 0.0)` offset from true center.
+
+---
+
+## 2026-07-28 — Fixed illegible background behind every modal (dim + blur regression)
+
+User sent a screenshot of the Findings page with a finding-detail modal open, asking why the background
+content was now nearly illegible. Investigated (Explore agent) before proposing a fix: three modal
+components (`FindingDetailModal.tsx`, `ScanModal.tsx`, the inline "New Scan" modal in `dashboard/page.tsx`)
+each independently hand-rolled the identical Radix `Dialog.Overlay` block —
+`bg-black/60 backdrop-blur-sm` — a hardcoded, theme-unaware literal carried over byte-for-byte from
+before the light theme was added (commit `08c0688`, 2026-07-23) and never revisited. `backdrop-blur` (a
+gaussian blur smearing whatever's behind it) was the more likely dominant cause of "illegible"
+specifically, not the 60% opacity alone — cross-checked against shadcn/ui (80% opacity, no blur), Radix's
+own docs example, and MUI's `Backdrop` (all plain opacity, no `backdrop-filter`).
+
+### Fixed
+- **`frontend/src/app/globals.css`**: added a themed `--overlay` token — `222 47% 11%` (= light theme's
+  own `--foreground`) in `:root`, `222 47% 4%` (= dark theme's own `--background`, a near no-op tint
+  preserving the existing dark-theme look) in `.dark`. No new numbers invented, both reuse existing
+  per-theme values.
+- **`frontend/tailwind.config.ts`**: added `overlay: "hsl(var(--overlay))"` next to the other semantic
+  colors.
+- **New `frontend/src/components/ui/Dialog.tsx`**: a single shared `DialogOverlay` component
+  (`bg-overlay/60`, blur dropped entirely, not reduced), matching the `components/ui/Collapsible.tsx`
+  convention (re-export what needs no styling, wrap only the piece that needs fixed classes). Replaces
+  the 3 duplicated 7-line blocks with `<DialogOverlay />` at each call site — the July 23 CHANGELOG entry
+  already established the pattern of converting duplicated modal markup/hardcoded color literals onto
+  shared components and theme tokens in this codebase; this follows the same pattern rather than
+  patching 3 copies in place.
+
+### Verified
+- `tsc --noEmit` and `next lint` clean (no new warnings; the `Dialog`/`motion` imports each file still
+  uses for `Dialog.Content` stay referenced, so no unused-import issue from removing the inline overlay
+  block).
+- Rebuilt and redeployed the frontend (`target: production`, no hot reload).
+- Real-browser check via Playwright (`worker-screenshot` container's existing install, registered a
+  disposable test account through the real API to reach an authenticated dashboard): screenshotted the
+  "New Scan" modal in both dark and light theme — background sidebar/stat cards fully legible behind the
+  overlay in both, no blur smear, modal still clearly visually separated from the page.
+
+---
+
+## 2026-07-27 — Bug Bounty pipeline: fixed detector false-positives/noise, added JWT + JSON-CSRF coverage
+
+Live-diagnosed against the "OWASP Juice Shop" bug bounty program (real target, authenticated testing):
+of 939 accumulated findings, 63% were `inconclusive` and dominated by two detectors (`jsonbody` 387,
+`bac` 123 — 54% of the entire table) that fired on nearly every URL regardless of real vulnerability,
+burying the ~64 genuinely confirmed findings (SQLi auth-bypass, DOM XSS, IDOR, SSTI, CORS). Also found
+2 false *confirmed* findings (`.env`/`.htpasswd` "exposure" hits that were actually the target's
+`security.txt` catch-all content) and a crawler bug feeding JS-expression fragments (e.g. `'+L(i[8])+'`)
+into the target list as if they were real routes. Verified every root cause live via curl against the
+target before touching code, then verified every fix live the same way post-change (see PR/session
+notes) — a fresh vulnscan+exploit run post-fix went from the historical noise pattern to 7 curated
+exploit findings (down from 24 in the prior run), including a new critical finding (JWT `alg:none`
+forgery) that no prior module could have caught.
+
+### Fixed
+- **`workers/bounty/detect.py`**: `_is_catch_all_200()` now returns `(is_catch_all, baseline_body)`
+  instead of a bare bool (with an optional per-run cache so repeat callers on the same base issue the
+  nonce probe once). `check_sensitive_files()` now skips a hit when its body matches that baseline
+  body, regardless of content-type — the old guard only special-cased HTML-shaped catch-alls, missing a
+  base whose own catch-all is plain text (verified live: `.../.well-known/security.txt/.env` and
+  `.../.htpasswd` both 200 with identical `security.txt` prose, which trivially contains a stray `=`
+  and `:`, satisfying those signatures).
+- **`workers/bounty/exploit_ext.py`**: `run_json_body_mutations()`'s `nosql-body` case no longer treats
+  a bare HTTP 500 as a hit — verified live that Express's generic error handler 500s on almost any
+  malformed POST body regardless of NoSQL operators, so this fired on nearly every POST-able endpoint.
+  Now requires either an explicit driver-error signature, or a baseline (benign-body) POST that did
+  *not* itself 500. `idor_bac_probe()` now skips catch-all-200 hosts entirely (every method/response
+  looked "accepted" there regardless of real access control) and requires the alternate-method response
+  to genuinely differ in shape from the GET baseline (not just "a 2xx different from GET" — a normal
+  POST-201-vs-GET-401 pair used to fire on its own). `bac-unauth-privileged` can now graduate from
+  `inconclusive` to `confirmed` when the caller supplies the pipeline's own session token as a second,
+  optional comparison request (previously unused for this check even though every other module already
+  had it available).
+- **`workers/bounty/upload_xxe.py`**: `check_unrestricted_upload()` now skips catch-all-200 hosts too
+  (same false-positive shape as `bac` above — a server that 2xxs everything "accepts" any upload).
+- **`workers/bounty/recon_worker.py`**: `_persist()` now rejects any discovered `url`/`js_endpoint`
+  asset whose path (raw or percent-decoded) contains JS-expression punctuation (`+()[]{}` ) — traced to
+  `tools.py::ENDPOINT_PATTERN`'s char class (allowed `{}`) and katana's `-jc` JS-string extraction
+  lifting template/concatenation fragments out of bundled scripts and persisting them as if they were
+  real routes.
+- **`workers/bounty/tools.py`**: `ENDPOINT_PATTERN` char class no longer allows `{}`; `run_katana()`'s
+  output filter now drops lines matching the same punctuation instead of only stripping `\`/`%5C`/`%22`.
+- **`workers/bounty/idor_confirm.py`**: `_looks_like_resource` renamed to `looks_like_resource` (now a
+  cross-module utility, reused by the `idor_bac_probe` fix above).
+
+### Added
+- **`workers/bounty/exploit_ext.py::check_jwt_weakness`** (new "jwt" exploit module) — using the
+  pipeline's own valid session token: tests whether a token-gated endpoint accepts an unsigned
+  (`alg:none`) re-encoding of the same claims (confirmed live on this program: `/rest/user/authentication-details`
+  and `/api/Users` both accepted it), and for HS256 tokens, whether the signature matches a small
+  built-in list of common weak secrets (mathematically conclusive on a byte-exact HMAC match, no live
+  replay needed). Self-validates the target URL as a real oracle first (anonymous denied, real token
+  accepted) so it never runs against a public or catch-all endpoint.
+- **`workers/bounty/exploit_ext.py::check_json_csrf`** (folded into the existing "csrf" module) —
+  `run_csrf` only parses classic HTML `<form>` markup, which a JSON-only SPA never emits, so it silently
+  reported clean on that entire class of app. This checks the actual browser-enforced primitive instead:
+  does login set a session cookie at all (a bearer-token-only scheme is structurally CSRF-resistant and
+  correctly reports nothing), and if so, does it carry `SameSite=Strict/Lax`.
+- `ALL_MODULES`/`DEFAULT_MODULES` in `exploit_worker.py` gained `"jwt"`; `catch_all_cache` is now shared
+  across `bac`/`upload` within one exploit run and across `check_sensitive_files`/`check_403_bypass`
+  within one vulnscan run (`vulnscan_worker.py`), so a given origin's catch-all probe fires once per
+  run, not once per URL/module.
+
+## 2026-07-27 — Ground-truthed coverage against Juice Shop's own Score Board; one more generic check added
+
+User asked to drive a real headless browser (Playwright) to `/#/score-board` — Juice Shop's own built-in
+challenge tracker, which flags each of its 173 named challenges "solved"/"unsolved" as soon as *any*
+request (from us or anyone) triggers the underlying bug. Used this as ground truth to sanity-check the
+fixes above rather than trusting our own findings table: 13/173 solved, and every one of the 13 maps
+cleanly to a finding our pipeline already has (`Login Admin`→sqli-auth-bypass, `DOM XSS`→dom-xss,
+`View Basket`→idor-cross-identity, `Exposed Metrics`→nuclei/prometheus-metrics, `Security Policy`→
+recon crawl of `security.txt`, `Upload Type`→upload module, `Email Leak`→CORS reflected-origin, etc.).
+
+Also used it to catch a *false positive* the score board proves is stale: the historical `ssti`
+"confirmed" finding on `/redirect?to=` doesn't correspond to any solved challenge — `SSTi` is still
+listed unsolved. Reproduced `run_ssti()` live against that exact URL: it now correctly returns `[]`.
+The "49" the old finding matched on was never template evaluation — it's a substring of Express's own
+stack trace line number (`route.js:149:13`), present in both the baseline *and* payload responses. The
+baseline-diff this file's docstring already describes (`SSTI_PAYLOADS` baseline check, present before
+today's other changes) already guards against exactly this; the stale DB row just predates whichever
+earlier change added it. No code change needed here — confirmed working as intended, left as a data-
+hygiene note rather than mutated (didn't bulk-touch existing findings).
+
+Categorized the 98 other unsolved (of the ones rendered without further scrolling — score board uses
+virtual-scroll and 111/173 loaded is what two different scroll strategies converged on): a large chunk
+are Juice Shop's separate "Coding Challenges" (fix a source file, not discoverable by any dynamic
+scanner) or single-instance business-logic puzzles (specific coupon codes, a specific GDPR export flow,
+a specific cryptocurrency address) that would require hardcoding Juice-Shop-specific knowledge into a
+platform whose entire design point is being target-agnostic — deliberately not chased. One class stood
+out as genuinely generic and missing: **ownership-impersonation via request body** (`Forged Feedback`,
+`Forged Review` — submitting content "as" another user by supplying their ID instead of letting the
+server derive it from the session), the same shape of bug as the existing `mass-assignment` case, just
+on ownership fields instead of privilege fields.
+
+### Added
+- **`workers/bounty/exploit_ext.py::run_json_body_mutations`**: new `ownership-assignment` case —
+  POSTs a sentinel owner ID (`999999999`) under the common `UserId`/`userId`/`user_id`/`authorId`/
+  `ownerId`/`createdBy` field-name conventions; a hit requires the exact sentinel value to be echoed
+  back (not just the field name, unlike the existing `mass-assignment` case — a literal value match is
+  a stronger signal and was cheap to do here). `inconclusive`/`high` — same "candidate, not extraction"
+  discipline as every other module in this file.
+
+### Investigated, not built (flagged for a separate scoping conversation if wanted)
+- **`CSRF`** still unsolved despite the new `check_json_csrf` — correctly finds no session cookie
+  (Juice Shop's SPA login is Bearer-only), so whatever mechanism the game's own `CSRF` challenge uses
+  isn't the classic cookie-based primitive this check targets. Not yet root-caused.
+
+
+## 2026-07-27 — Vulnerable/outdated frontend JS component detection (retire.js-style)
+
+Follow-up to the Score Board gap analysis above — built the flagged "vulnerable components" detector.
+Scope note going in: Juice Shop's own `Vulnerable Library`/`Legacy Typosquatting`/`Supply Chain Attack`
+challenges are about a *backend* npm dependency (or are pure source-review "Coding Challenges"), not a
+frontend bundle, so this specific target's own score board wasn't expected to move much from this — and
+didn't (0 findings against all 36 of its real JS assets, verified live, no crashes). Built anyway because
+the *capability* — detecting known-vulnerable frontend JS libraries by version banner, the same thing
+retire.js/Wappalyzer-style tools do — is a real, generically valuable gap for actual bug bounty targets
+that do bundle outdated jQuery/Bootstrap/AngularJS(1.x), which is extremely common in the wild.
+
+Deliberately a small, high-confidence starting table (3 libraries, well-documented CVEs only) rather
+than a full retire.js-scale database — wrong version-fingerprint data would actively mislead a report,
+so precision over coverage here. Caught one accuracy bug in testing before it ever shipped: an early
+version flagged a Bootstrap 3.x install as needing "3.4.1" it deserved but tested a *4.x* threshold
+first and reported "upgrade to 4.3.1" (a different major branch entirely — a real Bootstrap 3 site
+would never make that jump for a patch). Fixed by making ranges major-version-aware where the upstream
+project actually maintains parallel branches (Bootstrap); jQuery/AngularJS don't have that problem
+(one continuously-maintained line each), so those stay a flat "upgrade to the latest fix" cascade.
+Verified against synthetic vulnerable/patched/cross-major-boundary cases before and after the fix.
+
+### Added
+- **`workers/bounty/detect.py::check_vulnerable_components`** (new) — fetches a JS asset (bounded to
+  its first 60KB; version banners are always at the top of a bundle), matches against
+  `LIBRARY_VERSION_SIGNATURES`: jQuery (< 3.5.0 CVE-2020-11022/11023, < 3.4.0 CVE-2019-11358, < 1.9.0
+  CVE-2015-9251), Bootstrap (< 4.3.1 CVE-2019-8331, < 3.4.1 CVE-2018-14040/41/42, major-branch-aware),
+  AngularJS 1.x (< 1.6.0, pre-sandbox-removal). Skips non-JS content (HTML catch-all shells) explicitly.
+- Wired into `workers/bounty/vulnscan_worker.py::_run_detection` as a new `"components"` module —
+  JS-suffixed URLs are split out of the same 400-row `BountyAsset` fetch `endpoint_urls` already uses
+  (no second query), bounded by new `MAX_DETECT_JS_FILES = 25`.
+
+
 ## 2026-07-26 — Restructured docs/ around the Diátaxis framework, added an executive summary
 
 User asked whether the documentation followed any recognized standard, then asked to restructure it to

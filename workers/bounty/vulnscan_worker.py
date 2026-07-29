@@ -26,10 +26,12 @@ from app.services.bounty_scope import is_target_in_scope
 from app.services.scan_profiles import PROFILE_TEMPLATE_DIRS
 from workers.bounty.bounty_stage import BountyStageWorker
 from workers.bounty.detect import (
+    CatchAllCache,
     check_403_bypass,
     check_cors,
     check_graphql_batching,
     check_sensitive_files,
+    check_vulnerable_components,
     graphql_schema_scan,
 )
 from workers.bounty.notify import notify_critical_findings
@@ -61,6 +63,7 @@ MAX_TARGETS_PER_RUN = 50
 # Detection-module bounds (each check is a burst of GETs per host/endpoint).
 MAX_DETECT_HOSTS = 20
 MAX_DETECT_ENDPOINTS = 40
+MAX_DETECT_JS_FILES = 25
 # Same "graphql" pattern the priority-bucket classifier already uses to flag
 # these URLs for a researcher's attention -- reused here to pick which
 # endpoint URLs get the deeper GraphQL checks.
@@ -281,20 +284,32 @@ class BountyVulnscanWorker(BountyStageWorker):
                 ).limit(400)
             )).scalars().all()
         endpoint_urls: Dict[str, Any] = {}
+        js_urls: Dict[str, Any] = {}
         for u in url_assets:
             if not is_target_in_scope(u, scope_rules):
                 continue
             tid = target_by_host.get(host_from_target(u))
             if tid is None:
                 continue
-            endpoint_urls.setdefault(u, tid)
-            if len(endpoint_urls) >= MAX_DETECT_ENDPOINTS:
+            # Same suffix check run_katana's own output filter already uses
+            # (tools.py) -- reusing the same 400-row fetch above rather than a
+            # second query, since url_assets already has everything needed.
+            if u.split("?")[0].lower().endswith(".js"):
+                if len(js_urls) < MAX_DETECT_JS_FILES:
+                    js_urls.setdefault(u, tid)
+            else:
+                if len(endpoint_urls) < MAX_DETECT_ENDPOINTS:
+                    endpoint_urls.setdefault(u, tid)
+            if len(endpoint_urls) >= MAX_DETECT_ENDPOINTS and len(js_urls) >= MAX_DETECT_JS_FILES:
                 break
 
         attempts: List[Dict[str, Any]] = []
+        # Shared so a given base's catch-all-200 probe (detect.py) fires once
+        # per run, not once per host/endpoint that happens to share an origin.
+        catch_all_cache: CatchAllCache = {}
         # Sensitive files + CORS on base URLs.
         for base, tid in base_urls.items():
-            for f in await check_sensitive_files(base, extra_headers=extra_headers):
+            for f in await check_sensitive_files(base, extra_headers=extra_headers, catch_all_cache=catch_all_cache):
                 attempts.append(self._detect_attempt(program_id, tid, "exposure", f))
             for f in await check_cors(base, extra_headers=extra_headers):
                 attempts.append(self._detect_attempt(program_id, tid, "cors", f))
@@ -305,7 +320,7 @@ class BountyVulnscanWorker(BountyStageWorker):
         for url, tid in endpoint_urls.items():
             for f in await check_cors(url, extra_headers=extra_headers):
                 attempts.append(self._detect_attempt(program_id, tid, "cors", f))
-            for f in await check_403_bypass(url):
+            for f in await check_403_bypass(url, catch_all_cache=catch_all_cache):
                 attempts.append(self._detect_attempt(program_id, tid, "403bypass", f))
             # Deeper GraphQL checks (sensitive schema field names, batching
             # acceptance) on any endpoint URL that looks like a GraphQL
@@ -316,6 +331,15 @@ class BountyVulnscanWorker(BountyStageWorker):
                     attempts.append(self._detect_attempt(program_id, tid, "graphql", f))
                 for f in await check_graphql_batching(url, extra_headers=extra_headers):
                     attempts.append(self._detect_attempt(program_id, tid, "graphql", f))
+        # Vulnerable/outdated frontend JS library detection -- unauthenticated,
+        # doesn't need extra_headers (a JS bundle is served identically to
+        # anyone; auth would only change this if the bundle itself were
+        # behind a login wall, which none of the URLs collected here are,
+        # since js_urls is drawn from the same publicly-crawled asset list
+        # as endpoint_urls above).
+        for js_url, tid in js_urls.items():
+            for f in await check_vulnerable_components(js_url):
+                attempts.append(self._detect_attempt(program_id, tid, "components", f))
         return attempts
 
     def _detect_attempt(self, program_id, target_id, module: str, finding: Dict[str, Any]) -> Dict[str, Any]:

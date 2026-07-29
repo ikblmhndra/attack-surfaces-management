@@ -121,7 +121,7 @@ async def register_test_identity(
         return False
 
 
-def _looks_like_resource(status: int, body: str) -> bool:
+def looks_like_resource(status: int, body: str) -> bool:
     """Coarse shape check only -- 200 status and a non-trivial JSON-looking
     body. Deliberately not parsed further: this module never extracts or
     stores what the resource actually contains."""
@@ -155,7 +155,7 @@ async def confirm_idor_cross_identity(
         log.warning("bounty_idor_confirm_error", url=url, error=str(exc)[:200])
         return []
 
-    if _looks_like_resource(status_a, body_a) and _looks_like_resource(status_b, body_b):
+    if looks_like_resource(status_a, body_a) and looks_like_resource(status_b, body_b):
         return [{
             "technique": "idor-cross-identity-confirmed",
             "severity": "critical",

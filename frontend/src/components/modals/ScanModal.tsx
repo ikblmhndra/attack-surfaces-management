@@ -11,6 +11,7 @@ import { motion } from "framer-motion";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { apiClient } from "@/lib/api";
+import { DialogOverlay } from "@/components/ui/Dialog";
 import { cn } from "@/lib/utils";
 
 interface ScanModalProps {
@@ -119,20 +120,15 @@ export function ScanModal({ orgId, onClose }: ScanModalProps) {
   return (
     <Dialog.Root open onOpenChange={(open) => { if (!open) onClose(); }}>
       <Dialog.Portal>
-        <Dialog.Overlay asChild>
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm"
-          />
-        </Dialog.Overlay>
+        <DialogOverlay />
 
         <Dialog.Content asChild>
+          <div className="fixed left-1/2 top-1/2 z-50 -translate-x-1/2 -translate-y-1/2">
           <motion.div
             initial={{ opacity: 0, scale: 0.96, y: 8 }}
             animate={{ opacity: 1, scale: 1, y: 0 }}
             transition={{ duration: 0.2 }}
-            className="fixed left-1/2 top-1/2 z-50 w-[calc(100%-2rem)] max-w-lg -translate-x-1/2 -translate-y-1/2 bg-surface-900 border border-border rounded-2xl shadow-2xl overflow-hidden focus:outline-none"
+            className="w-[calc(100vw-2rem)] max-w-lg bg-surface-900 border border-border rounded-2xl shadow-2xl overflow-hidden focus:outline-none"
           >
           {/* Header */}
           <div className="flex items-center justify-between p-5 border-b border-border">
@@ -454,6 +450,7 @@ export function ScanModal({ orgId, onClose }: ScanModalProps) {
             )}
           </div>
           </motion.div>
+          </div>
         </Dialog.Content>
       </Dialog.Portal>
     </Dialog.Root>

@@ -26,6 +26,10 @@
     --input: 214 32% 91%;
     --ring: 201 96% 32%;
     --radius: 0.5rem;
+    /* Dialog/scrim backdrop -- reuses light theme's own --foreground rather
+       than a hardcoded black, so it dims predictably instead of crushing a
+       bright page to near-black (see CHANGELOG.md, modal backdrop fix). */
+    --overlay: 222 47% 11%;
 
     /* Surface scale -- chrome fills (sidebar/header/cards/dropdowns), hover
        states, borders. surface-950 is intentionally NOT themed here (see
@@ -79,6 +83,9 @@
     --border: 217 33% 14%;
     --input: 217 33% 10%;
     --ring: 199 89% 48%;
+    /* Same as dark theme's own --background -- a near no-op tint over an
+       already-dark page, preserving the existing dark-theme look. */
+    --overlay: 222 47% 4%;
 
     --surface-900: 221 44% 7%;
     --surface-800: 222 47% 11%;

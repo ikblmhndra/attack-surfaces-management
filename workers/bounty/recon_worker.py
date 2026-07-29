@@ -8,10 +8,11 @@ pipeline's schema separation exists to prevent. See CHANGELOG.md.
 """
 import asyncio
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import structlog
 from sqlalchemy import select
@@ -73,6 +74,34 @@ MAX_URLS_PERSISTED = 5000
 # Full-auto only: how many in-scope subdomains one recon run may auto-promote
 # into testable targets. A bound on blast radius, not a scope restriction.
 MAX_AUTO_PROMOTE = 50
+
+# Punctuation that never appears in a real URL path a browser would request,
+# but does appear verbatim when a JS-content crawler (katana's -jc mode, or
+# tools.py::analyze_js_file's own ENDPOINT_PATTERN, whose char class allows
+# "{}") lifts a template-expression or string-concatenation fragment out of
+# bundled script source -- e.g. "/'+L(i[8])+'" or the percent-decoded form of
+# "/%7B%7Bhref%7D%7D" ("/{{href}}"). Verified live against a real target:
+# these fragments get crawled as if they were routes and then re-tested by
+# every downstream module, wasting budget on non-existent endpoints.
+_JS_EXPR_PUNCT_RE = re.compile(r"[+(){}\[\]]")
+
+
+def _looks_like_real_path(value: str) -> bool:
+    """Reject a candidate whose path (raw OR percent-decoded) contains
+    JS-expression punctuation -- see _JS_EXPR_PUNCT_RE above. Checked on both
+    forms since the punctuation can arrive already percent-encoded."""
+    try:
+        path = urlparse(value if "://" in value else f"//{value}").path or value
+    except Exception:
+        path = value
+    if _JS_EXPR_PUNCT_RE.search(path):
+        return False
+    try:
+        if _JS_EXPR_PUNCT_RE.search(unquote(path)):
+            return False
+    except Exception:
+        pass
+    return True
 
 
 def _scope_seed_domains(scope_rules: List[Dict[str, Any]]) -> List[str]:
@@ -484,9 +513,13 @@ class BountyReconWorker(BountyStageWorker):
         if not entries:
             return 0
         seen: Set[Tuple[str, str]] = set()
+        rejected = 0
         rows = []
         for value, asset_type, source, meta in entries:
             value = str(value)[:1000]
+            if asset_type in ("url", "js_endpoint") and not _looks_like_real_path(value):
+                rejected += 1
+                continue
             key = (value, asset_type)
             if key in seen:
                 continue
@@ -498,6 +531,8 @@ class BountyReconWorker(BountyStageWorker):
                 "source": source,
                 "metadata": meta or None,
             })
+        if rejected:
+            log.info("bounty_recon_rejected_nonroute_assets", program_id=program_id, rejected=rejected)
         if not rows:
             return 0
 
