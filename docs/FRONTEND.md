@@ -53,7 +53,9 @@ frontend/src/app/
 │                                   # to /dashboard(/bounty) or /auth/login
 ├── auth/
 │   ├── login/page.tsx
-│   ├── register/page.tsx        # product picker (ASM / Bug Bounty / both) lives here
+│   ├── register/page.tsx        # product picker (ASM / Bug Bounty / both); reads ?invite_token=
+│   │                             # from the URL and switches to an invite-join mode (hides workspace
+│   │                             # name + product picker, both ignored server-side on that path)
 │   └── forgot-password/page.tsx
 ├── dashboard/
 │   ├── layout.tsx                # auth guard + product guard + shell picker (above)
@@ -75,7 +77,7 @@ frontend/src/app/
 │   ├── notifications/            # shared (both products)
 │   ├── search/                   # shared
 │   └── settings/
-│       ├── page.tsx
+│       ├── page.tsx                # workspace config + Team Members (list + invite-link generator)
 │       ├── api-keys/page.tsx
 │       └── profile/page.tsx
 └── api/                           # (Next.js route handlers, if any — thin)

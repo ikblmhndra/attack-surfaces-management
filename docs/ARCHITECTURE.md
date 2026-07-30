@@ -218,10 +218,11 @@ sequenceDiagram
 
 ## Known drift and dead code, factually
 
-- **`report.daily`** (published on a schedule by `workers/scheduler/scheduler.py`) has no consumer
-  anywhere — `EXCHANGE_MAP` doesn't declare it, so nothing binds a queue to receive it. Scheduled
-  daily-summary reports are silently dropped; treat them as dead code until a consumer exists. On-demand
-  reports (`POST /reports/generate`) are unaffected — separate, synchronous `BackgroundTasks` path.
+- **Reports are on-demand only, by decision, not by an unfinished gap**: an older claim here described a
+  `report.daily` message published on a schedule with no consumer. Verified (2026-07-28): neither the
+  publish side nor a consumer exists anywhere in the current codebase. `POST /reports/generate`
+  (synchronous, `BackgroundTasks`) is the only report path, confirmed as the intended design — not
+  something to "finish" by wiring up a scheduled consumer.
 - **Three separate queue routing tables can drift from each other**: `workers/base_worker.py::EXCHANGE_MAP`,
   `workers/queue_client.py::ROUTING_CONFIG`, `backend/app/core/queue_client.py::ROUTING_CONFIG`. As of
   this writing `backend/app/core/queue_client.py` is missing `scan.scanner` — publishing to it from

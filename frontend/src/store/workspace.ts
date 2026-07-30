@@ -137,7 +137,12 @@ export const useWorkspaceStore = create<WorkspaceState>()(
         window.location.href = "/auth/login";
       },
 
-      // Refresh user profile from API
+      // Refresh user profile from API. Also (re)sets workspaceId/workspaceName
+      // from the response, not just login() -- without this, a session
+      // restored purely from a stored token (workspaceId never persisted, or
+      // wiped independently of the token) would leave every `enabled:
+      // !!workspaceId` query permanently disabled with no way to recover
+      // short of a full re-login.
       refreshUser: async () => {
         try {
           const { data } = await authAPI.me();
@@ -145,6 +150,7 @@ export const useWorkspaceStore = create<WorkspaceState>()(
             user: data,
             isAuthenticated: true,
             isLoading: false,
+            workspaceId: data.workspace_id,
             enabledProducts: data.enabled_products?.length ? data.enabled_products : ["asm"],
           });
         } catch {

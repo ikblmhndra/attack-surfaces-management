@@ -3,14 +3,20 @@
 import { useState, useEffect, useRef } from "react";
 import {
   Settings, Save, Building2, Globe, AlertTriangle,
-  CheckCircle, RefreshCw
+  CheckCircle, RefreshCw, Users, UserPlus, Copy, Check
 } from "lucide-react";
 import { motion } from "framer-motion";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { apiClient } from "@/lib/api";
+import { apiClient, workspacesAPI } from "@/lib/api";
 import { useWorkspaceStore } from "@/store/workspace";
 import { cn } from "@/lib/utils";
+
+const INVITABLE_ROLES = [
+  { value: "admin", label: "Admin" },
+  { value: "analyst", label: "Analyst" },
+  { value: "viewer", label: "Viewer" },
+] as const;
 
 export default function SettingsPage() {
   const { user, workspaceId, canAdmin } = useWorkspaceStore();
@@ -37,6 +43,36 @@ export default function SettingsPage() {
     },
     onError: () => toast.error("Failed to save settings"),
   });
+
+  // ── Team members / invite ──────────────────────────────────
+  const { data: members } = useQuery({
+    queryKey: ["workspace-members"],
+    queryFn: () => workspacesAPI.getMembers().then(r => r.data.items as Array<{ id: string; email: string; full_name: string; role: string }>),
+    enabled: !!workspaceId,
+  });
+
+  const [inviteEmail, setInviteEmail] = useState("");
+  const [inviteRole, setInviteRole] = useState<"admin" | "analyst" | "viewer">("analyst");
+  const [inviteResult, setInviteResult] = useState<{ path: string; role: string } | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  const inviteMutation = useMutation({
+    mutationFn: () => workspacesAPI.invite(inviteEmail, inviteRole),
+    onSuccess: (res) => {
+      setInviteResult({ path: res.data.invite_path, role: res.data.role });
+      setInviteEmail("");
+      toast.success("Invite link generated");
+    },
+    onError: (err: any) => toast.error(err?.response?.data?.detail || "Failed to create invite"),
+  });
+
+  const copyInviteLink = () => {
+    if (!inviteResult) return;
+    const fullUrl = `${window.location.origin}${inviteResult.path}`;
+    navigator.clipboard.writeText(fullUrl);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
 
   useEffect(() => {
     if (workspace?.name && !initialized.current) {
@@ -171,6 +207,85 @@ export default function SettingsPage() {
               disabled={!canAdmin()}
             />
           </div>
+        </div>
+
+        {/* Team Members */}
+        <div className="glass-card p-5 space-y-4">
+          <h2 className="text-sm font-semibold text-foreground flex items-center gap-2">
+            <Users className="w-4 h-4 text-brand-400" />
+            Team Members
+          </h2>
+
+          <div className="space-y-2">
+            {members?.map((m) => (
+              <div key={m.id} className="flex items-center justify-between bg-surface-800 rounded-lg p-3">
+                <div className="min-w-0">
+                  <p className="text-sm font-medium text-foreground truncate">{m.full_name}</p>
+                  <p className="text-xs text-muted-foreground truncate">{m.email}</p>
+                </div>
+                <span className="text-xs font-medium text-muted-foreground capitalize px-2 py-0.5 rounded-full bg-surface-700 flex-shrink-0">
+                  {m.role}
+                </span>
+              </div>
+            ))}
+          </div>
+
+          {canAdmin() && (
+            <div className="pt-2 border-t border-border space-y-3">
+              <p className="text-xs text-muted-foreground">
+                Generate an invite link to add a teammate. No email is sent — copy the link and share it
+                yourself.
+              </p>
+              <div className="flex flex-col sm:flex-row gap-2">
+                <input
+                  type="email"
+                  value={inviteEmail}
+                  onChange={(e) => setInviteEmail(e.target.value)}
+                  placeholder="teammate@company.com"
+                  className="flex-1 px-3 py-2 bg-surface-800 border border-border rounded-lg text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-brand-500"
+                />
+                <select
+                  value={inviteRole}
+                  onChange={(e) => setInviteRole(e.target.value as typeof inviteRole)}
+                  className="px-3 py-2 bg-surface-800 border border-border rounded-lg text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-brand-500"
+                >
+                  {INVITABLE_ROLES.map((r) => (
+                    <option key={r.value} value={r.value}>{r.label}</option>
+                  ))}
+                </select>
+                <button
+                  onClick={() => inviteMutation.mutate()}
+                  disabled={!inviteEmail || inviteMutation.isPending}
+                  className="flex items-center justify-center gap-2 px-4 py-2 rounded-lg bg-brand-600 hover:bg-brand-500 text-white text-sm font-medium transition-colors disabled:opacity-50 flex-shrink-0"
+                >
+                  {inviteMutation.isPending ? (
+                    <RefreshCw className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <UserPlus className="w-4 h-4" />
+                  )}
+                  Invite
+                </button>
+              </div>
+
+              {inviteResult && (
+                <div className="flex items-center gap-2 p-3 rounded-lg bg-brand-500/10 border border-brand-500/20">
+                  <input
+                    readOnly
+                    value={`${typeof window !== "undefined" ? window.location.origin : ""}${inviteResult.path}`}
+                    className="flex-1 min-w-0 bg-transparent text-xs font-mono text-foreground focus:outline-none truncate"
+                    onFocus={(e) => e.target.select()}
+                  />
+                  <button
+                    onClick={copyInviteLink}
+                    className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-surface-700 hover:bg-surface-600 text-xs font-medium text-foreground transition-colors flex-shrink-0"
+                  >
+                    {copied ? <Check className="w-3.5 h-3.5 text-green-400" /> : <Copy className="w-3.5 h-3.5" />}
+                    {copied ? "Copied" : "Copy"}
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         {canAdmin() && (

@@ -18,8 +18,11 @@ const nextConfig = {
     formats: ["image/avif", "image/webp"],
   },
 
+  // Promoted out of `experimental` in Next.js 15 (was
+  // experimental.serverComponentsExternalPackages).
+  serverExternalPackages: ["@tanstack/react-table"],
+
   experimental: {
-    serverComponentsExternalPackages: ["@tanstack/react-table"],
     optimizePackageImports: [
       "lucide-react",
       "recharts",

@@ -2,6 +2,7 @@
 ASM Platform — Redis Client
 Async Redis connection with typed cache helpers and pub/sub support.
 """
+import asyncio
 import json
 from typing import Any, Optional, Union
 
@@ -30,8 +31,22 @@ async def init_redis() -> None:
         health_check_interval=30,
     )
 
-    # Verify connection
-    await redis_client.ping()
+    # Verify connection. Retried the same way workers/base_worker.py retries
+    # its RabbitMQ connect: on a host/daemon restart, Docker starts all
+    # `restart: unless-stopped` containers natively and doesn't honor
+    # compose's `depends_on: condition: service_healthy` ordering, so this
+    # can race Redis's own boot. A lost race here would otherwise kill the
+    # whole ASGI lifespan with no self-recovery (see rabbitmq.py::init_rabbitmq).
+    for attempt in range(1, 6):
+        try:
+            await redis_client.ping()
+            break
+        except Exception as e:
+            if attempt == 5:
+                raise
+            wait = attempt * 3
+            log.warning("redis_connect_retry", attempt=attempt, wait=wait, error=str(e))
+            await asyncio.sleep(wait)
     log.info("redis_initialized", url=settings.REDIS_URL.split("@")[-1])
 
 

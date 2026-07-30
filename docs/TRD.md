@@ -217,13 +217,30 @@ and [DEVELOPMENT.md's known quirks](./DEVELOPMENT.md#known-quirks), consolidated
 technical debt:
 
 1. Three independent copies of the queue routing table can silently drift from each other.
-2. `report.daily` messages are published on a schedule but have no consumer — silently dropped.
-3. `backend/app/integrations/{scanners,enrichment}/` and `backend/app/workers/` are empty/near-empty
+2. `backend/app/integrations/{scanners,enrichment}/` and `backend/app/workers/` are empty/near-empty
    stub packages, not real extension points — a contributor reading only package names could reasonably
-   but incorrectly assume otherwise.
-4. Editing a running worker's `.py` file on disk does not take effect until that worker container is
+   but incorrectly assume otherwise. There's also a *third*, separate empty directory,
+   `backend/workers/` (top-level, no `app/`) — genuinely empty, no `__init__.py` even. It's what the
+   `api` container's `/app/workers` resolves to (the `api` service only mounts `backend/`, not the
+   real repo-root `workers/` package that worker containers mount). Found (2026-07-28) because
+   `backend/tests/unit/test_scan_pipeline_state.py` does `from workers import scan_state` — that import
+   can only ever succeed in a worker container's environment, never the `api` container's, so this one
+   test fails collection whenever `make test`/`docker compose exec api pytest tests/` runs. Pre-existing,
+   unrelated to any dependency version — not fixed here, flagged for whoever owns test infra next.
+3. Editing a running worker's `.py` file on disk does not take effect until that worker container is
    restarted — a process-level fact, not a bug, but a frequent source of false-negative manual testing
    if forgotten.
-5. `workers/` is excluded from CI/`make lint`'s ruff scope entirely.
-6. `technical`/`compliance`/`custom` report formats are currently aliases of the same full finding list
-   with no real framework-specific mapping.
+4. `workers/` is excluded from CI/`make lint`'s ruff scope entirely.
+5. `custom` report format is still a plain alias of `technical` with no section-picker built.
+   `compliance` (unlike an older version of this note claimed) does have real framework mapping — every
+   finding maps to a CIS Controls v8 Control + Safeguard, display-only.
+6. `ecdsa` (a transitive dependency of `python-jose[cryptography]`) has one open CVE
+   (PYSEC-2026-1325, a Minerva timing side-channel on ECDSA P-256 signing) with **no fix released or
+   planned** — upstream considers timing side-channels out of scope. Accepted as a documented risk, not
+   remediated: verified (`grep -rn "algorithm=\|algorithms=" backend/ workers/`) that this platform's
+   JWT usage is exclusively `HS256` (symmetric, `settings.ALGORITHM`) everywhere, never an EC-based
+   algorithm (ES256/384/512), so `ecdsa`'s vulnerable `sign_digest()` path is never actually exercised by
+   this application's own code.
+
+Scheduled/recurring report generation is deliberately **not** on this list — it's a confirmed non-goal
+(see [PRD.md §10](./PRD.md)), not standing debt to resolve.

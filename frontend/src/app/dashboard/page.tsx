@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
+import Link from "next/link";
 import * as Dialog from "@radix-ui/react-dialog";
 import {
   Shield, AlertTriangle, Globe, Cpu, TrendingDown, TrendingUp,
@@ -576,9 +577,9 @@ export default function DashboardPage() {
           >
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-sm font-semibold text-foreground">Scan Activity</h2>
-              <a href="/dashboard/scans" className="text-xs text-brand-400 hover:text-brand-300 flex items-center gap-1">
+              <Link href="/dashboard/scans" className="text-xs text-brand-400 hover:text-brand-300 flex items-center gap-1">
                 View all <ChevronRight className="w-3 h-3" />
-              </a>
+              </Link>
             </div>
 
             <div className="space-y-2">
@@ -605,9 +606,9 @@ export default function DashboardPage() {
             >
               <div className="flex items-center justify-between mb-4">
                 <h2 className="text-sm font-semibold text-foreground">Organization Scorecards</h2>
-                <a href="/dashboard/organizations" className="text-xs text-brand-400 hover:text-brand-300 flex items-center gap-1">
+                <Link href="/dashboard/organizations" className="text-xs text-brand-400 hover:text-brand-300 flex items-center gap-1">
                   Manage <ChevronRight className="w-3 h-3" />
-                </a>
+                </Link>
               </div>
 
               <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3">

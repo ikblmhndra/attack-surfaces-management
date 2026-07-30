@@ -56,7 +56,7 @@ A request to a gated router from a workspace lacking that product gets `403` wit
 
 | Method | Path | Notes |
 |---|---|---|
-| POST | `/auth/register` | Creates a **brand-new** `Workspace` + owner `User` — self-serve signup never joins an existing workspace. Body includes `enabled_products` (validated non-empty subset of `{asm, bounty}`, defaults to `["asm"]`). |
+| POST | `/auth/register` | Without `invite_token`: creates a **brand-new** `Workspace` + owner `User`. Body includes `enabled_products` (validated non-empty subset of `{asm, bounty}`, defaults to `["asm"]`). With a valid `invite_token` (see `/workspaces/invite` below): joins that token's existing workspace at the granted role instead — `workspace_name`/`enabled_products` in the request are ignored in that case, the workspace's own values are used. |
 | POST | `/auth/login` | MFA-aware (`428` + `X-MFA-Required` header if TOTP required and not supplied). |
 | POST | `/auth/refresh` | Rotates both tokens; refresh token hash is stored server-side and checked, so refresh tokens are revocable. |
 | POST | `/auth/logout` | Invalidates the stored refresh token hash. |
@@ -70,7 +70,7 @@ A request to a gated router from a workspace lacking that product gets `403` wit
 |---|---|---|
 | GET | `/workspaces` | Current workspace details. |
 | GET | `/workspaces/members` | User list. |
-| POST | `/workspaces/invite` | `invite_token` exists in the register schema but the field is currently unused/dead in `register()` — every registration creates a new workspace regardless. |
+| POST | `/workspaces/invite` | Owner/admin only. Generates a signed, stateless invite JWT (`type=workspace_invite`, `wid`, `role`, 7-day expiry — same pattern as `/auth/forgot-password`'s reset token, no DB row/migration). Returned directly in the response (`invite_token`/`invite_path`) — no email is sent; delivery is the caller's problem. `POST /auth/register` with `invite_token` set joins the invite's workspace at the granted role instead of creating a new one. Not single-use or revocable, matching the reset-token's own simplicity level — anyone holding the link can join until it expires. |
 | PUT | `/workspaces` | Update settings. |
 
 ## `organizations` — ASM only

@@ -102,7 +102,7 @@ Short, factual — see `CHANGELOG.md` for the full incident write-ups behind eac
   is set in `rabbitmq.conf` (~24 queues here, so the added series count is small). Without it, any
   dashboard panel expecting a `queue`/`vhost` label silently renders nothing, indistinguishable from a
   broken query.
-- **`report.daily` has no consumer, three queue-routing tables can drift** — see
+- **Three queue-routing tables can drift** — see
   [ARCHITECTURE.md#known-drift-and-dead-code-factually](./ARCHITECTURE.md).
 
 For registration → workspace → product entitlement (relevant if extending auth), see

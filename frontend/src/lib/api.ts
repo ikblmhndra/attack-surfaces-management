@@ -152,6 +152,7 @@ export const authAPI = {
     full_name: string;
     workspace_name: string;
     enabled_products: string[];
+    invite_token?: string;
   }) => api.post("/auth/register", data),
 
   logout: () => api.post("/auth/logout"),
@@ -162,6 +163,13 @@ export const authAPI = {
 
   enableMFA: (secret: string, code: string) =>
     api.post("/auth/mfa/enable", { secret, code }),
+};
+
+export const workspacesAPI = {
+  getMembers: () => api.get("/workspaces/members"),
+
+  invite: (email: string, role: "admin" | "analyst" | "viewer") =>
+    api.post("/workspaces/invite", { email, role }),
 };
 
 export const organizationsAPI = {

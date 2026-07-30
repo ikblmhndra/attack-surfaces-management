@@ -1,8 +1,8 @@
 "use client";
 
-import { useState } from "react";
-import { useRouter } from "next/navigation";
-import { Shield, Eye, EyeOff, Loader2, AlertCircle, Lock, Mail, User, Building2, Crosshair, Check } from "lucide-react";
+import { Suspense, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { Shield, Eye, EyeOff, Loader2, AlertCircle, Lock, Mail, User, Building2, Crosshair, Check, UserPlus } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
@@ -14,6 +14,10 @@ import { cn } from "@/lib/utils";
 const registerSchema = z.object({
   full_name: z.string().min(1, "Full name is required"),
   email: z.string().email("Invalid email address"),
+  // Ignored server-side when joining via invite_token (the existing
+  // workspace's own name/enabled_products are used instead) -- still
+  // required by the schema since defaults satisfy it when those fields
+  // aren't even rendered, see isInvite below.
   workspace_name: z.string().min(1, "Workspace name is required"),
   password: z.string().min(12, "Password must be at least 12 characters"),
   enabled_products: z.array(z.enum(["asm", "bounty"])).min(1, "Choose at least one product"),
@@ -39,7 +43,18 @@ const PRODUCTS = [
 ];
 
 export default function RegisterPage() {
+  return (
+    <Suspense fallback={null}>
+      <RegisterForm />
+    </Suspense>
+  );
+}
+
+function RegisterForm() {
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const inviteToken = searchParams.get("invite_token");
+  const isInvite = !!inviteToken;
   const { login } = useWorkspaceStore();
   const [showPassword, setShowPassword] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
@@ -47,7 +62,16 @@ export default function RegisterPage() {
 
   const form = useForm<RegisterForm>({
     resolver: zodResolver(registerSchema),
-    defaultValues: { full_name: "", email: "", workspace_name: "", password: "", enabled_products: ["asm"] },
+    // workspace_name/enabled_products are never shown when joining via
+    // invite (server ignores them on that path anyway) -- defaults here
+    // just need to satisfy the schema's min-length checks.
+    defaultValues: {
+      full_name: "",
+      email: "",
+      workspace_name: isInvite ? "invited-member" : "",
+      password: "",
+      enabled_products: ["asm"],
+    },
   });
 
   const selectedProducts = form.watch("enabled_products");
@@ -70,6 +94,7 @@ export default function RegisterPage() {
         full_name: data.full_name,
         workspace_name: data.workspace_name,
         enabled_products: data.enabled_products,
+        ...(inviteToken ? { invite_token: inviteToken } : {}),
       });
       const { access_token, refresh_token, user_id, workspace_id, role } = response.data;
 
@@ -131,8 +156,14 @@ export default function RegisterPage() {
 
         {/* Card */}
         <div className="glass-card p-8">
+          {isInvite && (
+            <div className="flex items-center gap-2 mb-5 px-3 py-2 rounded-lg bg-brand-500/10 border border-brand-500/20">
+              <UserPlus className="w-4 h-4 text-brand-400 flex-shrink-0" />
+              <p className="text-xs text-brand-400">You&apos;ve been invited to join an existing workspace</p>
+            </div>
+          )}
           <h2 className="text-lg font-semibold text-foreground mb-6">
-            Create your workspace
+            {isInvite ? "Join your team" : "Create your workspace"}
           </h2>
 
           <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-5">
@@ -200,83 +231,91 @@ export default function RegisterPage() {
               )}
             </div>
 
-            {/* Workspace Name */}
-            <div>
-              <label className="block text-sm font-medium text-foreground mb-1.5">
-                Workspace name
-              </label>
-              <div className="relative">
-                <Building2 className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-                <input
-                  {...form.register("workspace_name")}
-                  type="text"
-                  autoComplete="organization"
-                  placeholder="My Company"
-                  className={cn(
-                    "w-full pl-10 pr-4 py-2.5 bg-surface-800 border rounded-lg text-foreground",
-                    "placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-brand-500",
-                    form.formState.errors.workspace_name ? "border-red-500" : "border-border",
-                  )}
-                />
+            {/* Workspace Name -- not asked when joining via invite: the
+                existing workspace's name is used, server-side, regardless
+                of whatever this field would contain. */}
+            {!isInvite && (
+              <div>
+                <label className="block text-sm font-medium text-foreground mb-1.5">
+                  Workspace name
+                </label>
+                <div className="relative">
+                  <Building2 className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+                  <input
+                    {...form.register("workspace_name")}
+                    type="text"
+                    autoComplete="organization"
+                    placeholder="My Company"
+                    className={cn(
+                      "w-full pl-10 pr-4 py-2.5 bg-surface-800 border rounded-lg text-foreground",
+                      "placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-brand-500",
+                      form.formState.errors.workspace_name ? "border-red-500" : "border-border",
+                    )}
+                  />
+                </div>
+                {form.formState.errors.workspace_name && (
+                  <p className="text-xs text-red-400 mt-1">{form.formState.errors.workspace_name.message}</p>
+                )}
               </div>
-              {form.formState.errors.workspace_name && (
-                <p className="text-xs text-red-400 mt-1">{form.formState.errors.workspace_name.message}</p>
-              )}
-            </div>
+            )}
 
-            {/* Products */}
-            <div>
-              <label className="block text-sm font-medium text-foreground mb-1.5">
-                What do you want to use this workspace for?
-              </label>
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                {PRODUCTS.map((product) => {
-                  const selected = selectedProducts?.includes(product.value);
-                  const isRose = product.accent === "rose";
-                  return (
-                    <button
-                      key={product.value}
-                      type="button"
-                      onClick={() => toggleProduct(product.value)}
-                      aria-pressed={selected}
-                      className={cn(
-                        "relative text-left p-3.5 rounded-lg border transition-colors",
-                        selected
-                          ? isRose
-                            ? "border-rose-500/50 bg-rose-500/10"
-                            : "border-brand-500/50 bg-brand-500/10"
-                          : "border-border bg-surface-800 hover:bg-surface-700/50",
-                      )}
-                    >
-                      <div className="flex items-start gap-2.5">
-                        <product.icon className={cn(
-                          "w-4 h-4 flex-shrink-0 mt-0.5",
-                          selected ? (isRose ? "text-rose-400" : "text-brand-400") : "text-muted-foreground",
-                        )} />
-                        <div className="min-w-0">
-                          <p className="text-sm font-medium text-foreground">{product.name}</p>
-                          <p className="text-xs text-muted-foreground mt-0.5">{product.description}</p>
+            {/* Products -- not asked when joining via invite: product
+                entitlement belongs to the workspace being joined, not a
+                per-user choice (see EXPLANATION.md). */}
+            {!isInvite && (
+              <div>
+                <label className="block text-sm font-medium text-foreground mb-1.5">
+                  What do you want to use this workspace for?
+                </label>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                  {PRODUCTS.map((product) => {
+                    const selected = selectedProducts?.includes(product.value);
+                    const isRose = product.accent === "rose";
+                    return (
+                      <button
+                        key={product.value}
+                        type="button"
+                        onClick={() => toggleProduct(product.value)}
+                        aria-pressed={selected}
+                        className={cn(
+                          "relative text-left p-3.5 rounded-lg border transition-colors",
+                          selected
+                            ? isRose
+                              ? "border-rose-500/50 bg-rose-500/10"
+                              : "border-brand-500/50 bg-brand-500/10"
+                            : "border-border bg-surface-800 hover:bg-surface-700/50",
+                        )}
+                      >
+                        <div className="flex items-start gap-2.5">
+                          <product.icon className={cn(
+                            "w-4 h-4 flex-shrink-0 mt-0.5",
+                            selected ? (isRose ? "text-rose-400" : "text-brand-400") : "text-muted-foreground",
+                          )} />
+                          <div className="min-w-0">
+                            <p className="text-sm font-medium text-foreground">{product.name}</p>
+                            <p className="text-xs text-muted-foreground mt-0.5">{product.description}</p>
+                          </div>
                         </div>
-                      </div>
-                      {selected && (
-                        <div className={cn(
-                          "absolute top-3 right-3 w-4 h-4 rounded-full flex items-center justify-center",
-                          isRose ? "bg-rose-500" : "bg-brand-500",
-                        )}>
-                          <Check className="w-2.5 h-2.5 text-white" strokeWidth={3} />
-                        </div>
-                      )}
-                    </button>
-                  );
-                })}
+                        {selected && (
+                          <div className={cn(
+                            "absolute top-3 right-3 w-4 h-4 rounded-full flex items-center justify-center",
+                            isRose ? "bg-rose-500" : "bg-brand-500",
+                          )}>
+                            <Check className="w-2.5 h-2.5 text-white" strokeWidth={3} />
+                          </div>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+                {form.formState.errors.enabled_products && (
+                  <p className="text-xs text-red-400 mt-1.5">{form.formState.errors.enabled_products.message}</p>
+                )}
+                <p className="text-xs text-muted-foreground mt-1.5">
+                  Select one or both. This can&apos;t be changed after your workspace is created.
+                </p>
               </div>
-              {form.formState.errors.enabled_products && (
-                <p className="text-xs text-red-400 mt-1.5">{form.formState.errors.enabled_products.message}</p>
-              )}
-              <p className="text-xs text-muted-foreground mt-1.5">
-                Select one or both. This can&apos;t be changed after your workspace is created.
-              </p>
-            </div>
+            )}
 
             {/* Password */}
             <div>
@@ -326,10 +365,10 @@ export default function RegisterPage() {
               {isLoading ? (
                 <span className="flex items-center justify-center gap-2">
                   <Loader2 className="w-4 h-4 animate-spin" />
-                  Creating workspace...
+                  {isInvite ? "Joining workspace..." : "Creating workspace..."}
                 </span>
               ) : (
-                "Create workspace"
+                isInvite ? "Join workspace" : "Create workspace"
               )}
             </button>
           </form>

@@ -80,13 +80,14 @@ every transition.
 
 ## Why product entitlement is chosen once, at registration
 
-A self-serve registration always creates a brand-new `Workspace` — there is no "join an existing
-workspace" flow in code today (`RegisterRequest.invite_token` exists in the schema but is currently
-unread/dead in `register()` — see [Platform self-security](#platform-self-security-what-was-found-what-wasnt)
-below). Because of that, product entitlement (`Workspace.enabled_products`) is chosen once, at
-registration, rather than being a per-user setting layered on later: one registration, one new
-workspace, one product choice, enforced server-side via `RequireProduct` and embedded in the JWT
-`products` claim so most requests don't need an extra DB lookup to check it. See
+A self-serve registration with no `invite_token` always creates a brand-new `Workspace` — product
+entitlement (`Workspace.enabled_products`) is chosen once, at that moment, rather than being a per-user
+setting layered on later. An invited join (`POST /workspaces/invite` + `register()` with `invite_token`
+— see [Platform self-security](#platform-self-security-what-was-found-what-wasnt) below) doesn't get its
+own product choice either, for the same underlying reason: it inherits the *existing* workspace's
+`enabled_products` rather than letting the request assert its own, since a request can't be trusted to
+self-assign entitlement. Either way, entitlement is server-side truth — enforced via `RequireProduct` and
+embedded in the JWT `products` claim so most requests don't need an extra DB lookup to check it. See
 [API_REFERENCE.md#product-entitlement](./API_REFERENCE.md) for the enforcement mechanics.
 
 ## Self-hosted Scalar API reference, not the CDN default
@@ -106,13 +107,26 @@ dependency on external services it doesn't have to have).
 
 ## Platform self-security: what was found, what wasn't
 
-An earlier full-repo assessment flagged three suspected issues. Two were confirmed real by reading the
-code directly and remain unfixed as of this writing: `POST /workspaces/invite` is a complete no-op stub,
-and `worker-notification`'s Docker Compose environment block omits every `SMTP_*` variable, so email
-notifications silently never send regardless of `.env` configuration. The third — a suspected
-cross-tenant data leak — was investigated exhaustively (every endpoint file, the JWT/API-key auth
-dependency layer, the correlation worker's cross-org shared-IP queries) and **not found**; every query
-checked was correctly scoped by `workspace_id`. One related hardening gap did surface during that audit:
+An earlier full-repo assessment flagged three suspected issues.
+
+**`POST /workspaces/invite` was a complete no-op stub — fixed (2026-07-28).** It now generates a signed,
+stateless invite JWT (`type=workspace_invite`, carrying `wid`/`role`, 7-day expiry — the exact same
+pattern `/auth/forgot-password`'s reset token already used, so no new DB table/migration was needed).
+`register()` consumes `invite_token` to join that workspace at the granted role instead of creating a
+new one. Delivery is deliberately not email: the token/link is returned directly in the API response for
+an owner/admin to share however they like, sidestepping the second issue below entirely rather than
+depending on it. Known, accepted limitation: not single-use or revocable, matching the reset-token
+pattern's own simplicity level — anyone holding the link can join at the granted role until it expires.
+
+**`worker-notification`'s missing `SMTP_*` env vars remain unfixed, deliberately.** The current phase is
+dev-environment-treated-as-production with no real SMTP credentials available to verify delivery
+against — wiring the env vars through without a way to confirm actual mail delivery would just be
+unverified code sitting there. Revisit once real SMTP access exists.
+
+The third suspected issue — a cross-tenant data leak — was investigated exhaustively (every endpoint
+file, the JWT/API-key auth dependency layer, the correlation worker's cross-org shared-IP queries) and
+**not found**; every query checked was correctly scoped by `workspace_id`. One related hardening gap did
+surface during that audit:
 `findings.py::bulk_action`'s bulk `UPDATE` statements don't re-assert `workspace_id` in their own `WHERE`
 clause the way the rest of the codebase consistently does (only the pre-check `SELECT` does) — not
 currently exploitable (the pre-check already validates every ID belongs to the caller's workspace before

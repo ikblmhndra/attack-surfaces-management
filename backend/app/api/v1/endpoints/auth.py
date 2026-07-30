@@ -122,7 +122,9 @@ async def register(
     db: AsyncSession = Depends(get_db),
     bg: BackgroundTasks = BackgroundTasks(),
 ):
-    """Register a new user and create their workspace."""
+    """Register a new user. Joins an existing workspace if a valid
+    invite_token is supplied (see workspaces.py::invite_member); otherwise
+    always creates a brand-new workspace, same as before."""
     user_service = UserService(db)
 
     # Check if email already exists
@@ -133,21 +135,45 @@ async def register(
             detail="Email already registered",
         )
 
-    # Create workspace + owner user in transaction
-    workspace = Workspace(
-        name=request.workspace_name,
-        slug=_slugify(request.workspace_name),
-        enabled_products=request.enabled_products,
-    )
-    db.add(workspace)
-    await db.flush()
+    invited_workspace = None
+    invited_role = "owner"
+    if request.invite_token:
+        from jose import JWTError, jwt
+        try:
+            invite_payload = jwt.decode(request.invite_token, settings.SECRET_KEY, algorithms=["HS256"])
+        except JWTError:
+            raise HTTPException(status_code=400, detail="Invalid or expired invite token")
+        if invite_payload.get("type") != "workspace_invite":
+            raise HTTPException(status_code=400, detail="Invalid invite token")
+        result = await db.execute(
+            select(Workspace).where(Workspace.id == invite_payload["wid"], Workspace.is_active == True)
+        )
+        invited_workspace = result.scalar_one_or_none()
+        if not invited_workspace:
+            raise HTTPException(status_code=400, detail="Invite token's workspace no longer exists")
+        invited_role = invite_payload["role"]
+
+    if invited_workspace:
+        # Joining an existing workspace -- product entitlement and workspace
+        # identity come from the invite, not from this request (a request
+        # here can't be trusted to self-assign products/workspace).
+        workspace = invited_workspace
+    else:
+        # No invite -- create workspace + owner user, same as always.
+        workspace = Workspace(
+            name=request.workspace_name,
+            slug=_slugify(request.workspace_name),
+            enabled_products=request.enabled_products,
+        )
+        db.add(workspace)
+        await db.flush()
 
     user = User(
         workspace_id=workspace.id,
         email=request.email.lower(),
         password_hash=get_password_hash(request.password),
         full_name=request.full_name,
-        role="owner",
+        role=invited_role,
         is_verified=False,
         last_login=datetime.now(timezone.utc),
         last_login_ip=_get_client_ip(req),
@@ -156,7 +182,7 @@ async def register(
     await db.commit()
     await db.refresh(user)
 
-    log.info("user_registered", user_id=str(user.id), email=user.email)
+    log.info("user_registered", user_id=str(user.id), email=user.email, via_invite=bool(invited_workspace))
 
     # Generate tokens
     access_token = create_access_token(
@@ -178,7 +204,7 @@ async def register(
         audit_log,
         workspace_id=str(workspace.id),
         user_id=str(user.id),
-        action="user.register",
+        action="user.register.via_invite" if invited_workspace else "user.register",
         resource_type="user",
         resource_id=str(user.id),
         ip_address=_get_client_ip(req),

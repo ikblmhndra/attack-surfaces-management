@@ -130,7 +130,7 @@ would offer, not just internal consistency.
 | Screenshots | ✅ shipped |
 | Enrichment | ✅ shipped, **keyless only** (ASN/RDAP/network baseline) — see [EXPLANATION.md's threat-intel note](./EXPLANATION.md#docs-vs-reality) |
 | Notifications (email/Slack/Discord/Telegram/webhook) | ✅ shipped, on-demand triggers only |
-| Scheduled/recurring daily-summary reports | ❌ dead code — `report.daily` has no consumer, see [ARCHITECTURE.md](./ARCHITECTURE.md#known-drift-and-dead-code-factually) |
+| Scheduled/recurring daily-summary reports | 🚫 explicitly not wanted — reports stay on-demand only (`POST /reports/generate`), confirmed by the project owner 2026-07-28; not a gap to fill |
 | Continuous/passive monitoring without a manual scan trigger | ❌ not started — bigger architecture lift, explicitly deferred |
 | PDF/CSV reports (executive/technical/compliance/custom) | ✅ shipped — `executive`/`technical` are real; `compliance` maps every finding to a CIS Controls v8 Control + Safeguard (display-only); `custom` is still a plain alias of `technical`, no section-picker built |
 
@@ -285,6 +285,8 @@ security, reliability, observability). Headline points:
 
 - Continuous/passive monitoring without a manual scan trigger for ASM.
 - Auto-scope-sync from bug bounty platform APIs.
+- Scheduled/recurring report generation — reports stay on-demand only
+  (`POST /reports/generate`), confirmed by the project owner (2026-07-28); not a gap to fill later.
 - Any form of active exploitation beyond proof-of-concept (no data exfiltration, no persistence, no
   destructive/DoS testing) — a deliberate, standing product boundary, not a backlog item.
 - Third-party paid threat-intelligence integration (Shodan/VirusTotal/AbuseIPDB/OTX/Censys) — a
@@ -299,17 +301,21 @@ As of the most recent internal roadmap discussion:
    finding validity/triage correctness, exploit-intelligence accuracy (EPSS/KEV/SSVC), tool parameter
    tuning (rate limits, timeouts, concurrency, flags) over "is the tool wired at all."
 2. **Deferred, explicitly not dropped**:
-   - Platform self-security issues found during an earlier full-repo assessment: **2 of the original 3
-     confirmed still open, not yet actioned** — `POST /workspaces/invite` is still a complete no-op stub
-     (`backend/app/api/v1/endpoints/workspaces.py`), and `worker-notification`'s `docker-compose.yml`
-     environment block still omits every `SMTP_*` var, so email notifications silently never send
-     regardless of `.env` config. The third item, a suspected cross-tenant data leak, was
-     **investigated exhaustively (2026-07-22) and not found** — every endpoint file, the auth/JWT
-     dependency layer, and the correlation worker's cross-org shared-IP query were all checked and
-     confirmed properly scoped by `workspace_id`. One related hardening nit surfaced during that audit:
-     `findings.py::bulk_action`'s bulk UPDATE statements don't re-assert `workspace_id` in their own
-     `WHERE` clause (only the pre-check SELECT does) — not currently exploitable, but inconsistent with
-     the defense-in-depth pattern used everywhere else; still on the list, low priority.
+   - Platform self-security issues found during an earlier full-repo assessment: **1 of the original 3
+     confirmed still open** — `worker-notification`'s `docker-compose.yml` environment block still omits
+     every `SMTP_*` var, so email notifications silently never send regardless of `.env` config;
+     deliberately not fixed yet since there's no real SMTP environment to verify delivery against in this
+     phase (dev-treated-as-prod) — revisit once real SMTP credentials exist. `POST /workspaces/invite`
+     (the second item) is **fixed** (2026-07-28) — generates a real signed invite JWT, returned in the
+     response (no email dependency), and `register()` now consumes `invite_token` to join the inviting
+     workspace at the granted role instead of always creating a new one; see
+     [API_REFERENCE.md](./API_REFERENCE.md) for the contract. The third item, a suspected cross-tenant
+     data leak, was **investigated exhaustively (2026-07-22) and not found** — every endpoint file, the
+     auth/JWT dependency layer, and the correlation worker's cross-org shared-IP query were all checked
+     and confirmed properly scoped by `workspace_id`. One related hardening nit surfaced during that
+     audit: `findings.py::bulk_action`'s bulk UPDATE statements don't re-assert `workspace_id` in their
+     own `WHERE` clause (only the pre-check SELECT does) — not currently exploitable, but inconsistent
+     with the defense-in-depth pattern used everywhere else; still on the list, low priority.
    - Dependency/library CVE remediation — deferred until features are stable.
 3. **Frontend changes**: small display/readability fixes can proceed without asking; anything that
    amounts to a visual revamp needs a heads-up first (this document included — see the Bug Bounty

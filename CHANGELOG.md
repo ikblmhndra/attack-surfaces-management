@@ -4,6 +4,313 @@ All notable changes to this project are documented below, sorted newest-first.
 
 ---
 
+## 2026-07-30 — Fixed API failing to recover after host/Docker restarts (no self-healing on cold-boot dependency race)
+
+Investigated user report of the platform "hanging" and needing a forced container restart before it would
+respond again. Root cause: on this host, `docker-compose.yml`'s `depends_on: condition: service_healthy`
+ordering is only honored by `docker compose up` — it is **not** enforced when containers with
+`restart: unless-stopped` are brought back up natively by the Docker engine itself (e.g. after a host
+reboot or `dockerd` restart). Confirmed via `docker inspect`: every container's `State.StartedAt` was
+within milliseconds of each other after a reboot, `asm-api` included — meaning it started racing
+`asm-rabbitmq`, `asm-redis`, `asm-opensearch`, and `asm-minio` instead of waiting for them.
+
+`backend/app/main.py`'s `lifespan()` calls each service's `init_*()` once, un-retried. Three of the four
+(`init_rabbitmq`, `init_redis`, `init_opensearch`) do an eager connectivity check on first call
+(`aio_pika.connect_robust()`'s *initial* attempt fails fast by design — its own auto-reconnect only
+covers connections that already succeeded once — plus `redis_client.ping()` and
+`opensearch_client.info()`), and `init_minio`'s bucket-existence check could raise an unhandled
+non-`S3Error` connection exception. If the target service wasn't done booting yet (RabbitMQ's
+Erlang/Mnesia startup and OpenSearch's JVM startup are the slowest), that first call raised, which killed
+the whole FastAPI ASGI lifespan for every uvicorn worker process. Confirmed live: all 4
+`API_WORKERS` processes logged `Application startup failed. Exiting.` at the exact same reboot, yet the
+container's own top-level process never exited — so `restart: unless-stopped` never re-triggered, and
+`asm-api` sat there indefinitely reporting `unhealthy` (`curl localhost:8000/health` → connection refused,
+`FailingStreak` climbing) without ever serving traffic, until manually force-restarted.
+
+### Fixed
+- **`backend/app/core/rabbitmq.py`**, **`redis_client.py`**, **`opensearch.py`**, **`minio_client.py`**:
+  each `init_*()` now retries its initial connectivity check up to 5 times with linear backoff
+  (`attempt * 3`s), mirroring the retry pattern `workers/base_worker.py::_connect` already uses for the
+  same class of problem on the worker side. `init_minio` adds one explicit `bucket_exists` probe call
+  ahead of the existing per-bucket loop (which already handled real `S3Error`s correctly, just not raw
+  connection failures) rather than restructuring that loop.
+
+### Verified
+- Reproduced the unhealthy state live (host had rebooted ~15 min prior): `asm-api` `unhealthy`,
+  `FailingStreak: 30`, logs showing `aiormq.exceptions.AMQPConnectionError: [Errno 111] Connection
+  refused` during `init_rabbitmq` at lifespan startup.
+- `python3 -m py_compile` on all 4 edited files.
+- `docker compose restart api` post-fix: all 4 worker processes now log `rabbitmq_initialized` /
+  `redis_initialized` / `opensearch_initialized` / `minio_initialized` / `All services initialized
+  successfully` / `Application startup complete`, container health flips to `healthy`,
+  `curl localhost:8000/health` → `200 {"status":"healthy",...}`. (Dependencies were already up by the time
+  of this manual restart, so the retry loops weren't exercised on this run — the fix addresses the
+  cold-boot race specifically, not this restart.)
+
+## 2026-07-29 — Frontend CVE remediation: Next.js 14→15, npm audit 16 findings → 9 (all dev-only)
+
+Follow-up to the backend/workers CVE remediation, same day: the one deliberately-deferred item — `next`
+itself needing a major version bump for its one real (non-tooling) CVE. Investigated the actual breaking-
+change surface before touching anything, since a Next.js major bump has a reputation for being risky:
+this codebase turned out to be a much smaller target than expected. No `middleware.ts` exists; every
+single page in the App Router is `"use client"`, using `useParams()`/`useSearchParams()` (client hooks)
+rather than server-side `params`/`searchParams` props; nothing imports `next/headers`'s `cookies()`/
+`headers()`. Next 15's headline breaking change (async dynamic APIs) doesn't touch any code path this app
+actually uses.
+
+### Fixed
+- **`next` 14.2.35 → 15.5.22**, **`eslint-config-next` 14.2.35 → 15.5.22** (kept in lockstep, standard
+  practice — `eslint-config-next` tracks the `next` version it's meant to lint against). React stayed at
+  18.3.1 — Next 15 explicitly supports React 18, and several other deps in this tree
+  (`mapbox-gl`/`react-map-gl`, `vaul`, `cmdk`, the Radix packages) weren't worth also gambling on React 19
+  compatibility for in the same pass.
+- **`next.config.js`**: `experimental.serverComponentsExternalPackages` → top-level
+  `serverExternalPackages` (promoted out of experimental in Next 15; old key silently stops applying
+  otherwise). `experimental.optimizePackageImports` unchanged, still experimental as of 15.5.
+- **`sharp` forced to 0.35.3 via a new `overrides` entry** — a *transitive* dependency of `next` itself
+  (Next's own image-optimization dependency), pinned internally to 0.34.5 (below the CVE fix threshold)
+  even after the `next` bump; couldn't be fixed by bumping our own manifest since we don't depend on it
+  directly.
+- **`postcss` bumped to 8.5.25 in both the direct devDependency *and* a new `overrides` entry** — same
+  shape of problem as `sharp`: Next 15.5.22 bundles its own internal `postcss@8.4.31` (3 known CVEs: XSS
+  via unescaped `</style>`, two path-traversal/arbitrary-file-read issues via `sourceMappingURL`), which a
+  plain devDependency version bump doesn't reach since it's nested under `next`'s own `node_modules`, not
+  ours.
+- **`eslint` 8.57.0 → 9.39.5** — `eslint-config-next@15.5.22`'s peer range explicitly allows ESLint 9 (not
+  10, which is out — checked the exact peer range before picking a target), and doing so resolves most of
+  npm audit's remaining findings (glob/minimatch/rimraf/@eslint/eslintrc's old vulnerable versions were
+  all tied to ESLint 8's dependency tree). The existing `.eslintrc.json` (legacy format, `extends:
+  "next/core-web-vitals"`) kept working via `next lint`'s own compatibility handling — no flat-config
+  migration needed.
+- **`src/app/dashboard/page.tsx`**: the upgrade's stricter lint pass surfaced 2 real (if minor) issues
+  that predated this change — two internal navigation links (`View all` → `/dashboard/scans`, `Manage` →
+  `/dashboard/organizations`) used plain `<a href>` instead of `next/link`'s `<Link>`, triggering
+  `@next/next/no-html-link-for-pages` as a hard error (not just a warning) post-upgrade. Fixed — also a
+  minor UX win, `<Link>` avoids a full page reload for in-app navigation the rest of the app already does
+  via client-side routing.
+
+### Not fixed — accepted, scoped out
+The remaining 9 `npm audit` findings (down from 16) are entirely inside the ESLint devDependency chain
+(`@eslint/eslintrc`, `@eslint/config-array`, `brace-expansion`, `eslint`, `eslint-config-next`,
+`eslint-plugin-import`, `eslint-plugin-jsx-a11y`, `eslint-plugin-react`, `minimatch`) — build-time linting
+only, never present in the production Docker image (`target: production` only copies the Next.js
+standalone output, not `devDependencies`). `npm audit`'s own suggested fix for most of these
+(`eslint-config-next@16.2.12`) would require a further Next.js major bump (16.x) beyond the 15.5.22 this
+pass deliberately targeted — not bundled in, consistent with keeping this a single, well-tested major
+version jump rather than stacking two.
+
+### Verified
+- `npm run type-check`, `npm run lint` (now exits 0, previously would have failed post-upgrade on the
+  `<a>`-tag issue above), and a full `npm run build` (all 26 routes, static + dynamic, generated with no
+  errors) — all clean before ever touching the Docker image.
+- Rebuilt and redeployed the frontend container.
+- Real-browser Playwright pass against the live, rebuilt stack: logged in through the real form; the
+  modal centering/overlay fix from earlier this week still measures exactly `(0.0, 0.0)` offset from
+  viewport center under Next 15 (confirms no regression in that unrelated recent fix); the Attack Surface
+  Map (Cytoscape — the heaviest client-side visualization library in the app) rendered correctly;
+  Findings/Settings/Bounty pages all loaded without error. Remaining console errors (a pre-existing CSP
+  font-load block and WebSocket 403s) are both artifacts of this internal test environment's hostname/
+  build-arg mismatch, unrelated to the Next.js version and present identically before this change.
+
+---
+
+## 2026-07-29 — Dependency/library CVE remediation: 91 known vulnerabilities → 1 (unfixable, non-exploitable)
+
+Deferred item from the roadmap, tackled after the workspace-invite/report-scope work closed out.
+`pip-audit` against `backend/requirements.txt` and `workers/requirements-workers.txt` found 91 known CVEs
+across 11 packages (`aiohttp`, `pillow`, `cryptography`, `starlette`, `weasyprint`, `python-jose`,
+`jinja2`, `python-multipart`, `python-dotenv`, `pytest`, `ecdsa`); `npm audit` on the frontend found 16
+"high" findings, all but one (`next` itself) in dev-only eslint tooling never shipped to the production
+build.
+
+### Fixed (backend + workers)
+Every upgrade validated in an isolated venv first (`pip install` + `pip check` + a fresh `pip-audit` re-run)
+before touching the real files, specifically to catch resolver conflicts and confirm CVEs actually closed
+— not just bumping version numbers and hoping:
+- **`fastapi` 0.111.0 → 0.140.13** — required to pull a patched `starlette` at all (FastAPI pins
+  `starlette`'s allowed range internally; versions below ~0.135 cap it under 1.0, which doesn't reach the
+  latest starlette security fixes). Needed `pydantic` bumped alongside it (see below) since 0.140.13
+  requires `pydantic>=2.9.0`.
+- **`prometheus-fastapi-instrumentator` 7.0.0 → 8.1.0** — not itself CVE-flagged, but 7.0.0 caps its own
+  `starlette` requirement at `<1.0.0`, which would have silently kept 5 starlette CVEs unresolved even
+  after the FastAPI bump above; 8.1.0 allows `starlette` 1.x.
+- **`pydantic` 2.7.1 → 2.13.4**, **`pydantic-settings` 2.2.1 → 2.14.2** (kept in step with each other).
+- **`aiohttp` 3.9.5 → 3.14.3** (32 CVEs), **`pillow` 10.3.0 → 12.3.0** (24 CVEs), **`cryptography` 42.0.7
+  → 49.0.0** (6 CVEs), **`python-jose[cryptography]` 3.3.0 → 3.5.0** (5 of 6 CVEs — see ecdsa note below),
+  **`jinja2` 3.1.4 → 3.1.6** (3 CVEs), **`python-multipart` 0.0.9 → 0.0.32** (7 CVEs), **`python-dotenv`
+  1.0.1 → 1.2.2** (1 CVE).
+- **`weasyprint` 62.3 → 69.0**, and **the `pydyf==0.11.0` pin removed entirely** — that pin existed
+  because weasyprint 62.3 broke against `pydyf>=0.12` (`Stream.transform()` `AttributeError`). Verified
+  directly (not assumed) that 69.0 fixes this: generated a real PDF via `weasyprint.HTML(...).write_pdf()`
+  with the auto-resolved `pydyf` 0.12.1 and it worked cleanly.
+- **`pytest` 8.2.0 → 9.1.1**, **`pytest-asyncio` 0.23.6 → 1.4.0**, **`pytest-cov` 5.0.0 → 7.1.0** (major
+  version bumps, test-only — verified by actually running the suite, see below).
+- **`typing-extensions` 4.11.0 → 4.16.0** in `workers/requirements-workers.txt` — not CVE-related, but the
+  old pin conflicted with the new `pydantic`'s own requirement once that got bumped in step with backend.
+
+### Not fixed — accepted, documented risk
+- **`ecdsa` 0.19.2** (transitive, via `python-jose[cryptography]`): one CVE (PYSEC-2026-1325, a Minerva
+  timing side-channel on ECDSA P-256 signing) with no fix released or planned — upstream considers timing
+  side-channels out of scope for the project. Verified this platform's JWT usage is exclusively `HS256`
+  (`grep -rn "algorithm=\|algorithms=" backend/ workers/` — every call site uses `settings.ALGORITHM`,
+  which defaults to, and is never overridden away from, `HS256`), so the vulnerable ECDSA-signing code
+  path is never actually exercised by anything this application does. Documented in
+  [docs/TRD.md](./docs/TRD.md#9-technical-constraints--known-limitations), not silently left unexplained.
+
+### Found while verifying, not part of this task
+- `backend/tests/unit/test_scan_pipeline_state.py` fails collection (`from workers import scan_state`)
+  whenever run via `docker compose exec api pytest tests/` — pre-existing, unrelated to any dependency
+  version. The `api` container only mounts `backend/`, and `backend/workers/` (a third, genuinely-empty
+  directory distinct from the already-documented `backend/app/workers/` stub) is what `/app/workers`
+  resolves to there — the real `workers/` package this test wants is only mounted into worker containers.
+  Documented in TRD.md; not fixed here (out of scope for CVE remediation, flagged for whoever owns test
+  infra next).
+
+### Verified
+- Each candidate `requirements*.txt` installed cleanly in an isolated venv (`pip check`: "No broken
+  requirements found") and re-audited with `pip-audit` before ever touching the real files.
+- Rebuilt all 18 affected images (`api` + 16 workers + `scheduler`) and recreated the containers — all
+  came up healthy.
+- Full real-workflow smoke test against the live stack, not just health checks: logged in (exercises
+  `python-jose`/`cryptography`/`fastapi`); confirmed `/api/docs` and `/api/openapi.json` still serve
+  correctly (85 paths, same as before — confirms the FastAPI/Pydantic bump didn't change route/schema
+  generation); ran a real `quick` scan end-to-end against `example.com` through discovery → crawl →
+  nuclei, all stages completing (discovery found 164 real subdomains, confirming `aiohttp`-based HTTP
+  probing and DNS resolution both still work); generated a real executive PDF report and visually
+  inspected it — cover band, grade badge, stat tiles, severity bars, asset table all rendered correctly,
+  confirming the `weasyprint`/`jinja2`/`pydyf` upgrade produces a correct, non-corrupt document.
+- Ran the full backend test suite inside the rebuilt `api` container: **311 passed, 1 skipped** (the
+  same pre-existing skip noted throughout this project's history) — zero regressions from any of the
+  version bumps, including the `pytest` 8→9 major jump.
+
+### Not yet done
+Frontend: `next` itself needs a major bump (14.2 → 15.5.22) to resolve its one real (non-tooling) CVE —
+deliberately not bundled into this same pass, given the size of the jump and the blast radius of a
+framework major version across the whole App Router codebase. Planned as its own separate, carefully
+smoke-tested pass.
+
+---
+
+## 2026-07-28 — Confirmed reports stay on-demand only; corrected 2 more stale doc claims found in the process
+
+User confirmed scheduled/recurring reports should stay out of scope (on-demand only, via
+`POST /reports/generate`) rather than building a consumer for the old `report.daily` idea. Before writing
+that down, checked whether there was actually anything to remove: `grep -rn "report.daily\|
+_generate_daily_summaries" workers/ backend/` returned **nothing** — neither the publish side
+(`workers/scheduler/scheduler.py::_generate_daily_summaries`) nor a consumer exist anywhere in the
+current codebase. This directly contradicted a gotcha entry still present in `CLAUDE.md` (and copied from
+there into `docs/ARCHITECTURE.md`, `docs/PRD.md`, `docs/TRD.md`, `docs/DEVELOPMENT.md` during this
+session's own documentation work) claiming the publish side still exists with just a missing consumer —
+stale, evidently since at least 2026-07-15 per an old CHANGELOG entry that had already flagged this same
+claim as due for a fix and it never happened.
+
+### Fixed
+- **`CLAUDE.md`**: rewrote the `report.daily` gotcha entry — no such code exists; reports are on-demand
+  only, confirmed as the intended design, not a gap.
+- **`docs/ARCHITECTURE.md`**, **`docs/DEVELOPMENT.md`**: same correction, each doc's copy updated to
+  match.
+- **`docs/PRD.md`**: moved "scheduled/recurring reports" from the product-scope table's ❌-gap row into
+  §10 Out of scope/non-goals, where it belongs now that it's a confirmed non-goal, not unfinished work.
+- **`docs/TRD.md`**: same fix, plus a second, unrelated stale claim caught in the same pass — item 6 of
+  the technical-debt list still said `compliance` reports have "no real framework-specific mapping,"
+  which was already corrected in `API_REFERENCE.md` and `PRD.md`'s product-scope table earlier this week
+  but missed here. Fixed to match (CIS Controls v8 mapping is real), list renumbered.
+
+### Verified
+- Re-ran the repo-wide `grep` for `report.daily`/`_generate_daily_summaries` after edits — the only
+  remaining mentions are in `CLAUDE.md` and `ARCHITECTURE.md`, both now explicitly explaining that the
+  code doesn't exist rather than asserting it does.
+- Re-ran the broken-GFM-table-row check across every doc file plus `CLAUDE.md`/root `README.md` — clean.
+
+---
+
+## 2026-07-28 — Frontend for workspace invites (Team Members UI + invite-mode register page)
+
+Follow-up to the invite backend fix, same day: user pointed out there was no frontend for it at all —
+the API worked, but an owner/admin had no way to trigger it, and a new user had no way to consume an
+invite link, both through the UI.
+
+### Added
+- **`frontend/src/lib/api.ts`**: new `workspacesAPI` (`getMembers()`, `invite(email, role)`);
+  `authAPI.register()`'s type now accepts an optional `invite_token`.
+- **`dashboard/settings/page.tsx`**: new "Team Members" section — lists current members
+  (name/email/role), and (admin/owner only) an inline invite form (email + role select, restricted to
+  `admin`/`analyst`/`viewer`). On success, shows the returned invite link in a read-only field with a
+  copy button — no email round-trip, matches the backend's own delivery design.
+- **`auth/register/page.tsx`**: reads `invite_token` from the URL query string
+  (`?invite_token=...`, matching the backend's `invite_path`). When present: shows a "You've been invited"
+  banner, retitles the form ("Join your team" / "Join workspace"), and hides the Workspace Name and
+  Product picker fields entirely (the backend already ignores both on this path — showing them would just
+  be confusing). Required wrapping the page in `<Suspense>` since `useSearchParams()` needs it under
+  Next.js 14's App Router, split into an outer `RegisterPage` + inner `RegisterForm`.
+
+### Fixed (found while testing the above, not the original ask)
+- **`store/workspace.ts::refreshUser()`** never set `workspaceId` from the `/auth/me` response it already
+  fetches (only `login()` did). Harmless in normal usage, where `workspaceId` persists from the original
+  login — but any session restored without that persisted value present (confirmed while testing: a
+  fresh browser context seeded only with tokens, bypassing the login form) left every `enabled:
+  !!workspaceId` query on the page permanently disabled, no user-visible error, just silently-empty data
+  (the Team Members list, and the Workspace Name field, both rendered blank). Now sets `workspaceId` from
+  `data.workspace_id` on every refresh, same as `login()` does.
+
+### Verified
+- `tsc --noEmit`, `next lint` clean; `docker compose build frontend` succeeded (confirms the
+  `useSearchParams`/Suspense split is correct — this fails at build time, not just at runtime, if missed).
+- Real end-to-end via Playwright, **through the actual UI** (not API calls): logged in through the real
+  login form, opened Settings, confirmed the owner's own row appeared in Team Members, generated a fresh
+  invite, opened the returned link in a brand-new browser context (simulating a different person),
+  completed registration through the real form, landed on the dashboard — then reloaded the original
+  owner's Settings page and confirmed the new member now appears in the same team list. All 3 members
+  visible in one workspace, entirely through the browser, no direct API calls standing in for the UI.
+
+---
+
+## 2026-07-28 — Fixed workspace-invite stub (real invite JWT, no email dependency)
+
+One of the three platform self-security issues flagged in an earlier full-repo assessment. User confirmed
+proceeding on this specifically while explicitly deferring the SMTP fix (no real SMTP environment to
+verify delivery against in this phase) — so the invite's delivery mechanism was deliberately designed to
+not depend on email at all, rather than half-wire something unverifiable.
+
+### Fixed
+- **`backend/app/api/v1/endpoints/workspaces.py::invite_member`**: was a complete no-op stub (`return
+  {"message": "Invitation sent"}`, sent nothing). Now generates a signed, stateless invite JWT — same
+  pattern `auth.py`'s `/forgot-password`/`/reset-password` already use (`jose.jwt`, a `type`
+  discriminator, `settings.SECRET_KEY`, no DB row, no migration needed). Payload carries `wid` (workspace
+  id), `role` (validated against `{admin, analyst, viewer}` — "owner" is never invite-grantable), and a
+  7-day expiry. Returned directly in the response (`invite_token` + a ready `invite_path`) for an
+  owner/admin to share however they like — no SMTP dependency at all.
+- **`backend/app/api/v1/endpoints/auth.py::register()`**: now consumes `invite_token` when present —
+  decodes/validates the JWT, looks up the invite's workspace (must still exist and be active), and joins
+  the *existing* workspace at the granted role instead of creating a new one. `workspace_name` and
+  `enabled_products` in the request are ignored on this path (the existing workspace's real values are
+  used instead) — a request can't be trusted to self-assign entitlement to someone else's workspace.
+  Without `invite_token`, behavior is unchanged (always creates a new workspace, `role="owner"`).
+
+### Known, accepted limitation
+Not single-use or revocable — matching the reset-token pattern's own simplicity level, not gold-plating
+beyond what already exists elsewhere in this codebase. Anyone holding a valid invite link can join at the
+granted role until it expires; there's no DB row to mark "already used" or to let an admin cancel one
+early. Worth building if invite abuse or accidental over-sharing becomes a real problem; not built
+speculatively.
+
+### Verified
+- `python -m py_compile` on both edited files, then a full API container restart — healthy (needed a
+  second manual restart after, for an unrelated transient RabbitMQ-connection-refused race on boot, same
+  recovery as the last two redeploys this week).
+- End-to-end via real `curl` calls against the live API (not just reading the code): created a real
+  invite as an owner, registered a brand-new account with that token, confirmed the new account landed in
+  the *same* workspace (`workspace_id` matched exactly) at the granted `analyst` role with the *existing*
+  workspace's `enabled_products` — then confirmed via `GET /workspaces/members` that both accounts show
+  up as teammates in one workspace.
+- Negative cases, also via real requests: requesting role `owner` on an invite → `422` (rejected by the
+  Pydantic validator); a non-owner/admin (the newly-invited analyst) attempting to create an invite →
+  `403`; registering with a garbage `invite_token` → `400` with a clear message.
+- Updated `docs/API_REFERENCE.md`, `docs/PRD.md`, and `docs/EXPLANATION.md` in the same change — all
+  three previously stated this was still an open, unfixed stub.
+
+---
+
 ## 2026-07-28 — Fixed modals rendering off-center (framer-motion clobbered Tailwind centering)
 
 Follow-up to the same-day overlay-blur fix: user reported the modal itself "still isn't centered."
