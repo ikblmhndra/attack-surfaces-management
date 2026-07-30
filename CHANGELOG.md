@@ -4,6 +4,180 @@ All notable changes to this project are documented below, sorted newest-first.
 
 ---
 
+## 2026-07-30 — Finding dedup fingerprint ignored URL trailing-slash/casing; migrated production data to fix it
+
+Last item from the "core scanning/detection maturity" finding-validity investigation. Approved by the user
+after flagging the real risk up front: `finding_fingerprint()` (used by scanner-family checks) and
+`nuclei_worker.py`'s own separate, un-shared fingerprint computation (used by nuclei findings — the
+majority of real findings) both hash the raw, un-normalized target string. The same underlying issue
+rediscovered as `https://x.com/path` vs `https://x.com/path/`, or with different host casing, fingerprints
+as two separate `Finding` rows instead of one rediscovered one — each rescan would silently inflate finding
+counts and re-fire "new finding" notifications for something already known. `find_asset_for_target()` in
+the same file already had a `target.rstrip("/")` special case for *asset* matching, but nothing carried
+that into the fingerprint itself.
+
+This one needed care beyond the usual code fix: `(fingerprint, org_id)` is the `Finding` table's upsert
+key, so changing what gets hashed makes every *already-persisted* finding's fingerprint stop matching what
+the new code would compute for it — without a backfill, the next scan of anything already known would
+look like a brand-new finding and insert a duplicate row, against real customer data. Ran a read-only dry
+run against the actual production database *before writing any migration*: 3095 findings total, 74 would
+get a changed fingerprint under the new scheme, and critically, 0 collisions (no two existing rows would
+land on the same new fingerprint within an org) — so this was safe as a pure rename, no merge logic needed.
+
+### Fixed
+- **`workers/scanner/scanner_common.py`**: new `normalize_fingerprint_target()` — lowercases scheme/host
+  and collapses a single trailing slash on http(s) targets (path/query/fragment untouched, since those can
+  carry a genuinely distinct finding); non-URL targets are lowercased. `finding_fingerprint()` now hashes
+  the normalized target.
+- **`workers/scanner/nuclei_worker.py`**: its own separate inline fingerprint computation (`org_id:
+  template_id:matched`, never routed through the shared helper) now normalizes `matched` the same way
+  before hashing, without changing the hash's overall shape — so any finding whose target was already
+  canonical gets byte-identical fingerprints to before, and only the actually-affected subset needed
+  backfilling.
+- **`backend/app/db/migrations/versions/018_normalize_fp_target.py`** (new, `alembic upgrade head`):
+  one-time backfill recomputing every `Finding.fingerprint` under the new scheme and updating only the
+  rows that actually changed. Falls back to `scanner or source or "unknown"` for 3 pre-existing rows
+  (unrelated seed/demo data, "ACME Corp") that predate the `scanner` column being populated.
+
+### Verified
+- Dry run (read-only, no writes) against the real database confirmed scope and zero collision risk before
+  any code or migration was written (see above).
+- Ran the migration for real: `alembic upgrade head` → `018_normalize_fp_target`. First attempt failed
+  cleanly on an unrelated issue (revision id string exceeded `alembic_version.version_num`'s `VARCHAR(32)`
+  column — confirmed via a post-failure dry-run re-check that the failed transaction rolled back with zero
+  data changed) — shortened the revision id and re-ran successfully.
+- Re-ran the dry-run script post-migration: only the 3 known legacy `scanner`-null rows still showed as
+  "would change" under the dry-run script's own simplified fallback (which didn't match `source`) — manually
+  recomputed their expected fingerprint using the migration's actual `scanner or source or "unknown"` logic
+  and confirmed it matches what's now stored exactly. Full production data is fully converged; 0 rows
+  pending under the real logic.
+- Restarted `worker-nuclei`/`worker-scanner` to load the new code, then triggered a real rescan of the
+  disposable test org (`example.com`) that already had 6 findings from earlier testing: finding count
+  stayed at 6 (no duplicates), and all 6 `scan_findings` rows for the new scan show `change_type:
+  "recurring"`, not `"new"` — confirming the deployed code's fingerprints agree with the migrated data
+  end-to-end, not just in isolated calculation.
+
+## 2026-07-30 — Dampened confidence on subdomain-takeover findings; fixed 2 takeover templates being miscategorized
+
+Part of the same "core scanning/detection maturity" pass, finding-validity domain. Deliberate policy
+change (approved), not a bug fix: `nuclei_worker.py::_cve_confidence()` only ever cross-checks CVE-tagged
+findings against detected tech stack — by its own explicit docstring, a finding with no CVE (which is
+every subdomain-takeover template, since there's no CVE for "dangling CNAME") always resolves to
+`("unknown", 1.0)`, i.e. full confidence. Takeover checks are a classically false-positive-prone category
+industry-wide (dangling-CNAME heuristics without an actual takeover attempt), so per user decision they
+now get the same treatment `coverage_worker.py` already gives version-inferred CVE matches
+(`VERSION_MATCH_CONFIDENCE`): a fixed, conservative confidence score.
+
+While writing a synthetic test for this, found a real, independent pre-existing bug: `_map_category()`'s
+keyword matching checked `["git", "env", "config", "backup"]` *before* `["takeover", "subdomain"]`, so any
+takeover template named after a service containing "git" as a substring (`github-takeover.yaml`,
+`gitbook-takeover.yaml` — 2 of the 73 real templates in `http/takeovers/`) was miscategorized as
+`exposed_git` and never reached the takeover check at all — which would also have made them skip the new
+dampening entirely. Fixed by reordering (takeover check now runs first; nothing in the git/env/config/
+backup group legitimately contains "takeover"/"subdomain" as a substring, so this is a pure fix with no
+new false negatives).
+
+### Fixed
+- **`workers/scanner/nuclei_worker.py`**: new `TAKEOVER_MATCH_CONFIDENCE = 0.5` constant; `_parse_finding`
+  now overrides confidence to `("low", 0.5)` for `category == "subdomain_takeover"` findings that would
+  otherwise fall through `_cve_confidence()`'s `"unknown"` default (CVE-tagged takeover findings, if any
+  ever exist, are left untouched). `_map_category()`'s takeover/subdomain keyword check moved ahead of the
+  git/env/config/backup check.
+
+### Verified
+- Confirmed the fix is genuinely wired end-to-end, not just cosmetic: `workers/risk/risk_worker.py:133`
+  already reads `Finding.proof["confidence_score"]` into the dict `compute_org_score()` consumes, which
+  flows into `FindingInput.confidence` and `compute_severity_penalty()` — so this dampening will actually
+  affect real risk scores on the next scan that (re)matches a takeover finding, not just sit unread in
+  `proof` JSONB.
+- Called `NucleiWorker._parse_finding()` directly (inside the `worker-nuclei` container) with synthetic
+  nuclei-shaped raw results for `github-takeover.yaml`, `gitbook-takeover.yaml`, and `shopify-takeover.yaml`
+  — all three now correctly categorize as `subdomain_takeover` and get `confidence=0.5`/`"low"`. A
+  synthetic CVE-tagged, tech-matched finding was run alongside as a control and confirmed unaffected
+  (`unknown`/`1.0`, unchanged behavior).
+
+## 2026-07-30 — Scheduler had the same unfixed cold-boot RabbitMQ race as the API (exploit-intel refresh could silently stop)
+
+Follow-up to the same day's API cold-boot fix, found while investigating exploit-intel (EPSS/KEV) accuracy
+as part of the "core scanning/detection maturity" pass. That fix covered `backend/app/core/{rabbitmq,
+redis_client,opensearch,minio_client}.py` but not `workers/queue_client.py` — confirmed
+`QueueClient.connect()` still did a single un-retried `aio_pika.connect_robust()` call.
+`workers/scheduler/scheduler.py::start()` calls this once at process startup, before registering any job
+(including `exploit_intel_refresh`, every 24h, and `score_refresh`, every 4h). Unlike the API container,
+an unhandled exception here does crash the whole process (`asyncio.run(main())` propagates it, `tini`
+exits) so `restart: unless-stopped` does eventually recover it — but each failed attempt is a full crash
++ Docker-backoff cycle instead of a clean in-process retry, and it doesn't match the pattern already
+established everywhere else in this codebase for this exact race (`workers/base_worker.py::_connect`,
+now also `backend/app/core/*.py`).
+
+### Fixed
+- **`workers/queue_client.py`**: `QueueClient.connect()`'s initial `aio_pika.connect_robust()` call now
+  retries up to 5 times with linear backoff (`attempt * 3`s), identical shape to
+  `backend/app/core/rabbitmq.py::init_rabbitmq()`. This is the single shared client used by the scheduler
+  and every other worker's ad-hoc publish path, so fixing it here covers all of them, not just the
+  scheduler.
+
+### Verified
+- `python3 -m ast.parse` on the edited file.
+- `docker compose restart scheduler` (workers/ is bind-mounted, no rebuild needed): logs show
+  `queue_client_connected` → `scheduler_queue_connected` → `scheduler_jobs_registered count=8` →
+  `scheduler_health ... queue_connected=True`, with `exploit_intel_refresh`/`score_refresh` both present
+  in the registered job list — no regression under normal (RabbitMQ-already-up) conditions.
+- Did **not** reproduce the actual cold-boot race live (would've required stopping the shared `rabbitmq`
+  container, disrupting every other currently-connected worker) — correctness here rests on this being
+  the identical, already-proven retry shape from the same-day API fix, not on a live failure repro.
+
+## 2026-07-30 — Closed 3 scan-coverage gaps: naabu port fallback, unused nuclei `network/misconfig` and `workflows/`
+
+Part of a "core scanning/detection maturity" pass (coverage, finding validity, exploit-intel accuracy —
+the platform's #1 roadmap priority, benchmarked against Tenable ASM). Three parallel investigations
+surveyed all three areas; scan coverage/tool tuning was picked first. One candidate finding from that
+investigation (raising the DNS bruteforce/permutation host cap from 80) was ruled out during planning:
+`workers/discovery/dns_candidates.py` already documents, from real production data, that these two
+generated-only sources have a ~0%/~3.5% real hit rate — raising the cap adds DNS query volume with no
+real coverage gain.
+
+Two other gaps were confirmed real:
+1. `port_worker.py`'s naabu invocation silently falls back to `top-100` (`config.get("ports", "top-100")`)
+   whenever a scan profile doesn't set `ports` explicitly. `default`/`deep_authorized` already set
+   `top-1000`; the `limited` profile never did, silently scanning 10x fewer ports than the platform's
+   other authorized-use tiers. (`safe`'s missing `ports` key is left as-is — it's deliberately the
+   lightest/fastest tier by design. `endpoint`'s missing `ports` key is dead config — confirmed that
+   profile is only ever used for nuclei-only re-scans of already-discovered assets, which never run the
+   port module at all.)
+2. Two real nuclei template categories, present on disk at `/root/nuclei-templates/`, were never selected
+   by any scan profile: `network/misconfig` (a regular template directory) and `workflows/` (207
+   multi-step templates that chain other templates conditionally). `workflows/` needed more than adding it
+   to a directory list: nuclei loads workflows via a separate `-w` flag, not `-t`, and (confirmed via a
+   live `nuclei -validate` dry run) workflow YAMLs reference other templates by a path relative to
+   nuclei's *process CWD*, not the templates root — running `-w .../workflows` from an arbitrary CWD fails
+   with `no templates found in path "/app"` until the subprocess's `cwd` is explicitly set to the
+   templates root.
+
+### Fixed
+- **`backend/app/services/scan_profiles.py`**: `SCAN_PROFILES["limited"]` now sets `"ports": "top-1000"`.
+  `PROFILE_TEMPLATE_DIRS["network_safe"]` now includes `"network/misconfig"` (scopes it to
+  `deep_authorized`, the only profile that references `network_safe`). `SCAN_PROFILES["deep_authorized"]`
+  gains `"nuclei_workflows_enabled": True`, scoped to that profile only — matching how this file already
+  scopes other heavier features (`fuzz`, `js_analysis_enabled`) to the authorized/thorough tier.
+- **`workers/scanner/nuclei_worker.py`**: `_run_nuclei` now appends `-w <TEMPLATES_PATH>/workflows` when
+  `nuclei_workflows_enabled` is set, and passes `cwd=self.TEMPLATES_PATH` to the nuclei subprocess
+  (unconditionally — safe, since every `-t`/`-w` path passed is already absolute) so workflow templates'
+  relative references resolve correctly.
+
+### Verified
+- `docker compose exec api python -c "..."` confirmed the three config values resolve correctly in
+  `SCAN_PROFILES`/`PROFILE_TEMPLATE_DIRS` (had to restart the `api` container for this to actually take
+  effect on already-running processes — the bind-mounted source file changes, but a long-running Python
+  process doesn't re-import an edited module on its own).
+- Ran a real `deep_authorized` scan against a disposable test org (`example.com`, not a real customer
+  target): completed cleanly, 6 real findings persisted, no `no templates found`/nuclei loader errors in
+  `worker-nuclei` logs — confirming the `-w`/`cwd` fix actually works live, not just in isolation.
+  Directly confirmed via `NucleiWorker._template_dirs_for_profiles(...)` that `network/misconfig` resolves
+  into `deep_authorized`'s effective `-t` list.
+- Ran a real `limited`-profile scan against the same disposable org: persisted `Scan.config["ports"]` was
+  `"top-1000"` (was previously silently defaulting), and the port-scan phase completed successfully.
+
 ## 2026-07-30 — Fixed API failing to recover after host/Docker restarts (no self-healing on cold-boot dependency race)
 
 Investigated user report of the platform "hanging" and needing a forced container restart before it would

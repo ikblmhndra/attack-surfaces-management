@@ -4,7 +4,7 @@ from __future__ import annotations
 import hashlib
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from sqlalchemy import and_, case, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -42,8 +42,34 @@ def host_from_target(target: str) -> str:
     return host.strip("[]").lower()
 
 
+def normalize_fingerprint_target(target: str) -> str:
+    """Normalize a target string before it feeds a Finding's dedup fingerprint.
+
+    Conservative on purpose: only touches scheme/host casing and collapses a
+    single trailing slash on http(s) targets. Never touches path segments,
+    query string, or fragment -- those can carry a genuinely distinct finding
+    (a different endpoint, a different vulnerable parameter), so collapsing
+    them would merge unrelated issues instead of deduping the same one.
+    Without this, the same underlying issue re-discovered as
+    "https://x.com/path" vs "https://x.com/path/" (different tools -- katana,
+    httpx, nuclei's own matched-at -- normalize trailing slashes differently)
+    fingerprinted as two separate Finding rows instead of one rediscovered one.
+    See migrations/versions/018_normalize_finding_fingerprints.py, which must
+    ship with any change here -- it backfills existing rows to match.
+    """
+    target = str(target or "").strip()
+    if target.startswith(("http://", "https://")):
+        parsed = urlsplit(target)
+        path = parsed.path
+        if len(path) > 1 and path.endswith("/"):
+            path = path.rstrip("/")
+        return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), path, parsed.query, parsed.fragment))
+    return target.lower()
+
+
 def finding_fingerprint(org_id: str, scanner: str, check_id: str, target: str) -> str:
-    return hashlib.sha256(f"{org_id}:{scanner}:{check_id}:{target}".encode()).hexdigest()
+    normalized = normalize_fingerprint_target(target)
+    return hashlib.sha256(f"{org_id}:{scanner}:{check_id}:{normalized}".encode()).hexdigest()
 
 
 def status_preserving_conflict_updates(now: datetime) -> Dict[str, Any]:

@@ -3,6 +3,7 @@ ASM Platform — Queue Client
 Publishes messages to RabbitMQ from API and workers.
 Supports priority, routing keys, and connection pooling.
 """
+import asyncio
 import json
 import os
 from typing import Any, Dict, Optional
@@ -53,10 +54,31 @@ class QueueClient:
 
     async def connect(self) -> None:
         """Establish connection to RabbitMQ."""
-        self.connection = await aio_pika.connect_robust(
-            self.url,
-            reconnect_interval=5,
-        )
+        # connect_robust only auto-retries *after* an initial connection
+        # succeeds (it fails fast on the first attempt). scheduler.py calls
+        # this once at startup, un-retried, with no BaseWorker-style retry
+        # loop around it -- on a host/daemon restart (Docker starts
+        # `restart: unless-stopped` containers natively and does not honor
+        # compose's `depends_on: condition: service_healthy` ordering),
+        # RabbitMQ can still be booting when this runs, crashing the
+        # scheduler process before it registers a single job (exploit-intel
+        # refresh, 4-hourly risk re-scoring, etc.). Mirrors the same fix
+        # already applied to backend/app/core/rabbitmq.py::init_rabbitmq()
+        # and workers/base_worker.py::_connect for the identical race.
+        for attempt in range(1, 6):
+            try:
+                self.connection = await aio_pika.connect_robust(
+                    self.url,
+                    reconnect_interval=5,
+                )
+                break
+            except Exception as e:
+                if attempt == 5:
+                    raise
+                wait = attempt * 3
+                log.warning("queue_client_connect_retry", attempt=attempt, wait=wait, error=str(e))
+                await asyncio.sleep(wait)
+
         self.channel = await self.connection.channel()
         await self.channel.set_qos(prefetch_count=1)
 

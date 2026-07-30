@@ -22,7 +22,7 @@ from workers.queue_client import QueueClient
 from workers.scan_observability import record_target_selections
 from workers.scan_phase import update_scan_phase
 from workers.scan_state import mark_scan_running
-from workers.scanner.scanner_common import host_from_target
+from workers.scanner.scanner_common import host_from_target, normalize_fingerprint_target
 
 log = structlog.get_logger()
 
@@ -75,6 +75,17 @@ MAX_RAW_FIELD_CHARS = 10000
 MAX_RESPONSE_RAW_CHARS = 5000
 MAX_BATCH_TIMEOUT = int(os.getenv("NUCLEI_MAX_BATCH_TIMEOUT", "900"))
 MAX_ENDPOINT_BATCH_TIMEOUT = int(os.getenv("NUCLEI_ENDPOINT_MAX_BATCH_TIMEOUT", "600"))
+
+# Subdomain takeover templates have no CVE, so _cve_confidence()'s cross-check
+# never applies to them (it returns ("unknown", 1.0) whenever cve_ids is empty
+# by design -- a missing signal isn't evidence of a false positive for a CVE
+# match). But takeover checks are a well-known classically false-positive-prone
+# category on their own terms (dangling-CNAME heuristics without an actual
+# takeover attempt) -- same reasoning coverage_worker.py already applies to
+# version-inferred CVE matches via VERSION_MATCH_CONFIDENCE. This is a
+# conservative default, not measured against this platform's own real
+# false-positive rate (no such data exists yet) -- revisit if/when it does.
+TAKEOVER_MATCH_CONFIDENCE = 0.5
 
 NOISY_INFO_TEMPLATE_IDS = {
     "favicon-detect",
@@ -756,6 +767,15 @@ class NucleiWorker(BaseWorker):
                 if tmpl_path.exists():
                     cmd.extend(["-t", str(tmpl_path)])
 
+        # Workflows are a separate nuclei template type (multi-step, chained
+        # templates) loaded via -w rather than -t. Requires cwd=TEMPLATES_PATH
+        # below — workflow YAMLs reference other templates by a path relative
+        # to nuclei's process CWD, not to the templates root.
+        if config.get("nuclei_workflows_enabled"):
+            workflows_path = Path(self.TEMPLATES_PATH) / "workflows"
+            if workflows_path.exists():
+                cmd.extend(["-w", str(workflows_path)])
+
         # Tag filters are only applied when explicitly requested. Broad ASM
         # coverage comes from template directories plus -as, not tech tags.
         final_tags = list(tags)
@@ -775,6 +795,10 @@ class NucleiWorker(BaseWorker):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env={**os.environ},
+                # Required for -w/workflows (relative template refs resolve
+                # against CWD, not TEMPLATES_PATH) — safe unconditionally since
+                # every -t/-w path passed above is already absolute.
+                cwd=self.TEMPLATES_PATH,
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=scan_timeout)
 
@@ -875,14 +899,19 @@ class NucleiWorker(BaseWorker):
                 tags = [tags]
             category = self._map_category(template_id, tags)
 
-            # Fingerprint for deduplication
+            # Fingerprint for deduplication. See scanner_common.py::
+            # normalize_fingerprint_target -- keeps this in sync with the
+            # shared scheme so "matched-at" casing/trailing-slash differences
+            # across tools don't fingerprint the same issue twice.
             fingerprint = hashlib.sha256(
-                f"{org_id}:{template_id}:{matched}".encode()
+                f"{org_id}:{template_id}:{normalize_fingerprint_target(matched)}".encode()
             ).hexdigest()
 
             confidence_label, confidence_score, matched_product_tags, asset_tech_tags = self._cve_confidence(
                 cve_ids, tags, matched, tech_map or {}
             )
+            if category == "subdomain_takeover" and confidence_label == "unknown":
+                confidence_label, confidence_score = "low", TAKEOVER_MATCH_CONFIDENCE
 
             # Evidence
             request_raw = self._clean_text(raw.get("request", ""), limit=MAX_RAW_FIELD_CHARS)
@@ -1021,6 +1050,13 @@ class NucleiWorker(BaseWorker):
             return "exposed_admin_panel"
         if any(k in template_lower for k in ["debug", "ignition", "stacktrace", "stack-trace", "trace"]):
             return "debug_endpoint"
+        # Checked before the "git"/"env"/"config"/"backup" keyword group below:
+        # real takeover templates named after the takeover-vulnerable service
+        # (github-takeover.yaml, gitbook-takeover.yaml) contain "git" as a
+        # substring of the service name, so they were being miscategorized as
+        # exposed_git and never reaching this check at all.
+        if any(k in template_lower for k in ["takeover", "subdomain"]):
+            return "subdomain_takeover"
         if any(k in template_lower for k in ["git", "env", "config", "backup"]):
             return "exposed_git"
         if any(k in template_lower for k in ["header", "hsts", "csp", "xss"]):
@@ -1031,8 +1067,6 @@ class NucleiWorker(BaseWorker):
             return "cors_misconfiguration"
         if any(k in template_lower for k in ["spf", "dmarc", "dkim", "dnssec"]):
             return "missing_spf"
-        if any(k in template_lower for k in ["takeover", "subdomain"]):
-            return "subdomain_takeover"
 
         # Unmatched templates default to the lowest-weighted category (misconfiguration)
         # instead of falsely asserting a specific claim like "exposed_service"/network risk.

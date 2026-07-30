@@ -36,6 +36,10 @@ PROFILE_TEMPLATE_DIRS = {
         "network/cves",
         "network/vulnerabilities",
         "network/exposures",
+        # Never selected by any profile before this fix — confirmed present on
+        # disk (e.g. apache-dubbo-unauth.yaml, clickhouse-unauth.yaml), same
+        # -t-compatible shape as the three dirs above it.
+        "network/misconfig",
     ],
     "tls_dns": [
         "dns",
@@ -161,6 +165,15 @@ SCAN_PROFILES: Dict[str, Dict[str, Any]] = {
         # exact profile.
         "severities": ["critical", "high", "medium", "low", "info"],
         "nuclei_include_info_templates": True,
+        # Nuclei "workflows/" (207 templates) chain multiple templates
+        # conditionally and are never selected by any profile before this fix —
+        # confirmed via `nuclei -h` these load via -w, not -t, and (per a live
+        # -validate dry run) require the nuclei process's CWD to be the
+        # templates root for their relative template references to resolve
+        # (see nuclei_worker.py's subprocess cwd=). Scoped to this profile only,
+        # matching how fuzz/js_analysis_enabled are already scoped below —
+        # workflows are multi-step and heavier than a single template match.
+        "nuclei_workflows_enabled": True,
         "template_dirs": PROFILE_TEMPLATE_DIRS["deep_authorized"],
         "exclude_tags": SAFE_EXCLUDED_TAGS,
         # See "default" profile above — same port-range gap, same fix.
@@ -252,6 +265,11 @@ SCAN_PROFILES: Dict[str, Dict[str, Any]] = {
         "severities": ["critical", "high", "medium"],
         "template_dirs": PROFILE_TEMPLATE_DIRS["limited"],
         "exclude_tags": SAFE_EXCLUDED_TAGS,
+        # See "default"/"deep_authorized" above — same port-range gap (naabu's
+        # own fallback is top-100), same fix. "limited" is about scope
+        # restriction, not scan speed, so it gets the same port range as the
+        # other authorized-use profiles rather than "safe"'s narrower default.
+        "ports": "top-1000",
         "scan_timeout": 600,
         "template_timeout": 8,
         "concurrency": 4,
