@@ -10,6 +10,55 @@ from typing import Any, Dict, Iterable
 SCANNABLE_SCOPE_STATUSES = {"in_scope", "probable"}
 SCANNABLE_LIVENESS_STATUSES = {"alive"}
 
+# Common parked-domain / default-install placeholder page titles. A status
+# code alone can't distinguish a real live service from one of these (both
+# return 200), and response_hash/content_length were already being captured
+# by discovery_worker.py's httpx probe but never read by any validation
+# logic. Kept short and specific on purpose -- false positives here silently
+# exclude a real asset from scanning, so only clearly-parked/default phrases
+# are listed, not anything that could plausibly be a real app's own title.
+PARKED_TITLE_KEYWORDS = (
+    "domain is parked",
+    "domain for sale",
+    "buy this domain",
+    "future home of",
+    "apache2 ubuntu default page",
+    "welcome to nginx",
+    "iis windows server",
+    "account suspended",
+    "website coming soon",
+)
+
+# If this many *other* assets platform-wide share the exact same response
+# body hash, it's a shared default/placeholder page (e.g. a CDN or shared-
+# hosting provider's generic landing page), not a distinct real service.
+DUPLICATE_HASH_PARKED_THRESHOLD = 5
+
+
+def classify_liveness_content(
+    status_code: Any,
+    ips: Iterable[str],
+    title: str | None,
+    duplicate_hash_count: int = 0,
+) -> str:
+    """Derive liveness from response content, not just status-code presence.
+
+    duplicate_hash_count is computed by the caller (a DB query) and defaults
+    to 0 so existing callers that don't have that signal available yet (e.g.
+    discovery_worker.py's per-scan validation) still get the title-keyword
+    check for free, without needing to change their call site.
+    """
+    if status_code:
+        title_lower = str(title or "").lower()
+        if any(keyword in title_lower for keyword in PARKED_TITLE_KEYWORDS):
+            return "parked"
+        if duplicate_hash_count >= DUPLICATE_HASH_PARKED_THRESHOLD:
+            return "parked"
+        return "alive"
+    if list(ips):
+        return "dns_only"
+    return "unresolved"
+
 
 def normalize_hostname(value: str) -> str:
     return str(value or "").strip().lower().rstrip(".")
@@ -108,12 +157,11 @@ def validate_discovered_host(
         scope_status = "out_of_scope"
         ownership_reason = "host did not match registered scope"
 
-    if status_code:
-        liveness_status = "alive"
-    elif ips:
-        liveness_status = "dns_only"
-    else:
-        liveness_status = "unresolved"
+    liveness_status = classify_liveness_content(
+        status_code, ips, http_info.get("title"), http_info.get("duplicate_hash_count", 0),
+    )
+    if liveness_status == "parked":
+        reasons.append("liveness_parked_content_detected")
 
     if status_class in {"ok", "redirect", "auth", "auth_required"}:
         exposure_status = "exposed"

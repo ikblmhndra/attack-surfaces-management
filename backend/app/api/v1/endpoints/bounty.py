@@ -57,6 +57,18 @@ RUNNABLE_STAGES = {
 }
 
 REPORT_STATUSES = {"draft", "submitted", "triaged", "resolved", "paid"}
+TRIAGE_STATUSES = {"false_positive", "duplicate", "wont_fix"}
+
+
+class FindingTriageRequest(BaseModel):
+    triage_status: Optional[str] = Field(None, description="One of TRIAGE_STATUSES, or null to reset to untriaged")
+
+    @field_validator("triage_status")
+    @classmethod
+    def validate_triage_status(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and value not in TRIAGE_STATUSES:
+            raise ValueError(f"triage_status must be one of: {', '.join(sorted(TRIAGE_STATUSES))}, or null")
+        return value
 
 
 # ── Schemas ───────────────────────────────────────────────────
@@ -734,6 +746,7 @@ async def list_findings(
     status_filter: Optional[str] = Query(default=None, alias="status"),
     module: Optional[str] = Query(default=None),
     severity: Optional[str] = Query(default=None),
+    include_dismissed: bool = Query(default=False, description="Include findings a human marked false_positive/duplicate/wont_fix"),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=50, ge=1, le=200),
     workspace_id: UUID = Depends(get_workspace_id),
@@ -741,10 +754,13 @@ async def list_findings(
     db: AsyncSession = Depends(get_db),
 ):
     """List everything modules 6+ (nuclei so far) have confirmed against
-    this program's approved targets."""
+    this program's approved targets. Dismissed findings (triage_status set)
+    are excluded by default -- pass include_dismissed=true to review them."""
     await _get_program_or_404(db, program_id, workspace_id)
 
     query = select(ExploitAttempt).where(ExploitAttempt.program_id == program_id)
+    if not include_dismissed:
+        query = query.where(ExploitAttempt.triage_status.is_(None))
     if status_filter:
         query = query.where(ExploitAttempt.status == status_filter)
     if module:
@@ -765,13 +781,58 @@ async def list_findings(
     }
 
 
+@router.patch("/programs/{program_id}/findings/{finding_id}")
+async def triage_finding(
+    program_id: UUID,
+    finding_id: UUID,
+    request: FindingTriageRequest,
+    bg: BackgroundTasks,
+    workspace_id: UUID = Depends(get_workspace_id),
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Mark (or clear, by sending null) a finding's human triage status.
+    Independent of `status` (the pipeline's own confirmed/inconclusive
+    verdict) -- this is purely a human review decision, and the pipeline's
+    own dedup (workers/bounty/bounty_stage.py::persist_deduped_attempts)
+    never touches it, so marking something false_positive here is never
+    silently undone just because a later run re-detects the same thing."""
+    await _get_program_or_404(db, program_id, workspace_id)
+    finding = (await db.execute(
+        select(ExploitAttempt).where(ExploitAttempt.id == finding_id, ExploitAttempt.program_id == program_id)
+    )).scalar_one_or_none()
+    if not finding:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Finding not found")
+
+    old_status = finding.triage_status
+    finding.triage_status = request.triage_status
+    await db.commit()
+    await db.refresh(finding)
+
+    bg.add_task(
+        audit_log,
+        workspace_id=str(workspace_id),
+        user_id=str(current_user.id),
+        action="bounty_finding.triage",
+        resource_type="bounty_exploit_attempt",
+        resource_id=str(finding_id),
+        changes={"program_id": str(program_id), "triage_status": {"old": old_status, "new": request.triage_status}},
+    )
+
+    return _attempt_to_dict(finding)
+
+
 # ── Program summary + HTML report (classifier) ───────────────
 
 # Findings from these modules come from the vulnscan stage (nuclei +
-# detect.py's sensitive-file/CORS/403-bypass checks); everything else comes
-# from the exploit stage. Used to scope "current" findings to the latest
-# completed run of the stage that produced them -- see _gather_urls_findings.
-_VULNSCAN_MODULES = {"nuclei", "exposure", "cors", "403bypass"}
+# detect.py's sensitive-file/CORS/403-bypass/security-headers/GraphQL checks
+# + subzy takeover, all persisted via vulnscan_worker.py); everything else
+# comes from the exploit stage. Used to scope "current" findings to the
+# latest completed run of the stage that produced them -- see
+# _gather_urls_findings. (graphql/components/takeover/headers were already
+# missing here before this pass -- caught while touching this function for
+# the last_seen_at fix, not newly introduced by it.)
+_VULNSCAN_MODULES = {"nuclei", "exposure", "cors", "403bypass", "graphql", "components", "takeover", "headers"}
 
 
 def _stage_run_cutoff(stage_status: Optional[Dict[str, Any]], stage: str) -> Optional[datetime]:
@@ -789,23 +850,32 @@ def _stage_run_cutoff(stage_status: Optional[Dict[str, Any]], stage: str) -> Opt
 
 async def _gather_urls_findings(db: AsyncSession, program_id: UUID, stage_status: Optional[Dict[str, Any]] = None):
     finding_rows = (await db.execute(
-        select(ExploitAttempt).where(ExploitAttempt.program_id == program_id)
+        select(ExploitAttempt).where(
+            ExploitAttempt.program_id == program_id,
+            ExploitAttempt.triage_status.is_(None),
+        )
     )).scalars().all()
 
-    # A program can be tested many times over its life -- each run persists
-    # new rows rather than replacing old ones (by design: it's an append-only
-    # activity log, not just a snapshot). A report/summary should reflect the
+    # A program can be tested many times over its life -- a re-run that
+    # rediscovers an already-known finding bumps that same row's last_seen_at
+    # rather than inserting a new one (workers/bounty/bounty_stage.py::
+    # persist_deduped_attempts), so `executed_at` stays fixed at the *first*
+    # time a finding was ever seen. A report/summary should reflect the
     # *current* assessment though, so scope each finding to the latest
-    # completed run of whichever stage produced it. A finding from a run that
-    # predates a pipeline bugfix (a false positive that no longer reproduces)
-    # is exactly what this excludes; `stage_status` missing/incomplete falls
-    # back to "include everything" rather than risk hiding real findings.
+    # completed run of whichever stage produced it, compared against
+    # last_seen_at (not executed_at) for exactly that reason -- a finding
+    # still being re-confirmed on every run must not get excluded just
+    # because it was first discovered a long time ago. A finding whose
+    # last_seen_at predates a pipeline bugfix (a false positive that no
+    # longer reproduces) is exactly what this excludes; `stage_status`
+    # missing/incomplete falls back to "include everything" rather than risk
+    # hiding real findings.
     vulnscan_cutoff = _stage_run_cutoff(stage_status, "vulnscan")
     exploit_cutoff = _stage_run_cutoff(stage_status, "exploit")
     findings = []
     for f in finding_rows:
         cutoff = vulnscan_cutoff if f.module in _VULNSCAN_MODULES else exploit_cutoff
-        if cutoff is not None and f.executed_at < cutoff:
+        if cutoff is not None and (f.last_seen_at or f.executed_at) < cutoff:
             continue
         findings.append(_attempt_to_dict(f))
 
@@ -1056,6 +1126,9 @@ def _attempt_to_dict(attempt: ExploitAttempt) -> dict:
         "evidence": attempt.evidence or {},
         "executed_at": attempt.executed_at.isoformat(),
         "executed_by": str(attempt.executed_by) if attempt.executed_by else None,
+        "triage_status": attempt.triage_status,
+        "last_seen_at": attempt.last_seen_at.isoformat() if attempt.last_seen_at else None,
+        "occurrence_count": attempt.occurrence_count,
     }
 
 

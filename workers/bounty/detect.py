@@ -223,6 +223,76 @@ async def check_cors(
     return findings
 
 
+# ── Security headers (vulnscan stage) ──────────────────────────
+# Single-GET, header-only checks -- confirmed the moment a header is absent/
+# misconfigured, since a server either sends it or it doesn't (no baseline-
+# diff needed the way a body-content check like check_sensitive_files needs
+# the catch-all-200 guard). One of the most commonly-accepted "quick win"
+# bug bounty report categories, and previously entirely uncovered.
+
+async def check_security_headers(
+    url: str, timeout: int = 15, extra_headers: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, Any]]:
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout), headers={**_UA, **(extra_headers or {})}) as s:
+            async with s.get(url, allow_redirects=True) as r:
+                headers = r.headers
+                content_type = headers.get("Content-Type", "")
+    except Exception as exc:
+        log.warning("bounty_security_headers_error", url=url, error=str(exc)[:150])
+        return []
+
+    findings: List[Dict[str, Any]] = []
+
+    # Clickjacking (XFO/CSP frame-ancestors) only matters for an actual
+    # renderable page -- an API/JSON endpoint being frameable isn't a real
+    # clickjacking concern, and flagging it there would just be noise.
+    if "html" in content_type.lower():
+        xfo = (headers.get("X-Frame-Options") or "").strip().upper()
+        csp = headers.get("Content-Security-Policy") or ""
+        has_frame_ancestors = "frame-ancestors" in csp.lower()
+        if xfo not in ("DENY", "SAMEORIGIN") and not has_frame_ancestors:
+            findings.append({
+                "technique": "missing-clickjacking-protection",
+                "severity": "medium",
+                "evidence": {
+                    "url": url,
+                    "x_frame_options": headers.get("X-Frame-Options"),
+                    "csp": csp[:300] or None,
+                    "note": "No X-Frame-Options (DENY/SAMEORIGIN) and no CSP frame-ancestors directive -- "
+                            "this page can be embedded in a hostile iframe (clickjacking).",
+                },
+            })
+
+    if url.lower().startswith("https://") and not headers.get("Strict-Transport-Security"):
+        findings.append({
+            "technique": "missing-hsts",
+            "severity": "low",
+            "evidence": {
+                "url": url,
+                "note": "No Strict-Transport-Security header on an HTTPS response -- a user's first "
+                        "visit (or any plain-HTTP link to this site) isn't protected against an "
+                        "SSL-stripping downgrade.",
+            },
+        })
+
+    xcto = (headers.get("X-Content-Type-Options") or "").strip().lower()
+    if xcto != "nosniff":
+        findings.append({
+            "technique": "missing-x-content-type-options",
+            "severity": "low",
+            "evidence": {
+                "url": url,
+                "value": headers.get("X-Content-Type-Options"),
+                "note": "No 'X-Content-Type-Options: nosniff' -- browsers may MIME-sniff the response "
+                        "body, which can enable content-type-confusion attacks (e.g. an uploaded file "
+                        "served without nosniff being interpreted and executed as HTML/JS).",
+            },
+        })
+
+    return findings
+
+
 # ── 403 bypass (vulnscan stage) ────────────────────────────────
 
 _403_PATH_TRICKS = ["/%2e/{p}", "/{p}/.", "//{p}//", "/./{p}", "/{p}%20", "/{p}%09", "/{p}?", "/{p}#", "/{p}/..;/"]

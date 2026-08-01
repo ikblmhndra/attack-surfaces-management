@@ -12,15 +12,16 @@ completed/failed bookkeeping for free — subclasses implement run_stage() and
 return a small summary dict (or {"skipped": reason}).
 """
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import structlog
-from sqlalchemy import func, text, type_coerce, update
+from sqlalchemy import func, or_, select, text, type_coerce, update
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from workers.base_worker import BaseWorker
 from workers.db import get_session
-from workers.db_models import BountyProgram
+from workers.db_models import BountyProgram, ExploitAttempt
 from workers.queue_client import QueueClient
 
 log = structlog.get_logger()
@@ -41,6 +42,37 @@ NEXT_STAGE = {
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_window_bound(raw: Any) -> Optional[datetime]:
+    try:
+        bound = datetime.fromisoformat(str(raw))
+    except ValueError:
+        return None
+    return bound if bound.tzinfo else bound.replace(tzinfo=timezone.utc)
+
+
+def _within_testing_window(roe: Dict[str, Any]) -> bool:
+    """True if now falls within rules_of_engagement.testing_window_start/end
+    (ISO 8601 timestamps, either/both optional). Absence of a bound means
+    unrestricted on that side -- same opt-in, conservative-by-default pattern
+    as every other rules_of_engagement field (sqlmap_level, exploit_modules,
+    ...): a program that never set a window is never restricted by one. An
+    unparseable bound is logged and treated as not set, rather than either
+    silently allowing everything or blocking a whole engagement over a
+    config typo."""
+    now = datetime.now(timezone.utc)
+    for key, ok in (("testing_window_start", lambda t: now >= t), ("testing_window_end", lambda t: now <= t)):
+        raw = roe.get(key)
+        if not raw:
+            continue
+        bound = _parse_window_bound(raw)
+        if bound is None:
+            log.warning("bounty_testing_window_unparseable", key=key, value=raw)
+            continue
+        if not ok(bound):
+            return False
+    return True
 
 
 async def _publish_next_stage(stage: str, program_id: str, workspace_id: Optional[str]) -> None:
@@ -93,6 +125,59 @@ async def set_stage_status(program_id: str, stage: str, payload: Dict[str, Any])
         await db.commit()
 
 
+async def persist_deduped_attempts(db: AsyncSession, attempts: List[Dict[str, Any]]) -> int:
+    """Insert new ExploitAttempt rows, or bump last_seen_at/occurrence_count on
+    an existing row for the same (program_id, target_id, module, technique,
+    evidence URL) instead of inserting a duplicate -- a program tested
+    repeatedly over its life used to grow one new row per re-run for the same
+    already-known finding forever. Matches whichever evidence key the finding
+    used for its URL (target_url/url/matched_at -- different modules use
+    different keys), same fallback order bounty_report.py::_dedup_findings
+    already uses for its own *display*-layer dedup, so both layers agree on
+    what "the same finding" means.
+
+    Deliberately never touches `triage_status` on an existing match -- only
+    the report/findings PATCH endpoint does. A human marking something
+    false_positive/duplicate/wont_fix is never silently reverted just because
+    the same technicality reproduces on a later run; last_seen_at/
+    occurrence_count still update so the record honestly reflects it's still
+    being detected, in case a human wants to re-open it.
+
+    Caller still owns the transaction (commits after calling this), matching
+    every other persist site's existing pattern.
+    """
+    now = datetime.now(timezone.utc)
+    persisted = 0
+    for attempt in attempts:
+        evidence = attempt.get("evidence") or {}
+        target_url = evidence.get("target_url") or evidence.get("url") or evidence.get("matched_at")
+        existing = None
+        if target_url:
+            existing = (await db.execute(
+                select(ExploitAttempt).where(
+                    ExploitAttempt.program_id == attempt["program_id"],
+                    ExploitAttempt.target_id == attempt["target_id"],
+                    ExploitAttempt.module == attempt["module"],
+                    ExploitAttempt.technique == attempt.get("technique"),
+                    or_(
+                        ExploitAttempt.evidence["target_url"].astext == target_url,
+                        ExploitAttempt.evidence["url"].astext == target_url,
+                        ExploitAttempt.evidence["matched_at"].astext == target_url,
+                    ),
+                ).order_by(ExploitAttempt.executed_at.desc()).limit(1)
+            )).scalar_one_or_none()
+        if existing is not None:
+            existing.last_seen_at = now
+            existing.occurrence_count = (existing.occurrence_count or 1) + 1
+            existing.evidence = attempt.get("evidence")
+            existing.severity = attempt.get("severity", existing.severity)
+            existing.status = attempt.get("status", existing.status)
+        else:
+            db.add(ExploitAttempt(**attempt))
+        persisted += 1
+    return persisted
+
+
 class BountyStageWorker(BaseWorker):
     """Base for bounty pipeline workers. Subclasses set STAGE and implement
     run_stage(message) -> summary dict. This wraps it with stage-status
@@ -105,6 +190,19 @@ class BountyStageWorker(BaseWorker):
         program_id = message.get("program_id")
         if not program_id:
             log.warning("bounty_stage_missing_program_id", worker=self.worker_type)
+            return
+
+        async with get_session() as db:
+            roe = (await db.execute(
+                select(BountyProgram.rules_of_engagement).where(BountyProgram.id == program_id)
+            )).scalar_one_or_none() or {}
+        if not _within_testing_window(roe):
+            log.info("bounty_stage_outside_testing_window", stage=self.STAGE, program_id=program_id)
+            now = _now()
+            await set_stage_status(program_id, self.STAGE, {
+                "status": "skipped", "reason": "outside_testing_window",
+                "started_at": now, "finished_at": now,
+            })
             return
 
         started = _now()

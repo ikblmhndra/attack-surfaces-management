@@ -299,6 +299,8 @@ export const bountyAPI = {
 
   listFindings: (id: string, params?: Record<string, any>) =>
     api.get(`/bounty/programs/${id}/findings`, { params }),
+  triageFinding: (id: string, findingId: string, triageStatus: string | null) =>
+    api.patch(`/bounty/programs/${id}/findings/${findingId}`, { triage_status: triageStatus }),
 
   getSummary: (id: string) => api.get(`/bounty/programs/${id}/summary`),
   getReportHtml: (id: string) =>

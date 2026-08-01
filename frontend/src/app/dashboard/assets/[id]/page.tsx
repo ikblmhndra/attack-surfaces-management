@@ -787,7 +787,7 @@ function ValidationMetric({ label, value }: { label: string; value: string }) {
   const className =
     value === "in_scope" || value === "alive" || value === "exposed" || value === "approved"
       ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
-      : value === "probable" || value === "limited" || value === "dns_only" || value === "pending"
+      : value === "probable" || value === "limited" || value === "dns_only" || value === "pending" || value === "parked"
         ? "bg-amber-500/10 text-amber-400 border-amber-500/20"
         : value === "out_of_scope" || value === "unresolved" || value === "not_exposed" || value === "rejected"
           ? "bg-red-500/10 text-red-400 border-red-500/20"

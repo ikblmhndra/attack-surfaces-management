@@ -62,6 +62,16 @@ log = structlog.get_logger()
 # Bounds to keep a single recon run finite regardless of how wide a
 # program's scope is -- these are recon budgets, not scope restrictions.
 MAX_DOMAINS_PER_RUN = 10
+# Domains within one recon run used to process strictly sequentially -- a
+# real 10-domain program could take 1.5h+ wall-clock even after the timeout/
+# ceiling fixes below made that *safe* rather than infinite. Bounded (not
+# unbounded) concurrency: each domain already fans out many subprocess tools
+# (subfinder/httpx/katana/ffuf/feroxbuster/browser_crawl) internally, so
+# running all MAX_DOMAINS_PER_RUN at once would both hammer the worker
+# container's CPU/subprocess budget and multiply live request volume against
+# the real target by up to 10x simultaneously -- not a good bug-bounty
+# citizen. 3 is a middle ground: a real speedup without that multiplier.
+MAX_CONCURRENT_DOMAINS = int(os.getenv("BOUNTY_RECON_DOMAIN_CONCURRENCY", "3"))
 MAX_KATANA_SEED_HOSTS = 20
 MAX_JS_FILES_ANALYZED = 25
 MAX_FFUF_HOSTS = 5
@@ -74,6 +84,10 @@ MAX_URLS_PERSISTED = 5000
 # Full-auto only: how many in-scope subdomains one recon run may auto-promote
 # into testable targets. A bound on blast radius, not a scope restriction.
 MAX_AUTO_PROMOTE = 50
+# _persist()'s bulk-insert chunk size -- see the comment at its call site;
+# keeps every batch safely under Postgres/asyncpg's 32767-bind-parameter cap
+# (5 columns/row here).
+_PERSIST_BATCH_SIZE = 1000
 
 # Punctuation that never appears in a real URL path a browser would request,
 # but does appear verbatim when a JS-content crawler (katana's -jc mode, or
@@ -196,21 +210,18 @@ class BountyReconWorker(BountyStageWorker):
 
         with tempfile.TemporaryDirectory(prefix="asm-bounty-recon-") as tmpdir_raw:
             tmpdir = Path(tmpdir_raw)
+            semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOMAINS)
+            results = await asyncio.gather(
+                *(self._process_domain(domain, tmpdir, program_id, extra_headers, auth_token, session_fields, semaphore)
+                  for domain in domains),
+                return_exceptions=True,
+            )
             total_persisted = 0
-
-            for domain in domains:
-                entries: List[Tuple[str, str, str, Dict[str, Any]]] = []
-
-                subdomains = await self._enumerate_subdomains(domain, tmpdir, entries)
-                base_urls = await self._resolve_base_urls(subdomains, tmpdir, extra_headers)
-                await self._collect_urls(domain, subdomains, base_urls, tmpdir, entries, extra_headers)
-                await self._analyze_js(entries)
-                await self._discover_paths(subdomains, base_urls, tmpdir, entries, extra_headers)
-                await self._discover_apis(subdomains, base_urls, entries, extra_headers)
-                await self._browser_crawl_urls(subdomains, base_urls, entries, extra_headers, auth_token, session_fields)
-
-                async with get_session() as db:
-                    total_persisted += await self._persist(db, program_id, entries)
+            for domain, result in zip(domains, results):
+                if isinstance(result, Exception):
+                    log.warning("bounty_recon_domain_failed", domain=domain, error=str(result)[:300])
+                    continue
+                total_persisted += result
 
         # Full-auto: promote in-scope discovered subdomains to testable targets
         # so the chained probe/vulnscan/exploit stages have something to run
@@ -230,6 +241,45 @@ class BountyReconWorker(BountyStageWorker):
             "domains": len(domains), "assets_found": total_persisted,
             "auto_promoted": promoted, "authenticated": authenticated,
         }
+
+    async def _process_domain(
+        self,
+        domain: str,
+        tmpdir_root: Path,
+        program_id: str,
+        extra_headers: Dict[str, str],
+        auth_token: Optional[str],
+        session_fields: Dict[str, str],
+        semaphore: asyncio.Semaphore,
+    ) -> int:
+        """Run every recon module for one domain and persist its findings.
+        Returns the number of rows persisted. Runs under `semaphore` so at
+        most MAX_CONCURRENT_DOMAINS domains are in flight at once.
+
+        Each domain gets its own subdirectory under the shared tmpdir root,
+        not the root itself -- several tools in tools.py (run_dnsx, run_katana,
+        run_httpx) write to fixed filenames (e.g. "bounty_dnsx_output.json")
+        rather than domain-scoped ones, since they were written assuming one
+        domain runs at a time. Two domains sharing tmpdir directly would race
+        on those files and silently corrupt/cross-contaminate each other's
+        results -- not crash, just return wrong data. A per-domain
+        subdirectory sidesteps that without touching every tool function.
+        """
+        async with semaphore:
+            tmpdir = tmpdir_root / domain
+            tmpdir.mkdir(parents=True, exist_ok=True)
+            entries: List[Tuple[str, str, str, Dict[str, Any]]] = []
+
+            subdomains = await self._enumerate_subdomains(domain, tmpdir, entries)
+            base_urls = await self._resolve_base_urls(subdomains, tmpdir, extra_headers)
+            await self._collect_urls(domain, subdomains, base_urls, tmpdir, entries, extra_headers)
+            await self._analyze_js(entries)
+            await self._discover_paths(subdomains, base_urls, tmpdir, entries, extra_headers)
+            await self._discover_apis(subdomains, base_urls, entries, extra_headers)
+            await self._browser_crawl_urls(subdomains, base_urls, entries, extra_headers, auth_token, session_fields)
+
+            async with get_session() as db:
+                return await self._persist(db, program_id, entries)
 
     async def _auto_promote_in_scope(self, db: AsyncSession, program_id: str, scope_rules) -> int:
         """Promote in-scope subdomain assets to domain targets (full-auto only).
@@ -536,11 +586,23 @@ class BountyReconWorker(BountyStageWorker):
         if not rows:
             return 0
 
-        stmt = pg_insert(BountyAsset.__table__).values(rows)
-        stmt = stmt.on_conflict_do_nothing(index_elements=["program_id", "value", "asset_type"])
-        result = await db.execute(stmt)
+        # Postgres/asyncpg hard-caps bind parameters at 32767 per query -- 5
+        # columns per row here, so one all-in-one INSERT tops out around 6553
+        # rows. Confirmed live against a real, long-lived multi-domain
+        # program: a single domain's collected entries (subdomains + URLs +
+        # JS endpoints/secrets/findings) exceeded that and crashed the whole
+        # call with asyncpg.exceptions._base.InterfaceError, losing every
+        # entry for that domain, not just the overflow. Batched in chunks
+        # safely under the limit instead.
+        total = 0
+        for i in range(0, len(rows), _PERSIST_BATCH_SIZE):
+            batch = rows[i:i + _PERSIST_BATCH_SIZE]
+            stmt = pg_insert(BountyAsset.__table__).values(batch)
+            stmt = stmt.on_conflict_do_nothing(index_elements=["program_id", "value", "asset_type"])
+            result = await db.execute(stmt)
+            total += result.rowcount or 0
         await db.commit()
-        return result.rowcount or 0
+        return total
 
 
 if __name__ == "__main__":

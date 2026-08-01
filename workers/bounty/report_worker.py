@@ -51,6 +51,7 @@ class BountyReportWorker(BountyStageWorker):
                 select(ExploitAttempt).where(
                     ExploitAttempt.program_id == program.id,
                     ExploitAttempt.status.in_(statuses),
+                    ExploitAttempt.triage_status.is_(None),
                 )
             )).scalars().all()
 

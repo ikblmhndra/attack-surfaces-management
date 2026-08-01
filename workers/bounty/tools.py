@@ -470,9 +470,19 @@ API_BASE_URL_RE = re.compile(
 async def discover_js_files(urls: List[str], timeout: int = 15, max_pages: int = 30) -> Set[str]:
     """subjs if installed; otherwise a direct <script src> scrape -- both are
     just "find JS file URLs referenced by this page," so the fallback isn't a
-    lesser feature, just a different implementation of the same module."""
+    lesser feature, just a different implementation of the same module.
+
+    `max_pages` bounds the subjs input the same way it already bounded the
+    fallback scrape below -- it previously only applied there. On a large,
+    long-lived real-world domain (confirmed live: kpi.go.id alone produced
+    8488 deduped page URLs after recon's own URL-collection dedup), feeding
+    every one of them to subjs unbounded made `timeout * max(1, len(urls) //
+    10)` balloon to ~3.5 hours for a single call -- not a hang, just an
+    effectively-unbounded wait that looked identical to one from the outside
+    (near-zero CPU, no log output) for well over an hour."""
     path = tool_path("subjs")
     if path and urls:
+        bounded_urls = urls[:max_pages]
         try:
             proc = await asyncio.create_subprocess_exec(
                 path,
@@ -481,8 +491,8 @@ async def discover_js_files(urls: List[str], timeout: int = 15, max_pages: int =
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, _ = await asyncio.wait_for(
-                proc.communicate(("\n".join(urls)).encode()),
-                timeout=timeout * max(1, len(urls) // 10),
+                proc.communicate(("\n".join(bounded_urls)).encode()),
+                timeout=timeout * max(1, len(bounded_urls) // 10),
             )
             found = {u.strip() for u in stdout.decode(errors="ignore").splitlines() if u.strip()}
             if found:

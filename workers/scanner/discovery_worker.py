@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 import aio_pika
+import aiohttp
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -244,7 +245,25 @@ class DiscoveryWorker(BaseWorker):
                 self._merge_discovery_evidence(discovery_evidence, subdomains)
                 log.info("subdomains_discovered", domain=domain, count=len(subdomains))
 
-            extra_discoveries.extend(await self._expand_asn_targets(targets.get("asns", []), config, source_health))
+            manual_asns = targets.get("asns", [])
+            extra_discoveries.extend(await self._expand_asn_targets(manual_asns, config, source_health))
+            if not manual_asns and config.get("asn_auto_discovery", True):
+                auto_asns = await self._discover_org_asns(
+                    [targets.get("organization_name"), targets.get("company_name")]
+                )
+                if auto_asns:
+                    extra_discoveries.extend(await self._expand_asn_targets(
+                        [info["asn"] for info in auto_asns], config, source_health,
+                        source_label="asn_auto_discovery",
+                        confidence=0.4,
+                        extra_evidence={
+                            info["asn"]: {
+                                "matched_name": info["matched_name"],
+                                "ripestat_description": info["ripestat_description"],
+                            }
+                            for info in auto_asns
+                        },
+                    ))
             extra_discoveries.extend(await self._discover_reverse_dns_targets(org_id, targets, config, source_health))
             extra_discoveries.extend(await self._discover_cloud_storage(targets, config, source_health))
 
@@ -320,11 +339,17 @@ class DiscoveryWorker(BaseWorker):
                 persisted_hosts[host] = http_data
 
             # ── Phase 4: Persist Assets ───────────────────────
+            wildcard_fps = {
+                tuple(fingerprint)
+                for domain_report in (wildcard_report.get("domains") or {}).values()
+                for fingerprint in domain_report.get("fingerprints") or []
+            }
             async with get_session() as db:
                 new_count, asset_ids_by_host = await self._persist_assets(
                     db, org_id, workspace_id, scan_id,
                     persisted_hosts, resolved, discovery_evidence,
                     root_domains=targets.get("domains", []),
+                    wildcard_fps=wildcard_fps,
                 )
                 cloud_new_count, cloud_asset_ids = await self._persist_cloud_assets(
                     db, org_id, workspace_id, scan_id, extra_discoveries
@@ -724,72 +749,201 @@ class DiscoveryWorker(BaseWorker):
         asns: List[str],
         config: Dict,
         source_health: Dict[str, Dict[str, Any]],
+        *,
+        source_label: str = "asn_expansion",
+        confidence: float = 0.65,
+        extra_evidence: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
+        # Previously queried whois.cymru's bulk "begin/verbose/ASxxxx/end"
+        # protocol expecting a per-prefix response (7 pipe-separated fields:
+        # AS | IP | BGP Prefix | CC | Registry | Allocated | AS Name). Verified
+        # live this query actually returns a single ASN-*info* summary row (5
+        # fields: AS | CC | Registry | Allocated | AS Name -- no prefix data
+        # at all), so `parts[2]` was silently reading the registry name as if
+        # it were a CIDR (correctly rejected by ipaddress.ip_network, but the
+        # net effect was this always returned zero real prefixes for every
+        # ASN, manually-entered or not). Replaced with RIPEstat's
+        # announced-prefixes + as-overview endpoints (already proven reliable
+        # in this environment by _discover_org_asns -- same host, same
+        # keyless access).
         if not config.get("asn_expansion", True):
             return []
         candidates: List[Dict[str, Any]] = []
         max_prefixes = int(config.get("asn_prefix_max", 25))
-        for raw_asn in asns or []:
-            asn = str(raw_asn or "").upper().replace("AS", "").strip()
-            if not asn.isdigit():
-                continue
-            source_key = f"AS{asn}"
-            try:
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection("whois.cymru.com", 43),
-                    timeout=10,
-                )
-                query = f"begin\nverbose\nAS{asn}\nend\n"
-                writer.write(query.encode())
-                await writer.drain()
-                data = await asyncio.wait_for(reader.read(65536), timeout=15)
-                writer.close()
-                try:
-                    await writer.wait_closed()
-                except Exception:
-                    pass
-            except Exception as exc:
-                self._record_source_health(
-                    source_health,
-                    "asn_expansion",
-                    source_key,
-                    "failed",
-                    error=f"{type(exc).__name__}: {exc}"[:200],
-                )
-                continue
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+            for raw_asn in asns or []:
+                asn = str(raw_asn or "").upper().replace("AS", "").strip()
+                if not asn.isdigit():
+                    continue
+                source_key = f"AS{asn}"
 
-            prefixes = []
-            for line in data.decode(errors="ignore").splitlines():
-                if "|" not in line or "BGP Prefix" in line:
-                    continue
-                parts = [part.strip() for part in line.split("|")]
-                if len(parts) < 3:
-                    continue
-                prefix = parts[2]
                 try:
-                    ipaddress.ip_network(prefix, strict=False)
-                except ValueError:
+                    async with session.get(
+                        "https://stat.ripe.net/data/announced-prefixes/data.json",
+                        params={"resource": source_key},
+                    ) as resp:
+                        if resp.status != 200:
+                            raise RuntimeError(f"http_{resp.status}")
+                        prefix_payload = await resp.json()
+                except Exception as exc:
+                    self._record_source_health(
+                        source_health, "asn_expansion", source_key, "failed",
+                        error=f"{type(exc).__name__}: {exc}"[:200],
+                    )
                     continue
-                prefixes.append({
-                    "value": prefix,
-                    "asset_type": "cidr",
-                    "source": "asn_expansion",
-                    "confidence": 0.65,
-                    "status": "candidate",
-                    "selected": False,
-                    "skip_reason": "asn_prefix_not_auto_scanned",
-                    "evidence": {
-                        "asn": f"AS{asn}",
-                        "asn_org": parts[6] if len(parts) > 6 else None,
-                        "country": parts[3] if len(parts) > 3 else None,
-                        "registry": parts[4] if len(parts) > 4 else None,
-                    },
-                })
-                if len(prefixes) >= max_prefixes:
-                    break
-            candidates.extend(prefixes)
-            self._record_source_health(source_health, "asn_expansion", source_key, "ok", count=len(prefixes))
+
+                asn_org = None
+                try:
+                    async with session.get(
+                        "https://stat.ripe.net/data/as-overview/data.json",
+                        params={"resource": source_key},
+                    ) as resp:
+                        if resp.status == 200:
+                            overview_payload = await resp.json()
+                            asn_org = ((overview_payload or {}).get("data") or {}).get("holder")
+                except Exception:
+                    pass  # holder name is evidence-only, not required for the prefix itself
+
+                prefixes = []
+                for entry in ((prefix_payload or {}).get("data") or {}).get("prefixes") or []:
+                    prefix = str(entry.get("prefix") or "")
+                    try:
+                        ipaddress.ip_network(prefix, strict=False)
+                    except ValueError:
+                        continue
+                    prefixes.append({
+                        "value": prefix,
+                        "asset_type": "cidr",
+                        "source": source_label,
+                        "confidence": confidence,
+                        "status": "candidate",
+                        "selected": False,
+                        "skip_reason": "asn_prefix_not_auto_scanned",
+                        "evidence": {
+                            "asn": source_key,
+                            "asn_org": asn_org,
+                            **((extra_evidence or {}).get(source_key, {})),
+                        },
+                    })
+                    if len(prefixes) >= max_prefixes:
+                        break
+                candidates.extend(prefixes)
+                self._record_source_health(source_health, "asn_expansion", source_key, "ok", count=len(prefixes))
         return candidates
+
+    # RIPEstat's searchcomplete endpoint behaves like a single-token
+    # autocomplete, not a phrase search -- confirmed live: "Cloudflare" finds
+    # 11 ASNs, "Cloudflare, Inc." or "Cloudflare Inc" finds 0; "Akamai" finds
+    # 39, "Akamai Technologies" (no punctuation, just a second word) finds 0.
+    # A real Organization.name/company_name is almost always a full legal
+    # name, so querying it verbatim would find nothing in practice.
+    _ORG_SUFFIX_RE = re.compile(
+        r",?\s*\b(incorporated|inc|llc|ltd|limited|corp|corporation|co|company|"
+        r"gmbh|plc|tbk|group|holdings?)\.?\s*$",
+        re.IGNORECASE,
+    )
+
+    def _org_name_stripped(self, name: str) -> str:
+        """Corporate-suffix-stripped form of an org name (repeatedly, for
+        "X Corp, Inc." style double suffixes)."""
+        stripped = name.strip()
+        while True:
+            next_stripped = self._ORG_SUFFIX_RE.sub("", stripped).strip().rstrip(",").strip()
+            if not next_stripped or next_stripped == stripped:
+                return stripped
+            stripped = next_stripped
+
+    def _org_name_search_variants(self, stripped: str) -> List[str]:
+        """Progressively simplified *query* terms to send to RIPEstat,
+        most-specific first -- the endpoint behaves like a single-token
+        autocomplete, not a phrase search, so a multi-word name needs
+        narrowing just to get any results back at all. The first-word tier
+        is deliberately lossy as a *query* (only used to fetch candidates
+        from RIPEstat) -- see _discover_org_asns for why it doesn't
+        introduce false positives on its own."""
+        variants: List[str] = [stripped] if stripped else []
+        first_word = re.split(r"\s+", stripped)[0] if stripped else ""
+        if len(first_word) >= 3 and first_word.lower() != stripped.lower():
+            variants.append(first_word)
+        return variants
+
+    async def _discover_org_asns(self, org_names: List[Optional[str]]) -> List[Dict[str, Any]]:
+        """Auto-discover candidate ASNs for an org that hasn't manually
+        entered any, via RIPEstat's free/keyless searchcomplete API (BGPView,
+        the more commonly-cited alternative, was unreachable entirely when
+        checked live -- connection failed outright). Confirmed live:
+        RIPEstat's search only works well against a single bare word --
+        "Cloudflare" finds 11 ASNs, "Cloudflare, Inc." finds 0 -- so a
+        multi-word name is queried progressively more narrowly just to get
+        candidates back at all.
+
+        Acceptance is kept strict regardless of which query variant found
+        the candidate: every "significant" word (len >= 3) of the
+        *suffix-stripped* name must appear in RIPEstat's own AS-holder
+        description, not just the (possibly single-word) query term. This
+        matters in practice -- confirmed live: querying "Digital" (the
+        first-word fallback for "Digital Ocean", which has no corporate
+        suffix to strip) returns "Digital Cafe", "Digital Ink", "Digital
+        Media Group" alongside the real DigitalOcean entries. Requiring
+        "ocean" to also appear (it does, as a substring of "DigitalOcean")
+        correctly keeps the real match and rejects the unrelated ones,
+        without needing an arbitrary stoplist of generic words.
+
+        Feeds into _expand_asn_targets's existing candidate-only pipeline
+        (never auto-scanned), just tagged with a lower confidence and a
+        distinct source so analysts know to double-check these harder
+        before promoting one.
+        """
+        names = [str(name).strip() for name in org_names if name and str(name).strip()]
+        if not names:
+            return []
+
+        found: Dict[str, Dict[str, Any]] = {}
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12)) as session:
+                for name in dict.fromkeys(names):
+                    stripped = self._org_name_stripped(name)
+                    significant_words = [w.lower() for w in re.split(r"\s+", stripped) if len(w) >= 3]
+                    if not significant_words:
+                        continue
+
+                    for variant in self._org_name_search_variants(stripped):
+                        try:
+                            async with session.get(
+                                "https://stat.ripe.net/data/searchcomplete/data.json",
+                                params={"resource": variant},
+                            ) as resp:
+                                if resp.status != 200:
+                                    continue
+                                payload = await resp.json()
+                        except Exception as exc:
+                            log.warning("asn_auto_discovery_query_failed", name=variant, error=str(exc))
+                            continue
+
+                        categories = ((payload or {}).get("data") or {}).get("categories") or []
+                        asn_category = next((c for c in categories if c.get("category") == "ASNs"), None)
+                        if not asn_category or not asn_category.get("suggestions"):
+                            continue
+
+                        for suggestion in asn_category.get("suggestions") or []:
+                            description = str(suggestion.get("description") or "")
+                            description_lower = description.lower()
+                            if not all(word in description_lower for word in significant_words):
+                                continue
+                            asn_value = str(suggestion.get("value") or "").upper().replace("AS", "").strip()
+                            if not asn_value.isdigit():
+                                continue
+                            found.setdefault(f"AS{asn_value}", {
+                                "asn": f"AS{asn_value}",
+                                "matched_name": stripped,
+                                "ripestat_description": description,
+                            })
+                        break  # a variant returned real ASN results -- don't broaden further
+        except Exception as exc:
+            log.warning("asn_auto_discovery_failed", error=str(exc))
+            return []
+
+        return list(found.values())
 
     async def _fetch_known_ip_assets(self, org_id: str) -> List[str]:
         """Already-confirmed IP Asset rows for this org (resolved from a
@@ -995,10 +1149,13 @@ class DiscoveryWorker(BaseWorker):
 
         report = {"enabled": True, "domains": {}}
         for domain in domains:
+            # 6, not 3: a round-robin/load-balanced wildcard backend can fail
+            # to repeat a DNS fingerprint across only 3 random probes, leaving
+            # it undetected and its generated-subdomain noise unsuppressed.
             labels = [
                 "asm-wildcard-"
                 + "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(12))
-                for _ in range(3)
+                for _ in range(6)
             ]
             probes = [f"{label}.{domain}" for label in labels]
             resolved = await self._resolve_dns(probes, tmpdir)
@@ -1528,6 +1685,7 @@ class DiscoveryWorker(BaseWorker):
         dns_data: Dict[str, Dict],
         discovery_evidence: Optional[Dict[str, Dict[str, Any]]] = None,
         root_domains: Optional[List[str]] = None,
+        wildcard_fps: Optional[Set[tuple]] = None,
     ) -> tuple[int, Dict[str, Any]]:
         """Upsert discovered assets into the database."""
         from sqlalchemy import select, update
@@ -1667,6 +1825,12 @@ class DiscoveryWorker(BaseWorker):
                 "tls_version": (tls.get("tls_version") or "")[:20] or None,
                 "redirect_chain": http_data.get("redirect_chain", []),
                 "http_headers": http_data.get("headers", {}),
+                # This host survived (kept because of real corroborating
+                # evidence -- wildcard-suppressed hosts never reach this
+                # function at all) but its own DNS answer still matches the
+                # domain's wildcard catch-all fingerprint -- worth surfacing
+                # to an analyst, previously a dead/never-populated column.
+                "is_wildcard": bool(wildcard_fps) and dns_fingerprint(dns_info) in wildcard_fps,
                 "last_seen": now,
                 "last_probed": now,
             }

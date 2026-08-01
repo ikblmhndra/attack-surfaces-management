@@ -4,6 +4,782 @@ All notable changes to this project are documented below, sorted newest-first.
 
 ---
 
+## 2026-08-02 — Host-header poisoning check on the password-reset flow (opt-in)
+
+The safe half of Phase 3.4b (the other half, reuse-after-consumption, needs a real test account +
+actually completing a reset -- flagged separately, not built without that decision first, see PLAN.md).
+
+### Added
+- **`workers/bounty/exploit_ext.py`**: `check_host_header_poisoning(reset_request_url, email,
+  email_field, timeout)` -- sends the same password-reset request `check_password_reset_token_leak`
+  already sends, but with `Host`/`X-Forwarded-Host` overridden to a random, guaranteed-unique marker
+  value instead of the real domain. If that marker string shows up anywhere in the response body
+  (e.g. reflected into a generated reset link), the app trusts a client-supplied host header when
+  building content -- confirmed, high severity, technique `host-header-poisoning-password-reset`. A
+  random marker per call (not a fixed string) means a match can only be an actual reflection, never a
+  coincidental hit on organic content. Same read-only posture as the existing token-leak check: never
+  completes a reset, finding nothing is the correct/expected result for a properly-behaved app.
+  Verified aiohttp actually transmits an explicit `Host` header override (not silently overwritten
+  based on the URL) via a live loopback test against a local echo server before relying on it, then
+  unit-tested both a vulnerable case (server reflects the injected host into a JSON link) and a safe
+  case (server ignores it, always uses its own canonical domain) against the same local server.
+- **`workers/bounty/exploit_worker.py`**: wired in right after the existing token-leak check, sharing
+  the same `password_reset_url`/`auth_email` opt-in gate -- no separate RoE field needed, since this is
+  a second check on the same already-consented-to flow, not a new capability requiring its own opt-in.
+- **`bounty_report_templates.py`**: added a `TECHNIQUE_META["host-header-poisoning-password-reset"]`
+  entry (more specific than the generic `passwordreset` module label) describing the full attack chain
+  and remediation (never build absolute/emailed URLs from a client-supplied Host header).
+- **`RulesOfEngagementEditor`** (`page.tsx`): updated the existing password-reset field's label/hint to
+  mention both checks now run together off the one URL.
+
+---
+
+## 2026-08-02 — Race-condition/TOCTOU detection module (opt-in); MODULE_META gap closed for 6 more modules
+
+Phase 3.3 (race-condition/TOCTOU testing), previously deferred pending "which resource specifically" --
+resolved the same way `password_reset_url` resolved an identical problem: don't guess the target,
+require the program to name it via `rules_of_engagement`.
+
+### Added
+- **`workers/bounty/exploit_ext.py`**: `check_race_condition(url, method, body, attempts, extra_headers)`
+  -- fires `attempts` (5-50, default 15) identical requests at a caller-supplied URL via `asyncio.gather`
+  (as close to simultaneous as the event loop allows) and counts how many came back with a 2xx status.
+  Deliberately cannot name its own target or decide "confirmed" vs not: whether an endpoint is supposed
+  to be single-use/quantity-limited (coupon redemption, one-time claim, balance transfer, limited-stock
+  purchase) is a business-logic question only a human who already suspects a specific action can answer.
+  2+ concurrent successes is always reported `status: inconclusive`, technique `possible-race-condition`
+  -- evidence for a race window, not proof of impact (the pipeline has no way to check whether the
+  underlying resource was actually double-consumed/credited).
+- **`workers/bounty/exploit_worker.py`**: new opt-in dispatch block gated on
+  `rules_of_engagement.race_condition_url` (+ optional `race_condition_method` default POST,
+  `race_condition_body`, `race_condition_attempts` clamped 5-50 default 15) -- same "you name it, we
+  test it" pattern as the existing `password_reset_url` block right above it.
+- **`RulesOfEngagementEditor`** (`page.tsx`): new field in the amber "Aggressive testing" section --
+  target URL, method dropdown, attempts. A JSON body (if the action needs one) goes through the
+  existing raw-JSON fallback mode rather than a new dedicated textarea -- keeps this addition to what's
+  actually new, not a re-implementation of a JSON editor that already exists in this component.
+- Verified via unit tests (all-succeed → finding; properly-serialized single-success → no finding;
+  all-rejected → no finding; borderline 2-success threshold → finding; `attempts<2` short-circuits with
+  zero requests fired) plus a real-network smoke test (15 genuinely concurrent requests against the
+  platform's own live `/health` endpoint, confirming the async firing + counting mechanics work against
+  a real server, not just mocks -- Juice Shop wasn't running in this environment to test against a
+  genuinely racy endpoint, so this validates the plumbing, not a specific vulnerable-target scenario).
+
+### Fixed
+- **`backend/app/services/bounty_report_templates.py`**: found the same class of bug as 2026-08-02's
+  earlier `report_worker.py` entry while adding `MODULE_META["race"]` -- `upload`, `jwt`, `redirect`,
+  `cmdi`, `bruteforce`, and `passwordreset` (all real, already-shipping modules) had **no** `MODULE_META`
+  entry either, so every one of their findings' reports was silently mislabeled with the generic
+  "Vulnerability / Misconfiguration (nuclei)" title instead of a class-appropriate one. Added all 6
+  missing entries (plus `race` for the new module above) with accurate label/impact/remediation text.
+
+---
+
+## 2026-08-02 — Recon now processes domains concurrently (bounded), not sequentially
+
+Phase 4's KPI stress test flagged (but deferred) that a real 10-domain program's recon stage runs
+1.5h+ wall-clock because `run_stage()` looped over domains one at a time. The consumer_timeout fixes
+that session made this *safe* (no more infinite redelivery loop) but not *fast*. Picked this up as
+part of "go build everything on the list" -- see PLAN.md Phase 4's deferred architecture note.
+
+### Changed
+- **`workers/bounty/recon_worker.py`**: replaced the sequential `for domain in domains:` loop with
+  `asyncio.gather` over a new `_process_domain()` method, bounded by a `asyncio.Semaphore` at
+  `MAX_CONCURRENT_DOMAINS` (env `BOUNTY_RECON_DOMAIN_CONCURRENCY`, default 3). Deliberately did *not*
+  build the heavier alternative (fan out one RabbitMQ message per domain + a new Redis fan-in
+  coordinator modeled on `task_coordinator.py`) -- that would have meant overriding
+  `BountyStageWorker.process()`'s one-message-one-completion contract (only the last of N domain
+  messages may mark the stage "completed" and trigger the next-stage publish), introducing exactly the
+  kind of message-boundary/completion-race bug class this session already found and fixed twice
+  (recon and exploit both hit a redelivery race at the old consumer_timeout boundary). In-process bounded
+  concurrency gets the same wall-clock win with none of that new failure surface, at the cost of a
+  smaller speedup ceilinged by `MAX_CONCURRENT_DOMAINS` rather than full N-way parallelism -- correctness
+  was scoped as the wrong place to spend risk budget for a plain speed complaint. Concurrency capped at
+  3 (not `MAX_DOMAINS_PER_RUN`'s 10) so peak resource usage and peak live request volume against the
+  real target don't multiply by 10x -- this stage hits a real, sometimes WAF-sensitive bug bounty target.
+- **Found and fixed a real collision hazard while building this**: `tools.py`'s `run_dnsx`, `run_katana`,
+  and `run_httpx` all write to fixed filenames under the shared tmpdir (e.g. `bounty_dnsx_output.json`),
+  written on the assumption that only one domain runs at a time. Running domains concurrently against a
+  shared tmpdir would have made two domains race on those files -- not crash, silently return each
+  other's (or corrupted) results, the worst kind of bug. Fixed by giving each domain its own
+  `tmpdir_root / domain` subdirectory instead of touching every tool function's filename logic.
+- Verified via a mocked concurrency test (5 domains, 1 forced to raise): confirmed exactly 1 domain's
+  failure doesn't affect the other 4 (`return_exceptions=True` isolation), confirmed 5 distinct
+  per-domain tmpdir subdirectories with zero collisions, confirmed peak in-flight domains never exceeded
+  the configured limit of 3.
+
+---
+
+## 2026-08-02 — Report stage ignored `triage_status`; one dismissed false positive had reached a submission-ready draft
+
+Triggered the `report` stage on the KPI program (first real run since Phase 2 added finding triage) to
+generate submission-ready drafts. Reviewing the 28 resulting drafts surfaced two bugs in the
+report-drafting path that Phase 2's triage work never touched.
+
+### Fixed
+- **`workers/bounty/report_worker.py`**: the finding-selection query filtered only by
+  `ExploitAttempt.status.in_(statuses)`, with no `triage_status` condition at all -- so a finding a human
+  had explicitly dismissed (`triage_status: false_positive`/`duplicate`/`wont_fix`) remained fully
+  eligible for report drafting. `_gather_urls_findings` in `backend/app/api/v1/endpoints/bounty.py`
+  (used for the summary/HTML report) already filtered this correctly when Phase 2 built it; this worker
+  was simply never updated to match. Confirmed live: exactly one drafted report
+  (`ab27991c-e3d2-4e67-8e81-a89715050aa1`) had been built from finding `f567fe6c-...`, the `.env`
+  catch-all false positive on `ebook.kpi.go.id` that had been manually dismissed on 2026-08-01. Fixed by
+  adding `ExploitAttempt.triage_status.is_(None)` to the query, mirroring the existing pattern.
+- **`backend/app/services/bounty_report_templates.py`**: `build_report()`'s `display_target` resolution
+  (and `_build_steps()`'s local copy of the same fallback) only checked
+  `evidence.get("target_url") or evidence.get("matched_at")` -- but `detect.py`'s vulnscan-stage checks
+  (`check_sensitive_files` for the `exposure` module, `check_security_headers` for `headers`) key their
+  evidence dict `"url"`, not `"target_url"`. Every `exposure`/`headers` report was therefore falling
+  through to the unrelated owning-target's `target_value` instead of the finding's real URL -- visible as
+  reports titled after a completely different endpoint than the one actually affected (e.g. an `.env`
+  finding's report titled after a `jquery-3.5.1.min.js` URL on the same target row). The correct 3-way
+  fallback (`target_url` -> `url` -> `matched_at`) already existed in two other places
+  (`bounty_stage.py`'s dedup matcher, `notify.py`'s Slack/webhook message builder) -- this template
+  builder was the one place it was missed. Fixed both fallback chains to include `evidence.get("url")`.
+  Also added missing `MODULE_META["headers"]` and `MODULE_META["exposure"]` entries -- previously both
+  modules fell back to the generic `MODULE_META["nuclei"]` label ("Vulnerability / Misconfiguration
+  (nuclei)"), mislabeling every header/exposure finding's report regardless of the target-URL bug above.
+- **Data cleanup**: deleted 8 of the 28 existing draft reports by specific ID (1 built from the dismissed
+  `.env` false positive; 7 genuine `headers`/`exposure` findings mislabeled with the wrong target URL),
+  then re-ran the `report` stage to regenerate the 7 genuine ones under the fixed code. Verified after:
+  27 reports total (20 untouched + 7 regenerated with correct label/target, e.g. "Missing/Misconfigured
+  Security Header on https://ebook.kpi.go.id"), 0 contain the dismissed `.env` finding.
+
+## 2026-08-01 — Full KPI exploit run completed; 8th bug found (consumer_timeout still too short) and fixed; static-asset filter strengthened
+
+Re-ran `exploit` (not the full pipeline -- recon/probe/vulnscan data was still current) to let it run to
+completion this time. It did complete -- and its completion is exactly what exposed one more bug.
+
+### Fixed
+- **`infrastructure/rabbitmq/rabbitmq.conf`**: `consumer_timeout` raised again, 3 hours (10800000ms) ->
+  8 hours (28800000ms). The exploit run legitimately took 4h19m against this heavily WAF-throttled real
+  target (14 modules, most individual URLs bounded by `RUN_MODULE_URL_TIMEOUT` but still adding up across
+  the whole stage) -- `bounty_exploit_completed` (findings=8) logged at the *exact same instant* as
+  `message_channel_closed elapsed_s=15563.5`. The ack lost the race against the channel already being
+  forced closed, so RabbitMQ redelivered the message anyway and the worker restarted the *entire already-
+  successfully-completed* stage from scratch -- caught live, stopped before it could burn several more
+  hours duplicating real traffic against the actual target for zero new value. Same root cause class as
+  the very first fix this weekend (recon's own consumer_timeout issue), just needing more headroom than
+  initially estimated once observed against a real worst case rather than an estimate.
+- **`workers/bounty/exploit_worker.py::_is_static_asset`**: found one more real static-asset false
+  positive after the first fix -- `/assets/admin/plugins/uri/URI` (a bundled copy of the URI.js library,
+  confirmed via `curl`: `Content-Type: application/javascript`, body literally starts `/*! URI.js v1.19.0
+  ... */`) has no file extension in its URL at all, so the extension-based filter missed it. Added a
+  second, independent check: any path containing an `/assets/`, `/static/`, or `/dist/` segment is treated
+  as a static asset regardless of extension -- a near-universal static-file-serving directory convention
+  across virtually every web framework, so the false-negative risk (excluding a genuine API endpoint) is
+  negligible. The one new *real* BAC finding from the same run, `ssj.kpi.go.id/dashboard/chart` (genuine
+  HTML, not a static asset), was deliberately left untouched -- correctly still testable, and correctly
+  landed as `inconclusive` pending human review, exactly the platform's own intended behavior for something
+  that needs a judgement call rather than being structurally provable either way.
+
+### Verified
+- `_is_static_asset` retest: the exact URI.js URL now correctly filtered, `dashboard/chart` confirmed
+  still NOT filtered (a real finding must stay reachable), plus 2 new `/static/`/`/dist/`-segment cases.
+  All pass, `py_compile` clean.
+- `consumer_timeout`: confirmed `{ok,28800000}` via `rabbitmqctl eval` post-restart; all containers
+  (including the whole platform, since this is a broker-wide restart) confirmed healthy afterward.
+- Marked the one URI.js false positive `triage_status: false_positive` by its specific ID (not deleted).
+- Final KPI findings tally: 48 total (16 `false_positive` from the first review + 1 more from this pass =
+  17 dismissed), 31 remaining genuine/needs-review, including 6 new legitimate findings from modules that
+  hadn't had a chance to run before (`oauth-missing-state` x2, `oauth-missing-pkce` x2 inconclusive,
+  `csrf-missing-token` x2) plus the one new inconclusive BAC candidate needing manual follow-up.
+
+## 2026-08-01 — Fixed both detection-quality bugs from the KPI findings review with one shared filter
+
+### Fixed
+- **`workers/bounty/exploit_worker.py`**: new `_is_static_asset()` / `_STATIC_ASSET_EXTENSIONS`, applied
+  once at `owned` construction (the master candidate list every module downstream reads from, directly or
+  via `param_urls`/`api_urls`) instead of patching the two symptom sites separately. No check in this
+  module is ever meaningful against a static asset file (.js/.css/images/fonts/...) -- no server-side code
+  processes a query param on one, and an anonymous 200 on one is normal, not a BAC finding. This single
+  change fixes both bugs the KPI findings review found: `idor_bac_probe`'s `_PRIVILEGED_RE` no longer sees
+  static assets at all (was matching any `/admin/`-themed asset folder, producing the 13 false
+  `bac-unauth-privileged` hits), and `api_urls`'s fallback to `param_urls` is automatically clean too
+  (was letting `.js` files with cache-busting query params through to `run_json_body_mutations` as if
+  they were JSON API endpoints). Extension list includes `.zgz`, seen live against a real
+  `PasswordRecovery_all.js.zgz?v=...` asset. Deliberately did *not* add `.json` -- it can legitimately be
+  a real API response, unlike the others.
+- Not touched: the separate `.env` catch-all false positive from the same review (dynamic per-request
+  content, likely a New Relic RUM script, defeating `_bodies_match`'s exact-or-whitespace-collapsed
+  comparison) -- a different root cause needing its own fix, not part of what was asked this pass.
+
+### Verified
+- `_is_static_asset` unit test: all 3 real false-positive URLs from the KPI review correctly filtered,
+  plus confirmed no false-exclusion on real targets (`.DS_Store` with no conventional extension, a bare
+  `/rest/user/login`, a `.json` API response, an IDOR-shaped `/rest/basket/6`) -- all pass. `py_compile`
+  clean.
+- Re-test plan: re-running only the `exploit` stage against the existing KPI targets (not the full
+  pipeline) -- recon/probe/vulnscan output is still current in the DB, and this bug is exploit-stage-only,
+  so a full multi-hour re-run isn't needed to verify it, and re-running less against the same real target
+  is the more considerate choice. See the next entry for the actual re-run's outcome.
+
+## 2026-08-01 — KPI run stopped for review; findings audit found 2 more detection-quality bugs (not yet fixed)
+
+Exploit stage stopped mid-run at the user's request after the four infra fixes above were proven working
+live (worker stopped, `bounty.exploit` queue purged so it doesn't silently resume later) -- 40 findings had
+already accumulated from the completed recon/probe/vulnscan stages plus the partial exploit run. Manually
+reviewed every one against the real target (not just trusted the "confirmed" label) before reporting them.
+
+### Found (not fixed -- reporting only, pending prioritization)
+- **`workers/bounty/exploit_ext.py::idor_bac_probe`'s `_PRIVILEGED_RE`** matches any path containing
+  `/admin/` as a substring, with no exclusion for static asset file extensions. `ssj.kpi.go.id` serves a
+  purchased/free admin-dashboard-template's own static assets from `/assets/admin/js/...` (jquery,
+  bootstrap, tether, ...) -- the theme's folder name, not an actual admin panel -- and all 13 of those got
+  flagged `bac-unauth-privileged`. Every one is a false positive: a static JS library returning 200 without
+  auth is completely normal (a login page has to load its own JS before the user is authenticated at all).
+- **`workers/bounty/exploit_worker.py`'s `api_urls` selection** (`any(k in u.lower() for k in ("/api/",
+  "/graphql", "/rest/", "format=json")) or param_urls`) falls back to *any* param-bearing URL when a
+  program has no true API-shaped ones discovered, with no exclusion for static asset extensions. Two static
+  `.js` files with cache-busting query params (`vendor.min.js?_=514`, `PasswordRecovery_all.js.zgz?v=...`)
+  got tested by `run_json_body_mutations` as if they were JSON API endpoints -- the mass-assignment
+  `"role"`/`"admin"` trigger strings it matched were confirmed (via direct `curl`) to already be present in
+  each file's own normal JS source, unrelated to the POST body at all.
+- Also confirmed via direct `curl`: the `sensitive-file/.env` hit on `ebook.kpi.go.id` is the exact same
+  false-positive class as the Juice Shop `/redirect?to=` bug from earlier -- a "Flipbook load error" catch-
+  all page served identically (byte-identical `<title>`, same HTTP 200) for `/.env` AND a random
+  nonexistent control path. The existing catch-all-200 guard didn't catch it here because the page likely
+  embeds per-request-varying content (New Relic RUM tracking script) that defeats `_bodies_match`'s exact-
+  or-whitespace-collapsed comparison, combined with `.env`'s deliberately weak `"="` signature.
+- By contrast, confirmed **`sensitive-file/.DS_Store` on `ppid.kpi.go.id` is a real finding**: the response
+  starts with the exact macOS `.DS_Store` magic bytes (`Bud1`), and a random control path on the same host
+  correctly 404s (not a catch-all host) -- a real accidentally-uploaded Finder metadata file.
+
+### Cleanup done
+- Marked all 16 confirmed false positives above (1 `.env` + 13 `bac-unauth-privileged` + 2 `mass-
+  assignment`) `triage_status: false_positive` via the Phase 2 PATCH endpoint, by their specific IDs --
+  not deleted, same non-destructive pattern as the cmdi false positives earlier today. 24 of the original
+  40 findings remain as genuinely real or legitimately-inconclusive.
+- The 6 `headers` findings (missing HSTS/clickjacking-protection/nosniff across `ssj.kpi.go.id` and
+  `ebook.kpi.go.id`) and the 1 `nosql` candidate were left as-is -- no false-positive pattern found in
+  either.
+
+## 2026-08-01 — Four real infra/data bugs found and fixed via first large-scale real-world Bug Bounty run (KPI program, 10 domains / 66 targets)
+
+First time the pipeline was run full-pipeline against a real, authorized, multi-domain bug bounty program
+(user-confirmed public VDP) rather than a small single-domain test app (OWASP Juice Shop) -- surfaced
+four real bugs that never had a chance to reproduce at Juice Shop's scale, found by watching the run live
+and reading worker logs rather than just waiting for a final result.
+
+### Fixed
+- **`infrastructure/rabbitmq/rabbitmq.conf`**: added `consumer_timeout = 10800000` (3 hours; RabbitMQ
+  server default is 30 minutes as of 3.8.15+). A single `bounty.recon` message processes every seed
+  domain in one message/one ack (`workers/bounty/recon_worker.py`'s `for domain in domains:` loop --
+  subdomain enum + URL collection + JS analysis + path discovery + a real browser crawl, per domain), and
+  a 10-domain program against a real, sometimes-slow external target regularly exceeded 30 minutes for the
+  whole batch. Confirmed live: the *same* message_id kept getting redelivered every ~30-45 minutes
+  (`message_channel_closed elapsed_s=2038-2710` in worker logs) and reprocessed from scratch each time --
+  recon (and whatever it auto-chained to) never reached one clean completion, and the real target got hit
+  with redundant repeat recon/crawl traffic on every cycle instead of once.
+- **`workers/bounty/recon_worker.py::_persist`**: batched the `BountyAsset` bulk insert into chunks of
+  `_PERSIST_BATCH_SIZE = 1000` rows instead of one all-in-one `INSERT`. Postgres/asyncpg hard-caps bind
+  parameters at 32767 per query -- 5 columns per row here, so a single unbatched call topped out around
+  6553 rows. Confirmed live: `kpi.go.id`'s own entries (subdomains + URLs + JS endpoints/secrets/findings,
+  a real long-lived government domain with a decade-plus of Wayback Machine history) exceeded that in one
+  domain's batch and crashed the whole call with `asyncpg.exceptions._base.InterfaceError: the number of
+  query arguments cannot exceed 32767` -- silently losing every entry for that domain, not just the
+  overflow, and (independent of the consumer_timeout issue above) itself a plausible contributor to the
+  same never-completes symptom, since an unhandled exception mid-`run_stage()` also triggers a retry/
+  requeue.
+- Operational cleanup once the first two fixes were in: stopped all 5 bounty workers, purged the now-
+  stale/duplicate messages that had piled up in `bounty.recon`/`bounty.vulnscan`/`bounty.exploit`
+  (redundant auto-chain triggers from the redelivery loop above) plus the 65-message `bounty.recon.dlq`
+  backlog (stale failed attempts, no longer actionable), restarted workers clean, then re-triggered the
+  KPI pipeline fresh.
+- **`workers/bounty/tools.py::discover_js_files`**: the re-triggered run above still didn't finish --
+  found live by noticing zero new log lines for 80+ minutes while its `subjs` subprocess sat at ~0% CPU.
+  `max_pages` (already a parameter, already applied to the direct-scrape fallback path) was never applied
+  to the primary `subjs` path, so it received every collected page URL for a domain uncapped -- and its
+  own timeout, `timeout * max(1, len(urls) // 10)`, scales linearly with that same uncapped count with no
+  ceiling. `kpi.go.id` alone produced 8488 deduped page URLs (recon's own dedup log:
+  `bounty_recon_urls ... collected=343460 deduped=8488 domain=kpi.go.id`), which computes to a ~3.5 hour
+  timeout for one `discover_js_files` call -- not a hang, just an effectively-unbounded wait that looked
+  identical to one from the outside. Fixed by slicing to `urls[:max_pages]` before handing input to subjs,
+  same as the fallback already does -- a bulk JS-reference-discovery tool doesn't need thousands of page
+  URLs to find the (much smaller, mostly-shared-across-pages-via-templates) set of JS files a site
+  actually serves.
+- **`workers/bounty/exploit_worker.py::_run_module`**: added a hard per-URL ceiling
+  (`RUN_MODULE_URL_TIMEOUT = 360`s, via `asyncio.wait_for` around each `runner(url)` call) on top of
+  whatever internal timeout each individual check already has. Found live after the exploit stage went
+  quiet (zero new log lines) for 34+ minutes with ~0% CPU and no active subprocess: `/proc/net/tcp` showed
+  a connection to a `kpi.go.id`-related IP stuck in `SYN_SENT` with 6 retransmits already sent and still
+  open -- a Playwright-driven check (DOM/stored XSS) waiting on a background sub-resource fetch to an
+  unreachable host, outside what the *page navigation's* own `page.goto(timeout=...)` covers. Without an
+  outer bound, `_run_module`'s `for url in urls: await runner(url)` loop (used by nearly every exploit
+  module) had nothing else limiting the wait -- it would have run until RabbitMQ's now-3-hour
+  `consumer_timeout` finally force-closed it, silently skipping every remaining URL and module for that
+  run. 360s sits above `run_sqlmap`'s own 300s default (the single slowest legitimate check) so normal
+  completions are unaffected -- confirmed a hung URL now times out and the loop moves on to the next one
+  instead of stalling the whole stage.
+
+### Verified
+- Log sweep across all 5 bounty workers' last 24h for every distinct exception class name: only the
+  asyncpg param-limit crash above (2 occurrences) was a real unhandled exception; the ~35 (recon) / 23
+  (vulnscan) `SSLCertVerificationError` instances are expected and already handled (logged as warnings,
+  not crashes) -- legitimate hostname-mismatch/expired-cert issues on real legacy subdomains
+  (`cpanel.kpi.go.id`, `www.old.kpi.go.id`, ...), not a bug.
+- `_persist()` fix: live DB test against a throwaway program, 8000 synthetic entries (would have crashed
+  the old single-INSERT version, 8000×5=40000 params > the 32767 cap) -- all 8000 persisted cleanly in
+  batches, `py_compile` clean.
+- `consumer_timeout` fix: confirmed active post-restart via `rabbitmqctl eval
+  'application:get_env(rabbit, consumer_timeout).'` → `{ok,10800000}`. Confirmed live afterward: recon ran
+  continuously for 1h40m on one message with zero redeliveries (vs. every ~30-45 min before), first real
+  confirmation this class of bug is gone.
+- `discover_js_files` fix: recomputed the exact timeout formula with the real 8488-URL count pre/post-fix
+  (~12720s → 45s), `py_compile` clean, recon worker restarted to load it and pick the (necessarily
+  redelivered -- it was mid-call) message back up cleanly.
+- `_run_module` timeout fix: synthetic test with a runner that hangs for 30s on one URL and returns
+  normally on a second -- with the ceiling patched to 1s for a fast test, the hung URL timed out at ~1s
+  (not 30s) and the loop still reached and correctly returned a finding from the second URL. `py_compile`
+  clean, exploit worker restarted to load it and pick the (necessarily redelivered) message back up.
+- Full re-run outcome after all four fixes -- logged in the next entry once that run completes.
+
+## 2026-07-31 — Bug Bounty gap-remediation Phase 3 (partial): OS command injection, login rate-limit test, password-reset token leak check
+
+Built after an explicit scope/risk conversation with the user (see prior CHANGELOG entries' "Phase 3"
+discussion) -- 3 of the 4 Phase 3 candidates, all opt-in only, never part of the default-ON module set.
+Race-condition/TOCTOU testing (the 4th candidate) deliberately deferred -- inherently app-specific (needs
+a manually-configured single-use resource per program), carries real state-change/financial risk on a
+live target, and the user didn't ask for it to be built this pass.
+
+### Added
+- **`workers/bounty/exploit_ext.py::run_command_injection`** (opt-in via `rules_of_engagement.cmdi_test`):
+  OS command injection via query params. Two independent, non-destructive confirmation signals -- an
+  echo-marker probe (unambiguous the instant a unique per-attempt token is reflected in the response) and
+  a timing side-channel (response delayed by ~6s matching an injected `sleep`/`ping`, measured against a
+  fresh per-param baseline so an already-slow endpoint is never mistaken for a hit). Small, hand-picked
+  payload set (same discipline as `LFI_PAYLOADS`/`SSTI_PAYLOADS`) rather than importing an external
+  wordlist -- deliberately excludes anything that reads/writes/downloads/deletes.
+- **`workers/bounty/exploit_ext.py::check_login_rate_limit`** (opt-in via
+  `rules_of_engagement.brute_force_test` + tunable `brute_force_test_attempts`, clamped 5-50, default 15):
+  an absence-of-throttling detector, not a password-cracking tool -- sends N sequential wrong-password
+  attempts against a fake, **never-registered** email (never the program's real test account, both
+  because most apps rate-limit by IP/pattern regardless of whether the username is real, and so this can
+  never lock out the identity every other module depends on) and checks whether the server ever throttles
+  (429/403, or a clear upward timing trend across the run). Reports `inconclusive` -- real evidence of a
+  missing control, but this check never touches a real account so it can't itself prove what an attacker
+  could extract with unlimited tries.
+- **`workers/bounty/exploit_ext.py::check_password_reset_token_leak`** (opt-in via presence of
+  `rules_of_engagement.password_reset_url`, reuses the configured `auth_email`): requests a password reset
+  twice and checks whether the API **response itself** contains the reset token -- never follows/completes
+  a reset, so the test account's password is never touched. Two requests (not one) also catches a static,
+  non-rotating token as a distinct, worse finding. A well-built app that only ever emails the token
+  correctly reports nothing here -- this has no mailbox integration and was never meant to (see "Not
+  built" below).
+- Frontend: new "Aggressive testing (opt-in only)" section in `RulesOfEngagementEditor`, visually
+  distinct (amber border/background) from the always-safe module chips above it -- checkboxes for
+  `cmdi_test`/`brute_force_test` (with a conditional attempts-count input), and a URL field for
+  `password_reset_url`, each captioned with exactly what it does and doesn't do.
+
+### Not built (scoped out during the design discussion, not oversights)
+- **Reset-token entropy/predictability analysis** beyond the static-token check above -- 2-3 samples is
+  too weak a sample size to say anything statistically meaningful about randomness quality; the
+  static-token check (byte-identical across 2 requests) is the one entropy-adjacent signal that's still
+  structurally provable with so few samples.
+- **Host-header poisoning of reset links + full reuse-after-consumption testing** -- structurally needs to
+  read the actual delivered email, which this platform has no mailbox integration for. Not a scope/
+  authorization gap, an infrastructure one -- would need its own initiative (SMTP catch-all inbox +
+  polling), not a Phase 3 tuning item.
+- **OTP brute-force testing** -- explicitly scoped out of `check_login_rate_limit`. A 4-6 digit OTP's
+  search space is too small to test meaningfully within a request count that's still safe to send at a
+  real target (meaningfully proving OTP brute-forceability needs an attempt count that's itself
+  indistinguishable from a real attack).
+- **Race-condition/TOCTOU testing (Phase 3 item 3.3)** -- see PLAN.md; deferred, not declined.
+
+### Verified
+- Synthetic-server tests for all 3 new checks (`test_phase3.py`, run inside the exploit worker container):
+  command injection (echo-vulnerable, blind-vulnerable via a real 6s delay, and a safe control -- all 3
+  correct); login rate-limit (a non-throttling mock correctly flagged, a mock that 429s after 5 attempts
+  correctly reported clean); password-reset token leak (static-token leak flagged with *both* techniques,
+  randomized-token leak flagged with only the leak technique -- not falsely flagged static, and a safe
+  email-only mock correctly reported nothing). All passed.
+- Live Playwright run against the rebuilt frontend: the new opt-in section renders correctly, both
+  checkboxes and the conditional attempts input work, save persists correctly (confirmed via API
+  afterward: `cmdi_test: true`, `brute_force_test: true`, `password_reset_url` set).
+- Live exploit run against the real `OWASP Juice Shop` program with all three enabled: `bruteforce`
+  correctly flagged `no-login-rate-limit` (Juice Shop's own login endpoint has no throttling -- a real,
+  genuine finding); `passwordreset` correctly found nothing (Juice Shop's `/rest/user/reset-password` is a
+  single-step security-question reset, not a token+email flow -- this check's premise doesn't apply to
+  that shape, same "correctly not applicable" result as `run_ssrf` without an `oob_domain`); `cmdi`
+  initially flagged 2 **false positives** on `/redirect?to=` -- caught, root-caused, and fixed in the same
+  pass (see below), confirmed clean on re-run afterward.
+  - **Bug found and fixed**: the echo-marker check (`; echo <token>`) embedded the literal marker text
+    inside its own payload, so it produced a false positive against any endpoint that reflects invalid
+    input verbatim into an error page -- which is exactly what Juice Shop's own `/redirect?to=` allowlist
+    rejection does for *any* value (`curl` control test confirmed: a totally unrelated garbage string gets
+    echoed back in the same 406 "Unrecognized target URL" message). Fixed by switching to shell arithmetic
+    (`expr {a} + {b}`) and requiring the computed RESULT to appear while the raw payload text does NOT --
+    the exact same "evaluated, not merely reflected" discipline `run_ssti` already uses for `{{7*7}}`/`49`.
+    Re-verified with a synthetic mock reproducing the exact reflection shape (must NOT flag) alongside a
+    genuinely `expr`-executing mock (must still flag) -- both correct. The 2 original false-positive rows
+    were marked `triage_status: false_positive` via the Phase 2 PATCH endpoint (by their specific IDs, not
+    deleted -- keeps the audit trail of the bug existing and being fixed) rather than removed. Confirmed
+    on a second live exploit run post-fix: the two dismissed rows' `occurrence_count` stayed at 1 (not
+    bumped) and zero new `cmdi` findings were persisted -- the fixed check now correctly returns nothing
+    for that endpoint rather than rediscovering the same false positive. No errors in worker logs across
+    either run.
+
+## 2026-07-31 — Bug Bounty gap-remediation Phase 2: security headers, open redirect, finding lifecycle + dedup
+
+Third item off the audit roadmap (PLAN.md), all three sub-items (2.1/2.2/2.3) shipped in one pass.
+
+### Added
+- **`workers/bounty/detect.py::check_security_headers`** (vulnscan stage): single-GET, header-only
+  checks -- missing clickjacking protection (X-Frame-Options DENY/SAMEORIGIN or CSP frame-ancestors,
+  only flagged on actual HTML responses), missing HSTS (HTTPS origins only), missing
+  X-Content-Type-Options: nosniff. Wired into `vulnscan_worker.py::_run_detection` alongside
+  `check_sensitive_files`/`check_cors` as a new `"headers"` module. One of the most commonly-accepted
+  "quick win" bug bounty report categories, previously entirely uncovered.
+- **`workers/bounty/exploit_tools.py::run_open_redirect`** (exploit stage): generic open-redirect probe
+  -- injects a fully-qualified attacker-controlled URL into each query param, confirms only if the
+  Location header actually points there. Distinct from `exploit_ext.py::check_oauth_jwt`'s own
+  `redirect_uri` probe, which only fires on OAuth-shaped URLs -- this is the far more common case (a
+  plain `?next=`/`?returnTo=`/`?url=` param on an ordinary page). Wired in as a new `"redirect"` module,
+  routed through the same `classify_url` "redirect" gf bucket that already existed in
+  `recon_ext.py` but was never consulted by any module before this.
+- **Finding triage + dedup** (`bounty_exploit_attempts` table, migration `d22599d40fba`): new
+  `triage_status` (null/`false_positive`/`duplicate`/`wont_fix`), `last_seen_at`, `occurrence_count`
+  columns. New `workers/bounty/bounty_stage.py::persist_deduped_attempts` -- re-running a stage that
+  rediscovers an already-known finding (same program/target/module/technique/evidence-URL) now bumps
+  that row's `last_seen_at`/`occurrence_count` and refreshes its evidence instead of inserting a
+  duplicate row forever; a human's `triage_status` is never touched by this path, only by the new
+  `PATCH /programs/{id}/findings/{finding_id}` endpoint, so marking something a false positive is never
+  silently undone just because it reproduces on a later run. `GET .../findings` gained
+  `include_dismissed` (default false); `_gather_urls_findings` (summary/HTML-report) now also excludes
+  dismissed findings by default. Frontend: `FindingsTab` gained a per-finding triage `<select>`, a
+  "Dismissed shown/hidden N" toggle, and an "seen N×" badge once `occurrence_count > 1`.
+- Wired `run_open_redirect`/`check_security_headers` into `exploit_worker.py`/`vulnscan_worker.py`
+  respectively; both use the same `_run_module`/`_detect_attempt` plumbing every other module already
+  goes through, no special-casing needed.
+
+### Fixed (found while touching adjacent code, not pre-planned)
+- **`backend/app/api/v1/endpoints/bounty.py::_gather_urls_findings`**: the run-scoping cutoff compared
+  each finding's `executed_at` against the stage's latest-completed-run timestamp -- correct before
+  dedup existed (every run was a fresh row), but with `persist_deduped_attempts` now leaving
+  `executed_at` fixed at first-seen forever, this would have started incorrectly excluding findings
+  still being actively re-confirmed on every run, just because they were first discovered a while ago.
+  Switched to comparing `last_seen_at` instead.
+- **`_VULNSCAN_MODULES`** (same file) was already missing `graphql`/`components`/`takeover` from earlier
+  sessions (not introduced by this pass) -- caught while adding `headers` to it. All four now included.
+
+### Verified
+- `check_security_headers`: 4 synthetic-server cases (all headers present, HTML with nothing set,
+  JSON with nothing set, CSP frame-ancestors present) -- all correct, including the "don't flag
+  clickjacking on a JSON response" and "HSTS only applies to https://" gates.
+- `run_open_redirect`: 3 synthetic-server cases (vulnerable reflect, safe allowlisted redirect, URL with
+  no query params) -- all correct.
+- `persist_deduped_attempts`: live DB test against a throwaway program -- same finding persisted twice
+  collapses to one row with `occurrence_count=2` and refreshed evidence; a different URL under the same
+  module/technique stays a separate row; marking a row `false_positive` then re-detecting it again bumps
+  `occurrence_count` but leaves `triage_status` untouched. All assertions passed; throwaway program
+  deleted after.
+- Live run against the real `OWASP Juice Shop` program: `vulnscan`/`exploit` both completed cleanly with
+  the new modules active (`"redirect"` present in the exploit run's own `modules` summary, 220 URLs
+  tested). Both new checks returned 0 findings on this specific target -- verified as true negatives, not
+  bugs: `curl -I http://owasp-juice.com/` directly confirms it already sends `X-Content-Type-Options:
+  nosniff` and `X-Frame-Options: SAMEORIGIN` (Juice Shop uses helmet.js), and it's plain-HTTP-only so the
+  HSTS check correctly never applies; no error/traceback in worker logs across either run.
+- Migration hand-trimmed from the raw `alembic revision --autogenerate` output, which also picked up a
+  large amount of pre-existing, unrelated model/DB drift across many other tables (indexes, NOT NULL,
+  server defaults) -- applied only the 3 new `bounty_exploit_attempts` columns, verified via `\d
+  bounty_exploit_attempts` post-migration.
+- Frontend: `npx tsc --noEmit` and `npm run lint` clean. Full Playwright run against the rebuilt
+  container (login → Findings tab → dismiss a finding as false_positive → confirm it disappears from the
+  default view and the "Dismissed hidden" counter increments → toggle to show it → confirm it renders
+  dimmed with its triage label → revert to untriaged). Caught and fixed a real bug during this pass: the
+  "Dismissed N" counter was computed from a query response that, when the toggle was off, structurally
+  could never contain a dismissed row (server-side `include_dismissed=false` filtering) -- permanently
+  stuck at 0 regardless of how many were actually dismissed. Fixed by always fetching everything and
+  filtering client-side instead. Confirmed via direct API query that no test-induced triage state was
+  left behind on the real program afterward.
+- Noted, not chased further: a `vulnscan` run against the real program started mid-session
+  (`started_at` a few seconds before an early, since-corrected Playwright locator ambiguity) that this
+  session did not deliberately trigger via any script action taken -- completed cleanly with no errors
+  either way, and not something this pass needed to investigate further to consider the work verified.
+
+## 2026-07-31 — Bug Bounty gap-remediation Phase 1: unlock rules_of_engagement + enforce testing window
+
+First two items off the roadmap from the previous end-to-end audit entry (see PLAN.md for the full
+phased plan) — both "unlock existing capability, zero new testing surface" by design, no active-
+exploitation-adjacent risk, so built directly rather than raised for authorization first.
+
+### Added
+- **`workers/bounty/bounty_stage.py`**: `BountyStageWorker.process()` (the single shared entry point
+  every bounty stage worker runs through) now fetches `BountyProgram.rules_of_engagement` before calling
+  `run_stage()` and checks `testing_window_start`/`testing_window_end` (new `_within_testing_window()` /
+  `_parse_window_bound()` helpers) — a stage outside the configured window is recorded
+  `{"status": "skipped", "reason": "outside_testing_window"}` instead of running. Both bounds are
+  optional and independent (absence = unrestricted on that side, matching every other
+  `rules_of_engagement` field's opt-in/conservative-default pattern); an unparseable bound is logged
+  and treated as not set rather than either silently allowing everything or blocking a whole engagement
+  over a config typo. This closes the gap the previous audit found: the column comment on
+  `BountyProgram.rules_of_engagement` documented this as "read by workers/bounty/* at execution time"
+  when nothing actually read it.
+- **`frontend/src/app/dashboard/bounty/[id]/page.tsx`**: `rules_of_engagement` is no longer read-only
+  (previously a `<pre>` block literally captioned "Edit via API / config — shown here read-only"). New
+  `RulesOfEngagementEditor` component gives a structured form for every high-value field: auth
+  (login URL/email/password/field names), all 13 exploit modules as toggle chips, sqlmap level/risk,
+  SSRF OOB domain, two-identity IDOR (registration URL + JSON payload template), stored-XSS opt-in,
+  the new testing-window datetime inputs, and nuclei severity/extra-tag/rate-limit tuning — plus a
+  "raw JSON" fallback mode (via a new toggle) for any field without dedicated UI, so nothing that was
+  previously reachable via a manual API call becomes unreachable. This was the single highest-leverage
+  finding from the audit: nearly every advanced capability already built into the pipeline (authenticated
+  crawling, two-identity IDOR, stored-XSS, SSRF OOB confirmation) was functionally inaccessible to a
+  dashboard-only user.
+
+### Verified
+- `_within_testing_window` unit-tested inline (9 cases: no window, started/not-yet-started, ended/not-yet-
+  ended, within window, naive-datetime treated as UTC, unparseable bound ignored-with-warning) — all pass.
+- Live positive/negative test against the real `OWASP Juice Shop` program: probe stage ran normally with
+  no window configured (153/153 targets probed); with `testing_window_start` set to a future date, the
+  `report` stage correctly skipped with `reason: "outside_testing_window"`; reverted after.
+- `npx tsc --noEmit` and `npm run lint` both clean on the frontend change (2 `react/no-unescaped-entities`
+  errors caught and fixed during this pass).
+- Full Playwright browser run against the built container (login → Scope tab → confirm existing
+  `auth_login_url` correctly pre-filled from the program's real config → toggle a module off → edit rate
+  limit → save → confirm toast + persisted → switch to raw-JSON mode → confirm the saved state round-trips
+  correctly). Screenshots reviewed. Test-induced state (excluded module, rate limit, stale
+  `outside_testing_window` skip on the `report` stage) reverted/re-run afterward so the real program is
+  left clean.
+
+## 2026-07-31 — End-to-end audit of the Bug Bounty pipeline (no code changes; findings only)
+
+Full read-through of every stage (recon/probe/vulnscan/exploit/report — all 17 files under
+`workers/bounty/`, plus the backend scope/model/endpoint/report-template layer) at the user's request,
+to answer "is anything missing" now that the pipeline has grown to 13+ exploit modules across several
+sessions. Confirmed strong: scope enforcement (`bounty_scope.py::is_target_in_scope`, fail-closed,
+re-validated independently at every stage), the recon→asset→human-promote→target gate (discovery can
+never silently expand what's testable), and the confirmed-vs-inconclusive evidence discipline holding
+consistently across every module read. Coverage itself is broad: XSS (reflected/DOM/stored), SQLi
+(query + JSON-login-body bypass), NoSQLi, SSRF (OOB), LFI/XXE, SSTI, IDOR (candidate + two-identity
+cross-account confirmation), BAC (unauth-privileged + method-switching), CSRF (HTML forms + JSON/
+SameSite), CORS, 403-bypass, sensitive-file exposure, unrestricted upload, JWT (alg:none forgery, weak-
+secret brute force), OAuth hygiene (state/PKCE/redirect_uri), GraphQL (introspection, sensitive-field
+scan, batching), subdomain takeover, and vulnerable frontend JS components.
+
+### Gaps found (not fixed — reporting only, pending prioritization)
+- **`rules_of_engagement` is read-only in the frontend** (`frontend/src/app/dashboard/bounty/[id]/page.tsx`
+  — literally commented "Edit via API / config — shown here read-only"). This JSON blob is the *only*
+  config surface for nearly every advanced capability the backend already has: authenticated testing
+  (`auth_login_url`/`auth_email`/`auth_password`), two-identity IDOR confirmation, stored-XSS testing,
+  SSRF OOB confirmation (`oob_domain`), which exploit modules run at all, sqlmap level/risk, nuclei
+  severity/tag tuning. A user driving purely from the dashboard can never turn any of these on without
+  hand-crafting a raw API call — the single highest-leverage gap found, since it's not missing code, it's
+  a missing door to code that already exists and works.
+- **`BountyProgram.rules_of_engagement`'s own column comment documents `testing_window_start`/
+  `testing_window_end` as "read by workers/bounty/* at execution time"** — grepped the entire codebase;
+  it is never actually read anywhere. A documented-but-unenforced safety control (real bug bounty
+  programs often specify an authorized testing window).
+- **No OS command-injection module.** `recon_ext.py::classify_url` computes an `"rce"` gf-style bucket
+  (cmd/exec/command/execute/ping/... param names) same as it does for xss/sqli/ssrf/lfi/ssti, but
+  `exploit_worker.py::MODULE_BUCKET` never maps any module to it — the bucket is computed and silently
+  discarded. No shell-metacharacter or time-based-blind (sleep/ping -c) payload testing exists anywhere.
+- **No standalone generic open-redirect module.** Same pattern: a `"redirect"` gf bucket exists and is
+  likewise never consulted. The only open-redirect testing that exists at all is buried inside
+  `exploit_ext.py::check_oauth_jwt`'s `redirect_uri` probe, gated behind the URL looking OAuth-shaped —
+  a plain `?next=`/`?returnTo=`/`?url=` param outside an OAuth flow is never tested.
+- **No security-headers / clickjacking check** (`X-Frame-Options`, CSP `frame-ancestors`, HSTS,
+  `X-Content-Type-Options`) — zero references anywhere in `workers/bounty/`. One of the most commonly
+  accepted "quick win" bug bounty report categories, entirely absent.
+- **No rate-limit / brute-force / account-lockout testing** on login, OTP, or password-reset endpoints.
+- **No race-condition / TOCTOU testing** (e.g. concurrently redeeming a single-use coupon/discount code,
+  parallel withdrawal requests) — a well-known modern bug-bounty report category.
+- **No password-reset-flow-specific testing** (reset-token entropy/predictability, token reuse after
+  consumption, Host-header poisoning of the reset link itself) — distinct from the generic CSRF/JWT/SQLi
+  coverage already in place.
+- Minor: finding lifecycle has no "false positive"/"duplicate"/"won't fix" status and no dedup at the
+  data layer — re-running `exploit` against an already-confirmed target appends a new `ExploitAttempt`
+  row forever (dedup only exists at display time, in `bounty_report.py::_dedup_findings`). No
+  regression-tracking concept (mark confirmed, then auto-reverify still-reproducible on a later run).
+
+Per [[feedback_active_exploitation_authorization]]: several of the above (command-injection, brute-force/
+lockout testing) are active-exploitation-adjacent and were deliberately left as findings for the user to
+prioritize/authorize rather than built proactively.
+
+## 2026-07-31 — Wildcard DNS hardening + auto-discovered ASN candidates; fixed ASN→CIDR expansion (was returning zero prefixes)
+
+Phase 3 of the ASM roadmap. One of the four original findings — "katana crawl depth defaults to 1" — was
+disproven while investigating: directly computing the real effective scan config confirmed
+`scan_type="full"` always resolves `crawl_depth=3` regardless of scan profile; only `"quick"` gets depth 1,
+deliberately. Dropped, not implemented. Cloud-discovery breadth also deferred. Two items implemented:
+
+### Fixed
+- **Wildcard DNS detection** (`discovery_worker.py::_detect_wildcard_dns`): raised the probe count per
+  apex domain from 3 to 6 — a round-robin/load-balanced wildcard backend could fail to repeat a DNS
+  fingerprint across only 3 random probes, leaving it undetected. `_persist_assets` now also populates
+  `Subdomain.is_wildcard` (existed in the schema, confirmed via grep it was never written anywhere) for
+  surviving hosts (kept because of real corroborating evidence, unlike suppressed ones) whose own DNS
+  answer still matches the domain's wildcard fingerprint.
+- **New `discovery_worker.py::_discover_org_asns`**: auto-discovers candidate ASNs for orgs that haven't
+  manually entered any, via RIPEstat's free/keyless `searchcomplete` API (BGPView, the more commonly-cited
+  alternative, was completely unreachable when checked live — connection failed outright). RIPEstat's
+  search behaves like a single-token autocomplete, not a phrase search — confirmed live, "Cloudflare" finds
+  11 ASNs, "Cloudflare, Inc." finds 0 — so a multi-word/suffixed org name is queried progressively more
+  narrowly (suffix-stripped, then first word) just to get candidates back at all. Acceptance stays strict
+  regardless: every significant word of the suffix-stripped name must appear in RIPEstat's own AS-holder
+  description, not just the narrowed query term — caught live during testing that the naive "first word"
+  fallback for "Digital Ocean" (no corporate suffix to strip) pulled in unrelated "Digital Cafe"/"Digital
+  Ink"/"Digital Media Group" ASNs; requiring "ocean" too (present as a substring of "DigitalOcean")
+  correctly rejects those while keeping the real match. Auto-discovered ASNs feed into the existing
+  candidate-only, never-auto-scanned pipeline at a lower confidence (`0.4` vs. manually-entered ASNs'
+  `0.65`) and a distinct `source: "asn_auto_discovery"` tag.
+- **`_expand_asn_targets`'s CIDR expansion had never actually worked, for manual ASNs either** — found
+  while regression-testing the manual-ASN path against my own changes (not something I set out to fix).
+  It queried whois.cymru's bulk `begin/verbose/ASxxxx/end` protocol expecting a 7-field per-prefix
+  response, but a live query confirmed that protocol actually returns a single 5-field ASN-*info* summary
+  row (AS, country, registry, allocation date, org name) — no prefix data at all. `parts[2]` was silently
+  reading the registry name string as if it were a CIDR, always failing `ipaddress.ip_network()` and
+  returning zero prefixes for every ASN, silently, since this feature was first built (Milestone 17,
+  2026-07-12). Replaced with RIPEstat's `announced-prefixes` (real BGP-announced prefixes) +
+  `as-overview` (holder name for evidence) endpoints — same reliable host already proven for ASN
+  auto-discovery above.
+
+### Verified
+- Real discovery scan against the disposable test org (`example.com`): `wildcard_dns` report shows 6
+  probes (not 3) and still correctly detects the wildcard; `is_wildcard=true` persisted for `example.com`/
+  `www.example.com` (both genuinely share the wildcard's exact IP set) and `false` for the other,
+  unresolved subdomains. `asn_candidates: 0` for this org's own name ("Overlay Test Org", correctly no
+  false positives).
+- Isolated calls to `_discover_org_asns` against real company names: "Cloudflare, Inc." → 11 correct ASNs,
+  "Akamai Technologies" → 22 correct ASNs (down from a naive 39 once the two-word requirement was
+  enforced), "Digital Ocean" → exactly 2 correct ASNs (`DIGITALOCEAN-ASN`, `DIGITALOCEAN-AS62567`,
+  unrelated "Digital Cafe" etc. correctly excluded).
+- Confirmed the whois.cymru bug and its fix directly: a live raw query to `whois.cymru.com:43` for
+  `AS13335` returned exactly the undocumented 5-field summary row described above. Post-fix,
+  `_expand_asn_targets(["AS13335"], ...)` returns 25 real Cloudflare-announced prefixes (capped at
+  `asn_prefix_max`) with correct `asn_org` evidence — and the full auto-discovery chain end-to-end
+  (`_discover_org_asns(["Fastly, Inc."])` → `_expand_asn_targets`) produces 25 real Fastly CIDR candidates
+  tagged `asn_auto_discovery`/`0.4` confidence.
+
+## 2026-07-31 — IP ownership confidence now reflects shared CDN infrastructure (Phase 2 of the ASM roadmap)
+
+`enrichment_worker.py::_classify_provider` has long computed and persisted `IPAddress.is_cdn`
+(Cloudflare/Akamai/Fastly detection via ASN-org text matching) — confirmed via grep it was never read by
+any validation or scoring logic. Every IP asset got `ownership_confidence: 0.65` regardless of whether it
+was a dedicated address or a shared anycast edge serving thousands of unrelated customers.
+
+Investigated two adjacent ideas from the original audit and scoped both out, confirmed with the user:
+- **Tightening CDN detection for CloudFront specifically isn't fixable this way.** `_classify_provider`
+  works by ASN-org text matching, and a CloudFront IP carries the *same* AWS ASN-org string as any other
+  AWS service (EC2, ELB, etc.) — there's no text signal distinguishing them. A real fix needs a different
+  data source (AWS's published `ip-ranges.json`, filtered to `service: "CLOUDFRONT"`) — a separate,
+  bigger feature, not attempted here.
+- **Excluding CDN IPs from active network-target scanning** (so a Cloudflare edge's open ports don't get
+  reported as the org's own exposure) is out of scope for this pass — that logic lives in
+  `scan_profiles.py::build_target_candidates`/`discovery_worker.py`, the hottest path in the codebase, and
+  has a real ordering problem: a newly-discovered IP has no enrichment data yet at the moment it's first
+  targeted (enrichment runs on its own 48h cadence, not inline with discovery).
+
+### Fixed
+- **`workers/validation/asset_validation_worker.py::_validate_ip_asset`**: reads `ip_row.is_cdn` (already
+  populated, previously unused) and caps `ownership_confidence` at 0.35 when true, applied *after*
+  `merge_rdap_evidence` rather than before — that helper independently raises confidence to ≥0.55 whenever
+  *any* ASN/registry data exists (true of nearly every real IP, CDN or not), which would have silently
+  undone a pre-merge cap. `is_hosting` alone (AWS/GCP/Azure/DigitalOcean, without `is_cdn`) deliberately
+  does *not* trigger the cap — a dedicated cloud VM IP is still reasonably exclusive to whoever's running
+  it, unlike a CDN edge genuinely shared across unrelated tenants. `cloud_provider`/`is_hosting` are
+  surfaced in `validation_sources.evidence` either way, for analyst visibility.
+
+### Verified
+- Confirmed via the disposable test org's real Cloudflare edge IP (`104.20.23.154`, `asn_org:
+  CLOUDFLARENET`) that `is_cdn` wasn't yet set (enrichment hadn't run for this org) — set it directly
+  (the value a real enrichment pass would produce for this genuinely-Cloudflare IP, correct either way)
+  and ran a real revalidation via `POST /organizations/{id}/assets/validate`. Result: persisted
+  `ownership_confidence` dropped from ~0.6 to `0.35`, `ownership_reason` reads "IP belongs to a shared CDN
+  provider (cloudflare) — ownership is not exclusive", and `validation_sources.reasons` shows *both*
+  `rdap_asn_observed` (proof `merge_rdap_evidence`'s bump did fire) *and* `shared_cdn_provider_ip`
+  (proof the post-merge cap correctly overrode it back down) — confirming the ordering fix actually
+  matters and isn't just defensive over-caution.
+
+## 2026-07-30 — Asset re-validation now actually re-validates (real DNS/HTTP/TCP recheck + parked-page detection)
+
+Phase 1 of the ASM roadmap (`docs/PRD.md` §11), highest-priority item from the same-day methodology
+audit: `AssetValidationWorker`'s scheduled 24h re-validation never re-resolved DNS or re-probed HTTP —
+it recomputed a confidence score from stale cached `Subdomain`/`IPAddress` columns and stamped
+`last_verified_at = now()` regardless, so a decommissioned asset could look "freshly verified"
+indefinitely. Liveness detection separately treated any HTTP status code (including 404/500/503) as
+`"alive"`, with no way to distinguish a real service from a soft-404 or shared CDN/hosting placeholder
+page, despite `response_hash`/`content_length` already being captured on every probe and simply unused.
+
+### Fixed
+- **`workers/validation/asset_validation_worker.py`**: `process()` now batches every subdomain hostname
+  in a validation cycle through one real `dnsx` pass (`-a -aaaa -cname`) and one real `httpx` pass
+  (`-status-code -title -content-length -hash sha256 -tls-grab -location`) before scoring — new
+  `_resolve_dns_batch`/`_probe_http_batch`, an independent, slimmed-down copy of
+  `discovery_worker.py`'s own tool invocations (kept separate rather than shared, so this worker's
+  probing can't regress the far-more-heavily-used discovery pipeline). `_validate_subdomain` uses this
+  fresh data (falling back to the stale columns only if the probe failed/timed out for that specific
+  host — fail-safe, not fail-open) and `_validate_asset` now also writes the fresh values back onto the
+  `Subdomain` row itself, so every other page/feature reading those columns stays in sync too, not just
+  this worker's own derived score. `dns_records` (mx/txt/ns) is deliberately left untouched — this
+  recheck only re-fetches a/aaaa/cname, and overwriting it would clobber a real discovery scan's fuller
+  record set.
+- **IP assets**: `_validate_ip_asset` previously trusted `ip_row.open_ports_count`, a field this worker
+  never updates. New `_check_ip_liveness` does a bounded, real TCP connectivity check against up to 5
+  previously-recorded open `Port` rows (`asyncio.open_connection`, 3s timeout each, concurrent) —
+  deliberately not a full naabu port rescan (that's the port-scanning pipeline's job), just enough of a
+  live check that "alive" stops being purely inherited from a field this worker never touches.
+- **`backend/app/services/asset_validation.py`**: new `classify_liveness_content()` and a new
+  `liveness_status` value, `"parked"` — downgrades from `"alive"` when either (a) the HTTP title matches
+  a short, curated parked-domain/default-install-page keyword list ("domain is parked", "domain for
+  sale", "apache2 ubuntu default page", "welcome to nginx", etc.), or (b) the response body hash matches
+  ≥5 other assets platform-wide (new `_duplicate_hash_counts`, batched one query per cycle) — a shared
+  default/placeholder page signature. No migration needed (`liveness_status` is a plain `String(50)`, no
+  CHECK constraint) and no scan-gating change needed (`SCANNABLE_LIVENESS_STATUSES = {"alive"}` already
+  excludes anything not literally `"alive"`).
+- **Frontend** (small, additive, not a revamp): `"parked"` added to the `liveness_status` union in
+  `frontend/src/types/index.ts`, and to the amber "needs attention" pill-color branch in both
+  `dashboard/assets/page.tsx`'s `ValidationPill` and `dashboard/assets/[id]/page.tsx`'s
+  `ValidationMetric`.
+
+### Verified
+- Isolated tests of `classify_liveness_content`/`validate_discovered_host`: a real-alive case, a
+  parked-title case, a duplicate-hash case, dns-only, and unresolved all classified correctly; the full
+  `validate_discovered_host` wiring correctly surfaces `liveness_parked_content_detected` in
+  `validation_sources.reasons`; `should_scan_validated_asset`/`validation_skip_reason` correctly exclude
+  `"parked"` (`liveness_parked` skip reason).
+- Real end-to-end run against the disposable test org from this session (`86d22146-3097-43a0-a1fb-
+  59e4a3b13424`, `example.com`) via the real `POST /organizations/{id}/assets/validate` endpoint (bypasses
+  the 24h staleness cutoff via explicit `asset_ids`): `worker-validation` logs show
+  `reprobed_hosts=2` and 8s of real elapsed processing (not an instant no-op), and Postgres confirms
+  `last_verified_at`/`last_probed` timestamps actually advanced to the run time, with `http_status`/
+  `http_title`/`response_hash`/`content_length` genuinely re-fetched. The IP asset
+  (`104.20.23.154`, a Cloudflare edge IP) shows `validation_sources.method:
+  "asset_revalidation_ip_rdap_asn_tcp"` with `tcp_ports_checked: 3, tcp_reachable_ports: 3` — the real TCP
+  recheck actually ran and found genuine connectivity, not an inherited stale count.
+- `npm run type-check` clean after the frontend type/pill changes; rebuilt and redeployed the frontend
+  container (production build, no hot reload) and confirmed `/dashboard/assets` still serves `200` with a
+  clean `Next.js ... Ready` boot log.
+
+## 2026-07-30 — Full ASM methodology audit (discovery, validation, vuln scanning); roadmap updated
+
+Requested review, ASM pipeline only (Bug Bounty pipeline explicitly excluded). Two research passes
+(data-collection/discovery methodology, asset-validation methodology) plus a synthesis of this session's
+own vuln-scanning/risk-engine work, covering: subdomain/IP/cloud/endpoint discovery breadth, liveness
+detection, wildcard-DNS handling, ownership/scope confidence, re-validation cadence, and exploit-intel
+freshness.
+
+**Two findings rated highest-severity** (not new code changes — this entry is the audit + roadmap
+update, no fix shipped yet): `workers/validation/asset_validation_worker.py`'s scheduled 24h
+re-validation never actually re-resolves DNS or re-probes HTTP — it recomputes a score off stale cached
+fields and stamps `last_verified_at = now` regardless, so a dead asset can look "freshly verified"
+indefinitely; and `backend/app/services/asset_validation.py`'s liveness detection treats any HTTP status
+code (including 404/500/503) as `alive`, with no soft-404/parked-domain/CDN-placeholder detection despite
+`response_hash`/`content_length` already being captured and unused for this. Also found: IP assets get
+`ownership_confidence: 0.65`/`alive`/`exposed` unconditionally at creation with no shared-hosting/CDN
+check, even though the needed `is_cdn` signal already exists in `enrichment_worker.py` and is simply
+never consulted; no automated IP/ASN footprint discovery independent of subdomain resolution; katana
+crawl depth defaults to 1 outside `deep_authorized`; wildcard DNS detection is a 3-probe apex-only sample
+that can miss round-robin setups.
+
+### Docs
+- **`docs/PRD.md` §11**: replaced the stale roadmap section with a 4-phase prioritized roadmap from this
+  audit (validation correctness → IP ownership confidence → discovery breadth → exploit-intel freshness),
+  moved dependency/CVE remediation from "deferred" to "done" (it shipped 2026-07-29/30 but the doc still
+  said otherwise), and updated the platform self-security item to reflect that 2 of the original 3 issues
+  are now resolved/ruled-out, only the SMTP env-var gap remains open.
+
 ## 2026-07-30 — Finding dedup fingerprint ignored URL trailing-slash/casing; migrated production data to fix it
 
 Last item from the "core scanning/detection maturity" finding-validity investigation. Approved by the user

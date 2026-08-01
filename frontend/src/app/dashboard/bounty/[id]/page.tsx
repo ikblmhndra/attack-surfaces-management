@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { useParams, useRouter } from "next/navigation";
 import {
   ArrowLeft, ShieldCheck, PauseCircle, Play, Trash2, Plus, X, Loader2,
@@ -471,6 +471,389 @@ function SummaryTab({ programId, programName }: { programId: string; programName
 
 // ── Scope tab ─────────────────────────────────────────────────
 
+// The full module set exploit_worker.py::ALL_MODULES runs by default when
+// exploit_modules is unset -- mirrored here so the checkboxes' "everything
+// checked" state actually matches what the pipeline does with no override.
+const EXPLOIT_MODULES = [
+  "xss", "sqli", "ssrf", "lfi", "idor", "csrf",
+  "ssti", "nosql", "jsonbody", "oauth", "bac", "upload", "jwt",
+] as const;
+const NUCLEI_SEVERITIES = ["critical", "high", "medium", "low", "info"] as const;
+// Off by default (BOUNTY_DEFAULT_EXCLUDED_TAGS in vulnscan_worker.py) -- only
+// re-included via allowed_extra_tags, never a blanket global.
+const EXTRA_NUCLEI_TAGS = ["dos", "destructive", "unsafe"] as const;
+
+function toDatetimeLocal(iso?: string): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function omitEmpty(d: Record<string, any>, key: string, value: any): Record<string, any> {
+  const isEmpty = value === "" || value === undefined || value === null || (Array.isArray(value) && value.length === 0);
+  if (isEmpty) {
+    const { [key]: _omit, ...rest } = d;
+    return rest;
+  }
+  return { ...d, [key]: value };
+}
+
+function FieldLabel({ children, hint }: { children: ReactNode; hint?: string }) {
+  return (
+    <label className="block text-xs font-medium text-muted-foreground mb-1" title={hint}>
+      {children}
+    </label>
+  );
+}
+
+const roeInputCls = "w-full bg-surface-800 border border-border rounded-lg px-3 py-1.5 text-sm text-foreground font-mono focus:outline-none focus:border-rose-500/50 transition-colors";
+
+function RulesOfEngagementEditor({ program, onChange }: { program: any; onChange: () => void }) {
+  const savedRoe = program.rules_of_engagement || {};
+  const [programId, setProgramId] = useState(program.id);
+  const [draft, setDraft] = useState<Record<string, any>>(savedRoe);
+  const [rawMode, setRawMode] = useState(false);
+  const [rawText, setRawText] = useState(() => JSON.stringify(savedRoe, null, 2));
+  const [rawError, setRawError] = useState<string | null>(null);
+  const [fieldsError, setFieldsError] = useState<string | null>(null);
+  const [fieldsText, setFieldsText] = useState(() => JSON.stringify(savedRoe.idor_registration_fields || {}, null, 2));
+
+  // Reset local edit buffers when switching to a different program -- derived
+  // state during render (React's own recommended pattern) rather than a
+  // useEffect, so there's no stale-draft flash from another program's data.
+  if (program.id !== programId) {
+    setProgramId(program.id);
+    setDraft(savedRoe);
+    setRawText(JSON.stringify(savedRoe, null, 2));
+    setFieldsText(JSON.stringify(savedRoe.idor_registration_fields || {}, null, 2));
+    setRawError(null);
+    setFieldsError(null);
+  }
+
+  const save = useMutation({
+    mutationFn: (roe: Record<string, any>) => bountyAPI.updateProgram(program.id, { rules_of_engagement: roe }),
+    onSuccess: () => { onChange(); toast.success("Rules of engagement updated"); },
+    onError: (e: any) => toast.error(e?.response?.data?.detail || "Failed"),
+  });
+
+  const set = (key: string, value: any) => setDraft((d) => omitEmpty(d, key, value));
+
+  const toggleInList = (key: string, value: string, allValues: readonly string[]) => {
+    setDraft((d) => {
+      const current: string[] = d[key] ?? [...allValues];
+      const next = current.includes(value) ? current.filter((v) => v !== value) : [...current, value];
+      return next.length === allValues.length ? omitEmpty(d, key, undefined) : { ...d, [key]: next };
+    });
+  };
+
+  const handleSave = () => {
+    if (rawMode) {
+      try {
+        const parsed = JSON.parse(rawText);
+        setRawError(null);
+        setDraft(parsed);
+        save.mutate(parsed);
+      } catch {
+        setRawError("Invalid JSON — fix before saving.");
+      }
+      return;
+    }
+    save.mutate(draft);
+  };
+
+  const applyFieldsText = (text: string) => {
+    setFieldsText(text);
+    try {
+      const parsed = JSON.parse(text);
+      setFieldsError(null);
+      set("idor_registration_fields", parsed);
+    } catch {
+      setFieldsError("Invalid JSON");
+    }
+  };
+
+  const modules: string[] = draft.exploit_modules ?? [...EXPLOIT_MODULES];
+  const severities: string[] = draft.nuclei_severities ?? [...NUCLEI_SEVERITIES];
+  const extraTags: string[] = draft.allowed_extra_tags ?? [];
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-2">
+        <h3 className="text-sm font-semibold text-foreground flex items-center gap-1.5">
+          <SlidersHorizontal className="w-3.5 h-3.5 text-muted-foreground" /> Rules of Engagement
+        </h3>
+        <button
+          onClick={() => {
+            if (!rawMode) setRawText(JSON.stringify(draft, null, 2));
+            setRawMode((v) => !v);
+          }}
+          className="text-xs text-muted-foreground hover:text-foreground underline underline-offset-2"
+        >
+          {rawMode ? "Back to form" : "Edit as raw JSON"}
+        </button>
+      </div>
+      <p className="text-xs text-muted-foreground mb-3">
+        Per-program aggressiveness dials read by the workers at execution time. Conservative by default;
+        every capability below is opt-in — leaving a field empty keeps the safe default.
+      </p>
+
+      {rawMode ? (
+        <div className="space-y-2">
+          <textarea
+            value={rawText}
+            onChange={(e) => { setRawText(e.target.value); setRawError(null); }}
+            rows={16}
+            spellCheck={false}
+            className={cn(roeInputCls, "resize-y")}
+          />
+          {rawError && <p className="text-xs text-critical">{rawError}</p>}
+        </div>
+      ) : (
+        <div className="space-y-5">
+          <div>
+            <h4 className="text-xs font-semibold text-foreground mb-2 uppercase tracking-wide">Authentication</h4>
+            <p className="text-[11px] text-muted-foreground mb-2">
+              Log in once as a test account and carry the session through recon/vulnscan/exploit — without
+              this, testing only ever sees the slice of the app that doesn&apos;t require a login.
+            </p>
+            <div className="grid grid-cols-2 gap-2">
+              <div className="col-span-2">
+                <FieldLabel>Login URL</FieldLabel>
+                <input className={roeInputCls} placeholder="https://target/rest/user/login"
+                  value={draft.auth_login_url || ""} onChange={(e) => set("auth_login_url", e.target.value)} />
+              </div>
+              <div>
+                <FieldLabel>Email / username</FieldLabel>
+                <input className={roeInputCls} value={draft.auth_email || ""} onChange={(e) => set("auth_email", e.target.value)} />
+              </div>
+              <div>
+                <FieldLabel>Password</FieldLabel>
+                <input className={roeInputCls} type="password" value={draft.auth_password || ""} onChange={(e) => set("auth_password", e.target.value)} />
+              </div>
+              <div>
+                <FieldLabel hint="JSON body field name for the identifier, default 'email'">Email field name</FieldLabel>
+                <input className={roeInputCls} placeholder="email" value={draft.auth_email_field || ""} onChange={(e) => set("auth_email_field", e.target.value)} />
+              </div>
+              <div>
+                <FieldLabel hint="JSON body field name for the password, default 'password'">Password field name</FieldLabel>
+                <input className={roeInputCls} placeholder="password" value={draft.auth_password_field || ""} onChange={(e) => set("auth_password_field", e.target.value)} />
+              </div>
+            </div>
+          </div>
+
+          <div>
+            <h4 className="text-xs font-semibold text-foreground mb-2 uppercase tracking-wide">Exploit modules</h4>
+            <p className="text-[11px] text-muted-foreground mb-2">All 13 modules run by default — uncheck to narrow.</p>
+            <div className="flex flex-wrap gap-1.5">
+              {EXPLOIT_MODULES.map((m) => (
+                <button key={m} onClick={() => toggleInList("exploit_modules", m, EXPLOIT_MODULES)}
+                  className={cn(
+                    "text-[11px] px-2 py-1 rounded border font-mono transition-colors",
+                    modules.includes(m)
+                      ? "text-emerald-400 bg-emerald-500/10 border-emerald-500/30"
+                      : "text-muted-foreground bg-surface-800 border-border",
+                  )}>
+                  {m}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <h4 className="text-xs font-semibold text-foreground mb-2 uppercase tracking-wide">SQLi intensity</h4>
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <FieldLabel>sqlmap level (1-5)</FieldLabel>
+                  <input className={roeInputCls} type="number" min={1} max={5}
+                    value={draft.sqlmap_level ?? ""} placeholder="1"
+                    onChange={(e) => set("sqlmap_level", e.target.value ? Math.max(1, Math.min(5, Number(e.target.value))) : undefined)} />
+                </div>
+                <div>
+                  <FieldLabel>sqlmap risk (1-3)</FieldLabel>
+                  <input className={roeInputCls} type="number" min={1} max={3}
+                    value={draft.sqlmap_risk ?? ""} placeholder="1"
+                    onChange={(e) => set("sqlmap_risk", e.target.value ? Math.max(1, Math.min(3, Number(e.target.value))) : undefined)} />
+                </div>
+              </div>
+            </div>
+            <div>
+              <h4 className="text-xs font-semibold text-foreground mb-2 uppercase tracking-wide">SSRF confirmation</h4>
+              <FieldLabel hint="An interactsh/collaborator host you control -- SSRF stays a no-op without this">OOB domain</FieldLabel>
+              <input className={roeInputCls} placeholder="your-oob.interact.sh" value={draft.oob_domain || ""} onChange={(e) => set("oob_domain", e.target.value)} />
+            </div>
+          </div>
+
+          <div>
+            <h4 className="text-xs font-semibold text-foreground mb-2 uppercase tracking-wide">Two-identity IDOR</h4>
+            <p className="text-[11px] text-muted-foreground mb-2">
+              Registers a second, disposable test account and compares its access against the primary
+              identity&apos;s — a real capability increase (it creates a real account), not a passive check.
+            </p>
+            <div className="space-y-2">
+              <div>
+                <FieldLabel>Registration URL</FieldLabel>
+                <input className={roeInputCls} placeholder="https://target/api/Users" value={draft.idor_registration_url || ""} onChange={(e) => set("idor_registration_url", e.target.value)} />
+              </div>
+              <div>
+                <FieldLabel hint="JSON template -- {email}/{password} are substituted for the generated second identity">Registration payload template (JSON)</FieldLabel>
+                <textarea className={cn(roeInputCls, "resize-y")} rows={4} spellCheck={false}
+                  value={fieldsText} onChange={(e) => applyFieldsText(e.target.value)} />
+                {fieldsError && <p className="text-xs text-critical mt-1">{fieldsError}</p>}
+              </div>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <input type="checkbox" id="stored_xss_test" checked={!!draft.stored_xss_test}
+              onChange={(e) => set("stored_xss_test", e.target.checked || undefined)}
+              className="w-4 h-4 accent-rose-600" />
+            <label htmlFor="stored_xss_test" className="text-sm text-foreground">
+              Stored-XSS testing <span className="text-muted-foreground">(fills &amp; submits a real form field on the target — creates visible content)</span>
+            </label>
+          </div>
+
+          <div className="p-3 rounded-lg border border-amber-500/30 bg-amber-500/5 space-y-4">
+            <div>
+              <h4 className="text-xs font-semibold text-amber-400 mb-1 uppercase tracking-wide flex items-center gap-1.5">
+                <AlertTriangle className="w-3.5 h-3.5" /> Aggressive testing (opt-in only)
+              </h4>
+              <p className="text-[11px] text-muted-foreground">
+                Off by default and deliberately separate from the module chips above — each of these
+                either really executes something on the target, sends a real burst of repeated requests,
+                or triggers a real flow. Only turn these on for a program you&apos;ve discussed this with.
+              </p>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <input type="checkbox" id="cmdi_test" checked={!!draft.cmdi_test}
+                onChange={(e) => set("cmdi_test", e.target.checked || undefined)}
+                className="w-4 h-4 accent-amber-500" />
+              <label htmlFor="cmdi_test" className="text-sm text-foreground">
+                OS command injection <span className="text-muted-foreground">(non-destructive: timing/echo-marker probes only, never reads/writes/deletes anything — but a working hit does execute a real command)</span>
+              </label>
+            </div>
+
+            <div>
+              <div className="flex items-center gap-2 mb-2">
+                <input type="checkbox" id="brute_force_test" checked={!!draft.brute_force_test}
+                  onChange={(e) => set("brute_force_test", e.target.checked || undefined)}
+                  className="w-4 h-4 accent-amber-500" />
+                <label htmlFor="brute_force_test" className="text-sm text-foreground">
+                  Login rate-limit / lockout test <span className="text-muted-foreground">(sends repeated failed logins against a fake, never-registered email — never your real test account)</span>
+                </label>
+              </div>
+              {draft.brute_force_test && (
+                <div className="max-w-[200px] ml-6">
+                  <FieldLabel>Attempts (5–50)</FieldLabel>
+                  <input className={roeInputCls} type="number" min={5} max={50} placeholder="15"
+                    value={draft.brute_force_test_attempts ?? ""}
+                    onChange={(e) => set("brute_force_test_attempts", e.target.value ? Math.max(5, Math.min(50, Number(e.target.value))) : undefined)} />
+                </div>
+              )}
+            </div>
+
+            <div>
+              <FieldLabel hint="Requests a reset for auth_email and checks two things: whether the API response itself leaks the token, and whether it reflects an attacker-controlled Host/X-Forwarded-Host header back into a generated link (host-header poisoning). Never completes a reset, your test account's password is never touched">Password-reset checks (token leak + host-header poisoning) — reset endpoint URL</FieldLabel>
+              <input className={roeInputCls} placeholder="https://target/api/auth/forgot-password" value={draft.password_reset_url || ""} onChange={(e) => set("password_reset_url", e.target.value)} />
+              <p className="text-[11px] text-muted-foreground mt-1">Leave empty to skip — uses the Authentication email above, read-only (no reset is ever completed).</p>
+            </div>
+
+            <div>
+              <FieldLabel hint="Fires N identical requests at this exact endpoint as close to simultaneously as possible and reports if more than one succeeded — only meaningful for an action that should be single-use/quantity-limited (coupon redemption, one-time claim, balance transfer, limited-stock purchase). Always reported inconclusive, never confirmed — the pipeline can't judge business-logic impact on its own, that's for you to verify manually. Needs a specific endpoint you already suspect; there's no generic way to discover one">Race-condition / TOCTOU probe — target endpoint URL</FieldLabel>
+              <input className={roeInputCls} placeholder="https://target/api/coupon/redeem" value={draft.race_condition_url || ""} onChange={(e) => set("race_condition_url", e.target.value)} />
+              {draft.race_condition_url && (
+                <div className="grid grid-cols-2 gap-2 mt-2 max-w-sm">
+                  <div>
+                    <FieldLabel>Method</FieldLabel>
+                    <select className={roeInputCls} value={draft.race_condition_method || "POST"}
+                      onChange={(e) => set("race_condition_method", e.target.value)}>
+                      {["GET", "POST", "PUT", "PATCH", "DELETE"].map((m) => <option key={m} value={m}>{m}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <FieldLabel>Concurrent attempts (5–50)</FieldLabel>
+                    <input className={roeInputCls} type="number" min={5} max={50} placeholder="15"
+                      value={draft.race_condition_attempts ?? ""}
+                      onChange={(e) => set("race_condition_attempts", e.target.value ? Math.max(5, Math.min(50, Number(e.target.value))) : undefined)} />
+                  </div>
+                </div>
+              )}
+              <p className="text-[11px] text-muted-foreground mt-1">Leave empty to skip. Needs a JSON request body? Use the raw-JSON mode above to set <code>race_condition_body</code> directly.</p>
+            </div>
+          </div>
+
+          <div>
+            <h4 className="text-xs font-semibold text-foreground mb-2 uppercase tracking-wide">Testing window</h4>
+            <p className="text-[11px] text-muted-foreground mb-2">
+              Every stage checks this before running and skips outside the window. Leave both empty for
+              unrestricted (default).
+            </p>
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <FieldLabel>Starts</FieldLabel>
+                <input className={roeInputCls} type="datetime-local" value={toDatetimeLocal(draft.testing_window_start)}
+                  onChange={(e) => set("testing_window_start", e.target.value ? new Date(e.target.value).toISOString() : undefined)} />
+              </div>
+              <div>
+                <FieldLabel>Ends</FieldLabel>
+                <input className={roeInputCls} type="datetime-local" value={toDatetimeLocal(draft.testing_window_end)}
+                  onChange={(e) => set("testing_window_end", e.target.value ? new Date(e.target.value).toISOString() : undefined)} />
+              </div>
+            </div>
+          </div>
+
+          <div>
+            <h4 className="text-xs font-semibold text-foreground mb-2 uppercase tracking-wide">Nuclei tuning</h4>
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <FieldLabel>Severities</FieldLabel>
+                <div className="flex flex-wrap gap-1.5">
+                  {NUCLEI_SEVERITIES.map((s) => (
+                    <button key={s} onClick={() => toggleInList("nuclei_severities", s, NUCLEI_SEVERITIES)}
+                      className={cn("text-[11px] px-2 py-1 rounded border capitalize transition-colors",
+                        severities.includes(s) ? SEV_CLS[s] + " bg-surface-800 border-border" : "text-muted-foreground bg-surface-800 border-border opacity-50")}>
+                      {s}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <FieldLabel hint="Off by default -- dos/destructive templates can disrupt the target">Extra tags (off by default)</FieldLabel>
+                <div className="flex flex-wrap gap-1.5">
+                  {EXTRA_NUCLEI_TAGS.map((t) => (
+                    <button key={t} onClick={() => setDraft((d) => {
+                      const has = extraTags.includes(t);
+                      const next = has ? extraTags.filter((v) => v !== t) : [...extraTags, t];
+                      return omitEmpty(d, "allowed_extra_tags", next);
+                    })}
+                      className={cn("text-[11px] px-2 py-1 rounded border font-mono transition-colors",
+                        extraTags.includes(t) ? "text-critical bg-critical/10 border-critical/30" : "text-muted-foreground bg-surface-800 border-border")}>
+                      {t}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+            <div className="mt-2 max-w-[200px]">
+              <FieldLabel>Rate limit (req/s)</FieldLabel>
+              <input className={roeInputCls} type="number" min={1} placeholder="100"
+                value={draft.rate_limit_rps ?? ""} onChange={(e) => set("rate_limit_rps", e.target.value ? Number(e.target.value) : undefined)} />
+            </div>
+          </div>
+        </div>
+      )}
+
+      <button onClick={handleSave} disabled={save.isPending}
+        className="mt-4 flex items-center gap-1.5 px-3 py-2 rounded-lg bg-rose-600 hover:bg-rose-500 disabled:opacity-50 text-white text-sm font-medium transition-colors">
+        {save.isPending && <Loader2 className="w-3.5 h-3.5 animate-spin" />} Save rules of engagement
+      </button>
+    </div>
+  );
+}
+
 function ScopeTab({ program, onChange }: { program: any; onChange: () => void }) {
   const [pattern, setPattern] = useState("");
   const [ptype, setPtype] = useState("domain");
@@ -490,8 +873,6 @@ function ScopeTab({ program, onChange }: { program: any; onChange: () => void })
     setPattern("");
   };
   const removeRule = (idx: number) => save.mutate(rules.filter((_, i) => i !== idx));
-
-  const roe = program.rules_of_engagement || {};
 
   return (
     <div className="space-y-5">
@@ -540,19 +921,7 @@ function ScopeTab({ program, onChange }: { program: any; onChange: () => void })
         </div>
       </div>
 
-      <div>
-        <h3 className="text-sm font-semibold text-foreground mb-2 flex items-center gap-1.5"><SlidersHorizontal className="w-3.5 h-3.5 text-muted-foreground" /> Rules of Engagement</h3>
-        <p className="text-xs text-muted-foreground mb-2">
-          Per-program aggressiveness dials read by the workers. Conservative by default; escalation is
-          always explicit. (Edit via API / config — shown here read-only.)
-        </p>
-        <pre className="text-xs text-muted-foreground bg-surface-900 border border-border rounded-lg p-3 overflow-x-auto">
-          {JSON.stringify(Object.keys(roe).length ? roe : {
-            exploit_modules: ["xss", "lfi", "csrf", "idor"],
-            sqlmap_level: 1, sqlmap_risk: 1,
-          }, null, 2)}
-        </pre>
-      </div>
+      <RulesOfEngagementEditor program={program} onChange={onChange} />
     </div>
   );
 }
@@ -945,18 +1314,42 @@ function ReconTab({ programId, onChange }: { programId: string; onChange: () => 
 
 // ── Findings tab ──────────────────────────────────────────────
 
+const TRIAGE_LABELS: Record<string, string> = {
+  false_positive: "False positive", duplicate: "Duplicate", wont_fix: "Won't fix",
+};
+
 function FindingsTab({ programId }: { programId: string }) {
+  const qc = useQueryClient();
+  const [showDismissed, setShowDismissed] = useState(false);
+  // Always fetch everything (including dismissed) and filter client-side --
+  // fetching only when the "show dismissed" toggle is off would mean the
+  // dismissed count itself is unknowable in that state (the server-filtered
+  // response structurally never contains dismissed rows), which previously
+  // showed a permanently-stuck "Dismissed 0" chip regardless of how many
+  // were actually dismissed.
   const { data } = useQuery({
     queryKey: ["bounty-findings", programId],
-    queryFn: () => bountyAPI.listFindings(programId, { page_size: 200 }).then((r) => r.data),
+    queryFn: () => bountyAPI.listFindings(programId, { page_size: 200, include_dismissed: true }).then((r) => r.data),
   });
-  const findings: any[] = data?.items || [];
+  const allFindings: any[] = data?.items || [];
+  const findings = showDismissed ? allFindings : allFindings.filter((f) => !f.triage_status);
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState<"all" | "confirmed" | "inconclusive">("all");
   const [sev, setSev] = useState<"all" | "critical" | "high" | "medium" | "low" | "info">("all");
 
+  const triage = useMutation({
+    mutationFn: ({ findingId, triageStatus }: { findingId: string; triageStatus: string | null }) =>
+      bountyAPI.triageFinding(programId, findingId, triageStatus),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["bounty-findings", programId] });
+      toast.success("Finding updated");
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.detail || "Failed"),
+  });
+
   const confirmedCount = findings.filter((f) => f.status === "confirmed").length;
   const inconclusiveCount = findings.filter((f) => f.status === "inconclusive").length;
+  const dismissedCount = allFindings.filter((f) => f.triage_status).length;
 
   const q = query.trim().toLowerCase();
   const filtered = findings.filter((f) =>
@@ -965,7 +1358,7 @@ function FindingsTab({ programId }: { programId: string }) {
     (!q || f.technique?.toLowerCase().includes(q) || f.evidence?.target_url?.toLowerCase().includes(q)),
   );
 
-  if (findings.length === 0) {
+  if (allFindings.length === 0) {
     return <EmptyState icon={Bug} label="No findings yet. Run Vuln Scan or Exploit stages." />;
   }
 
@@ -976,6 +1369,9 @@ function FindingsTab({ programId }: { programId: string }) {
         <FilterChip active={status === "all"} onClick={() => setStatus("all")}>All <span className="opacity-60 ml-0.5">{findings.length}</span></FilterChip>
         <FilterChip active={status === "confirmed"} onClick={() => setStatus("confirmed")}>Confirmed <span className="opacity-60 ml-0.5">{confirmedCount}</span></FilterChip>
         <FilterChip active={status === "inconclusive"} onClick={() => setStatus("inconclusive")}>Candidate <span className="opacity-60 ml-0.5">{inconclusiveCount}</span></FilterChip>
+        <FilterChip active={showDismissed} onClick={() => setShowDismissed((v) => !v)}>
+          Dismissed {showDismissed ? "shown" : "hidden"} <span className="opacity-60 ml-0.5">{dismissedCount}</span>
+        </FilterChip>
       </div>
       <div className="flex flex-wrap items-center gap-2">
         {(["all", "critical", "high", "medium", "low", "info"] as const).map((s) => (
@@ -990,7 +1386,10 @@ function FindingsTab({ programId }: { programId: string }) {
         {filtered.length === 0 ? (
           <EmptyState icon={SearchX} label="No findings match your filters." />
         ) : filtered.map((f) => (
-          <div key={f.id} className={cn("p-3 rounded-lg bg-surface-900 border border-border", LIFT, "hover:border-rose-500/25")}>
+          <div key={f.id} className={cn(
+            "p-3 rounded-lg bg-surface-900 border border-border", LIFT, "hover:border-rose-500/25",
+            f.triage_status && "opacity-50",
+          )}>
             <div className="flex items-center gap-2 flex-wrap">
               <span className={cn("w-1.5 h-1.5 rounded-full flex-shrink-0", SEV_BAR_CLS[f.severity] || "bg-info")} />
               <span className="text-xs uppercase font-semibold text-muted-foreground">{f.module}</span>
@@ -998,12 +1397,31 @@ function FindingsTab({ programId }: { programId: string }) {
               <span className={cn("text-[11px] px-1.5 py-0.5 rounded border font-medium", STATUS_CLS[f.status] || STATUS_CLS.blocked)}>
                 {f.status}
               </span>
+              {f.occurrence_count > 1 && (
+                <span className="text-[11px] text-muted-foreground" title={`First seen ${f.executed_at}, last seen ${f.last_seen_at}`}>
+                  seen {f.occurrence_count}×
+                </span>
+              )}
               <span className="text-sm text-foreground font-mono flex-1 truncate">{f.technique}</span>
+              <select
+                value={f.triage_status || ""}
+                onChange={(e) => triage.mutate({ findingId: f.id, triageStatus: e.target.value || null })}
+                className="text-[11px] bg-surface-800 border border-border rounded px-1.5 py-1 text-muted-foreground flex-shrink-0"
+                title="Triage status"
+              >
+                <option value="">Untriaged</option>
+                <option value="false_positive">False positive</option>
+                <option value="duplicate">Duplicate</option>
+                <option value="wont_fix">Won&apos;t fix</option>
+              </select>
             </div>
             {f.evidence?.target_url && (
               <p className="text-xs text-muted-foreground font-mono mt-1.5 truncate flex items-center gap-1.5">
                 <ExternalLink className="w-3 h-3 flex-shrink-0 opacity-60" /> {f.evidence.target_url}
               </p>
+            )}
+            {f.triage_status && (
+              <p className="text-[11px] text-amber-400 mt-1">Marked {TRIAGE_LABELS[f.triage_status] || f.triage_status}</p>
             )}
           </div>
         ))}

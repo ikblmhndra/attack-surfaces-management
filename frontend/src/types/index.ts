@@ -143,7 +143,7 @@ export interface Asset {
   ownership_confidence?: number;
   ownership_reason?: string;
   exposure_status?: "exposed" | "limited" | "not_exposed" | "unknown" | "unknown_http";
-  liveness_status?: "alive" | "dns_only" | "unresolved" | "unknown";
+  liveness_status?: "alive" | "dns_only" | "unresolved" | "unknown" | "parked";
   validation_sources?: Record<string, any>;
   last_verified_at?: string;
   review_status?:    "none" | "pending" | "approved" | "rejected";

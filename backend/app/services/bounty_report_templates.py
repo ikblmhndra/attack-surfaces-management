@@ -154,6 +154,127 @@ MODULE_META: Dict[str, Dict[str, str]] = {
             "HTTP method and route variant, deny-by-default."
         ),
     },
+    "headers": {
+        "label": "Missing/Misconfigured Security Header",
+        "impact": (
+            "A defensive security header is missing or misconfigured -- review the specific "
+            "technique below for exactly which header/protection this affects and its real "
+            "impact on this endpoint (e.g. clickjacking, SSL-stripping, MIME-sniffing)."
+        ),
+        "remediation": (
+            "Set the affected header(s) on every relevant response, ideally at a shared "
+            "middleware/reverse-proxy layer rather than per-route, so new endpoints inherit it "
+            "by default."
+        ),
+    },
+    "exposure": {
+        "label": "Sensitive File / Information Exposure",
+        "impact": (
+            "A file that should not be publicly reachable was retrieved directly -- depending on "
+            "its content this can disclose source code, credentials, environment configuration, "
+            "or internal infrastructure details. Confirm exactly what the file contains before "
+            "reporting; treat it as sensitive and avoid re-downloading/sharing it beyond what's "
+            "needed to prove the issue."
+        ),
+        "remediation": (
+            "Remove the file from the publicly-served directory (or block access to it at the "
+            "web server/reverse-proxy level) and rotate any credentials it may have exposed."
+        ),
+    },
+    "upload": {
+        "label": "Unrestricted File Upload / XXE",
+        "impact": (
+            "A file upload endpoint accepted a file type it shouldn't have, or processed an "
+            "attacker-supplied XML payload in a way that read a local file back -- review the "
+            "specific technique below for exactly what was observed and its real impact."
+        ),
+        "remediation": (
+            "Validate uploaded file type/content server-side against an explicit allowlist (not just "
+            "the client-supplied extension/MIME type), store uploads outside the webroot with "
+            "randomised names, and disable external entity resolution in any XML parser."
+        ),
+    },
+    "jwt": {
+        "label": "JWT / Token Weakness",
+        "impact": (
+            "A JSON Web Token issued by this application has a structural weakness -- review the "
+            "specific technique below (algorithm confusion, accepted `alg: none`, weak/guessable "
+            "signing secret) for the exact issue and how it can be abused to forge a valid token."
+        ),
+        "remediation": (
+            "Validate JWTs with an explicit signature-algorithm allowlist server-side (never trust "
+            "the `alg` header from the token itself), reject `alg: none` outright, and use a long, "
+            "high-entropy signing secret (or asymmetric keys) that can't be brute-forced or guessed."
+        ),
+    },
+    "redirect": {
+        "label": "Open Redirect",
+        "impact": (
+            "A redirect parameter accepts a fully-qualified attacker-controlled URL and sends the "
+            "browser there -- useful for phishing (a link that appears to start on this trusted "
+            "domain) and can strengthen OAuth/SSO token-theft attacks if the redirect target is "
+            "reachable from an authorization flow."
+        ),
+        "remediation": (
+            "Validate redirect targets against an explicit allowlist of paths/domains server-side; "
+            "never redirect to a raw, attacker-controlled URL parameter."
+        ),
+    },
+    "cmdi": {
+        "label": "OS Command Injection",
+        "impact": (
+            "User-controlled input reaches a shell/OS command execution point -- depending on the "
+            "application's privileges this can lead to full remote code execution on the host."
+        ),
+        "remediation": (
+            "Never pass user input to a shell/exec call. Use language-native APIs (not shell "
+            "commands) for the underlying operation, or at minimum a strict allowlist with no shell "
+            "metacharacters, and run the process with least-privilege."
+        ),
+    },
+    "bruteforce": {
+        "label": "Missing Login Rate-Limiting / Account Lockout",
+        "impact": (
+            "The login endpoint has no observable throttling or lockout after repeated failed "
+            "attempts -- an attacker can attempt credential-stuffing or password-guessing at "
+            "whatever rate the network allows, with no built-in resistance from the application."
+        ),
+        "remediation": (
+            "Add rate-limiting and/or progressive delays per account/IP on the login endpoint, "
+            "lock out or step up authentication (CAPTCHA/MFA) after a threshold of failed attempts, "
+            "and alert on anomalous login-attempt volume."
+        ),
+    },
+    "passwordreset": {
+        "label": "Password-Reset Flow Weakness",
+        "impact": (
+            "The password-reset flow has a weakness in how it issues or protects the reset token -- "
+            "review the specific technique below (token leaked directly in the API response, or not "
+            "randomized per request) for the exact issue. Either allows an attacker who can merely "
+            "trigger a reset for a victim's email to take over the account without ever touching "
+            "that inbox."
+        ),
+        "remediation": (
+            "Only ever deliver the reset token via the verified out-of-band channel (email/SMS), "
+            "never in the triggering API's own response; generate it fresh with a cryptographically "
+            "random value on every request; invalidate it after first use or a short expiry."
+        ),
+    },
+    "race": {
+        "label": "Possible Race Condition (TOCTOU)",
+        "impact": (
+            "Multiple concurrent identical requests to this endpoint all succeeded, which is only a "
+            "real bug if the endpoint is meant to be single-use or quantity-limited (e.g. a "
+            "redeem-once coupon, a one-time claim, a balance transfer, limited-stock purchase). This "
+            "is a concurrency probe, not a business-logic verifier -- confirm manually whether the "
+            "underlying resource was actually consumed/credited more than once before reporting."
+        ),
+        "remediation": (
+            "Serialize the critical section with a database-level lock/unique constraint or an "
+            "atomic compare-and-swap operation instead of a read-then-write check, so concurrent "
+            "requests can't both pass the same 'is this still available' check before either commits."
+        ),
+    },
     "nuclei": {
         "label": "Vulnerability / Misconfiguration (nuclei)",
         "impact": (
@@ -239,6 +360,24 @@ TECHNIQUE_META: Dict[str, Dict[str, str]] = {
             "id in the request, not just that they're logged in."
         ),
     },
+    "host-header-poisoning-password-reset": {
+        "label": "Host Header Poisoning — Password Reset",
+        "impact": (
+            "The password-reset endpoint trusts a client-supplied Host/X-Forwarded-Host header when "
+            "building content in its response (confirmed: an injected, attacker-chosen host value was "
+            "reflected back). If the real reset link sent by email is built the same way, an attacker "
+            "can trigger a reset for a victim's email with a poisoned host header so the victim's "
+            "email arrives containing a link to an attacker-controlled domain, capturing the reset "
+            "token when clicked -- a full account-takeover path that needs no access to the victim's "
+            "inbox beyond them clicking the link they received."
+        ),
+        "remediation": (
+            "Never build absolute URLs (especially ones sent to users, like reset links) from a "
+            "client-supplied Host/X-Forwarded-Host header. Use a server-side configured canonical "
+            "domain instead, and validate/allowlist the Host header at the edge (reverse proxy/load "
+            "balancer) regardless."
+        ),
+    },
     "bac-unauth-privileged": {
         "label": "Broken Access Control — Unauthenticated Access",
         "impact": (
@@ -301,7 +440,11 @@ def build_report(attempt: Dict[str, Any], target_value: str, program_name: str) 
 
     # Prefer the exact URL the module tested over the owning target's host, so
     # a finding on /file isn't reported as being on the host's /search target.
-    display_target = evidence.get("target_url") or evidence.get("matched_at") or target_value
+    # "url" is a second, equally-real key here (not a typo/legacy field) --
+    # vulnscan-stage checks in detect.py (sensitive-files, headers, CORS) key
+    # their evidence "url" rather than "target_url"; bounty_stage.py's dedup
+    # matcher and notify.py already fall back through both for this reason.
+    display_target = evidence.get("target_url") or evidence.get("url") or evidence.get("matched_at") or target_value
 
     title = f"{meta['label']} on {display_target}"
     param = evidence.get("param") or evidence.get("candidate_param")
@@ -339,7 +482,7 @@ _HANDLED_EVIDENCE_KEYS = {
 
 def _build_steps(technique: str, evidence: Dict[str, Any], target_value: str) -> str:
     lines = []
-    target_url = evidence.get("target_url") or target_value
+    target_url = evidence.get("target_url") or evidence.get("url") or target_value
 
     if technique == "sqli-auth-bypass":
         field = evidence.get("field", "email")

@@ -24,12 +24,13 @@ from sqlalchemy import select
 from app.services.bounty_report import PRIORITY_BUCKETS
 from app.services.bounty_scope import is_target_in_scope
 from app.services.scan_profiles import PROFILE_TEMPLATE_DIRS
-from workers.bounty.bounty_stage import BountyStageWorker
+from workers.bounty.bounty_stage import BountyStageWorker, persist_deduped_attempts
 from workers.bounty.detect import (
     CatchAllCache,
     check_403_bypass,
     check_cors,
     check_graphql_batching,
+    check_security_headers,
     check_sensitive_files,
     check_vulnerable_components,
     graphql_schema_scan,
@@ -37,7 +38,7 @@ from workers.bounty.detect import (
 from workers.bounty.notify import notify_critical_findings
 from workers.bounty.tools import login_and_get_token, run_nuclei, run_subzy
 from workers.db import get_session
-from workers.db_models import BountyAsset, BountyProgram, BountyTarget, ExploitAttempt
+from workers.db_models import BountyAsset, BountyProgram, BountyTarget
 from workers.scanner.scanner_common import host_from_target
 
 log = structlog.get_logger()
@@ -192,18 +193,15 @@ class BountyVulnscanWorker(BountyStageWorker):
             if attempt is not None:
                 nuclei_attempts.append(attempt)
         async with get_session() as db:
-            for attempt in nuclei_attempts:
-                db.add(ExploitAttempt(**attempt))
+            persisted = await persist_deduped_attempts(db, nuclei_attempts)
             await db.commit()
-        persisted = len(nuclei_attempts)
 
         # Phase-2 detection modules (sensitive-file exposure, CORS, 403 bypass)
         # on the in-scope targets + a sample of their in-scope recon URLs.
         detect_attempts = await self._run_detection(program_id, in_scope_targets, target_by_host, scope_rules, extra_headers)
         takeover_attempts = await self._run_takeover_check(program_id, target_by_host)
         async with get_session() as db:
-            for attempt in detect_attempts + takeover_attempts:
-                db.add(ExploitAttempt(**attempt))
+            await persist_deduped_attempts(db, detect_attempts + takeover_attempts)
             await db.commit()
 
         await notify_critical_findings(
@@ -313,6 +311,8 @@ class BountyVulnscanWorker(BountyStageWorker):
                 attempts.append(self._detect_attempt(program_id, tid, "exposure", f))
             for f in await check_cors(base, extra_headers=extra_headers):
                 attempts.append(self._detect_attempt(program_id, tid, "cors", f))
+            for f in await check_security_headers(base, extra_headers=extra_headers):
+                attempts.append(self._detect_attempt(program_id, tid, "headers", f))
         # CORS + 403-bypass on endpoint URLs. 403-bypass deliberately stays
         # unauthenticated -- it specifically measures what an anonymous caller
         # can reach, which a valid session would trivially (and misleadingly)

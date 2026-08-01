@@ -11,7 +11,7 @@ pipeline -- see CHANGELOG.md for the full design rationale.
 import uuid
 
 from sqlalchemy import (
-    Boolean, Column, DateTime, ForeignKey, String, Text, UniqueConstraint, func,
+    Boolean, Column, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import relationship, validates
@@ -149,6 +149,20 @@ class ExploitAttempt(TimestampMixin, Base):
 
     executed_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     executed_by = Column(UUID(as_uuid=True), nullable=True)
+
+    # Human triage, independent of `status` above (which is the pipeline's own
+    # confirmation verdict, never touched by a human). Null = untriaged/open.
+    # A dedup re-run (see workers/bounty/bounty_stage.py::persist_deduped_
+    # attempts) never sets or clears this itself -- only the PATCH endpoint
+    # does, so a human's "false positive" call is never silently reverted by
+    # the same finding simply reproducing on a later run.
+    triage_status = Column(String(20), nullable=True)  # false_positive, duplicate, wont_fix
+    # Bumped (not replaced) when a later run rediscovers the same finding
+    # (same program/target/module/technique/evidence-URL) instead of
+    # inserting another row -- see persist_deduped_attempts. executed_at
+    # above stays the *first* time this was seen.
+    last_seen_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    occurrence_count = Column(Integer, nullable=False, default=1, server_default="1")
 
     @validates("evidence")
     def _validate_evidence(self, key, value):

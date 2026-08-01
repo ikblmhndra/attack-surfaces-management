@@ -295,32 +295,100 @@ security, reliability, observability). Headline points:
 
 ## 11. Current priorities & roadmap
 
-As of the most recent internal roadmap discussion:
+**Core scanning/detection maturity stays the priority** over adjacent feature work — coverage, finding
+validity/triage correctness, exploit-intelligence accuracy (EPSS/KEV/SSVC), tool parameter tuning (rate
+limits, timeouts, concurrency, flags) over "is the tool wired at all." Benchmark for "proper" is Tenable's
+Attack Surface Management product (see §5) — not internal completeness.
 
-1. **Core scanning/detection maturity stays the priority** over adjacent feature work — coverage,
-   finding validity/triage correctness, exploit-intelligence accuracy (EPSS/KEV/SSVC), tool parameter
-   tuning (rate limits, timeouts, concurrency, flags) over "is the tool wired at all."
-2. **Deferred, explicitly not dropped**:
-   - Platform self-security issues found during an earlier full-repo assessment: **1 of the original 3
-     confirmed still open** — `worker-notification`'s `docker-compose.yml` environment block still omits
-     every `SMTP_*` var, so email notifications silently never send regardless of `.env` config;
-     deliberately not fixed yet since there's no real SMTP environment to verify delivery against in this
-     phase (dev-treated-as-prod) — revisit once real SMTP credentials exist. `POST /workspaces/invite`
-     (the second item) is **fixed** (2026-07-28) — generates a real signed invite JWT, returned in the
-     response (no email dependency), and `register()` now consumes `invite_token` to join the inviting
-     workspace at the granted role instead of always creating a new one; see
-     [API_REFERENCE.md](./API_REFERENCE.md) for the contract. The third item, a suspected cross-tenant
-     data leak, was **investigated exhaustively (2026-07-22) and not found** — every endpoint file, the
-     auth/JWT dependency layer, and the correlation worker's cross-org shared-IP query were all checked
-     and confirmed properly scoped by `workspace_id`. One related hardening nit surfaced during that
-     audit: `findings.py::bulk_action`'s bulk UPDATE statements don't re-assert `workspace_id` in their
-     own `WHERE` clause (only the pre-check SELECT does) — not currently exploitable, but inconsistent
-     with the defense-in-depth pattern used everywhere else; still on the list, low priority.
-   - Dependency/library CVE remediation — deferred until features are stable.
-3. **Frontend changes**: small display/readability fixes can proceed without asking; anything that
-   amounts to a visual revamp needs a heads-up first (this document included — see the Bug Bounty
-   dashboard redesign in `CHANGELOG.md`, 2026-07-21, for the pattern that was followed: mockup review
-   before implementation).
+### ASM methodology roadmap (from the 2026-07-30 self-audit)
+
+A full-repo review of the ASM pipeline's data-collection, validation, and vulnerability-scanning
+methodology (Bug Bounty pipeline explicitly excluded — separately scoped, see §6.2). Phased by
+impact, not by effort — Phase 1 items are prioritized first because they're places the platform
+*believes* it has current, validated data when it doesn't, which quietly undermines every downstream
+feature (risk scoring, notifications, dashboards) built on top of that data. Coverage gaps (Phase 3) are
+lower priority than correctness gaps (Phase 1-2) even though they're individually easier to fix.
+
+**Phase 1 — Validation is silently not validating — DONE (2026-07-30)**
+- Re-validation (`workers/validation/asset_validation_worker.py`) now runs a real batched `dnsx`+`httpx`
+  recheck before scoring (previously scored stale cached fields and stamped `last_verified_at = now`
+  regardless), and IP assets get a bounded real TCP connectivity check against previously-known open
+  ports instead of trusting a field this worker never updated.
+- Liveness detection gained a `"parked"` state (`classify_liveness_content()` in
+  `backend/app/services/asset_validation.py`) — a soft-404/CDN-placeholder/parked-domain page is no
+  longer indistinguishable from a real live service, via title-keyword matching and cross-asset
+  duplicate-response-hash detection. Excluded from scanning automatically (`SCANNABLE_LIVENESS_STATUSES`
+  is unchanged, already `{"alive"}` only). See `CHANGELOG.md` for full detail and live verification.
+
+**Phase 2 — Ownership confidence for network (IP) assets — DONE (2026-07-31)**
+- `workers/validation/asset_validation_worker.py::_validate_ip_asset` now reads `is_cdn` (already
+  computed by `enrichment_worker.py::_classify_provider`, previously unused) and caps
+  `ownership_confidence` at 0.35 for shared-CDN IPs (Cloudflare/Akamai/Fastly) — applied after
+  `merge_rdap_evidence`, which otherwise independently re-inflates confidence for almost any IP with ASN
+  data. See `CHANGELOG.md` for live verification. Two adjacent ideas scoped out after investigation, not
+  attempted: tightening CDN detection for CloudFront specifically isn't fixable by text-matching alone
+  (needs AWS's `ip-ranges.json`, a separate feature); excluding CDN IPs from active network-target
+  scanning would touch `scan_profiles.py`/`discovery_worker.py` (the hottest scan path) and has a real
+  ordering problem (a newly-discovered IP has no enrichment data yet when first targeted) — a bigger,
+  separately-scoped architectural change if revisited later.
+
+**Phase 3 — Discovery breadth — PARTIALLY DONE (2026-07-31)**
+- ~~Katana crawl depth defaults to 1 outside `deep_authorized`~~ — **disproven during investigation**:
+  directly computing the real effective scan config confirmed `scan_type="full"` always resolves
+  `crawl_depth=3` regardless of scan profile (`DEFAULT_SCAN_CONFIG["full"]` sets it before profile-merging
+  happens); only `"quick"` gets depth 1, deliberately. Not a real gap — dropped, not implemented.
+- IP/ASN footprint discovery: `discovery_worker.py::_discover_org_asns` now auto-suggests candidate ASNs
+  (for orgs that haven't manually entered any) via RIPEstat's free/keyless `searchcomplete` API, with a
+  conservative significant-word match filter to avoid generic-name false positives. Feeds the existing
+  candidate-only, never-auto-scanned pipeline at lower confidence than manually-entered ASNs. While
+  regression-testing this, found and fixed a real, load-bearing pre-existing bug: `_expand_asn_targets`'s
+  whois.cymru-based prefix lookup had returned **zero real prefixes for every ASN, manual or auto**, since
+  it was first built (Milestone 17) — it expected a 7-field per-prefix response but whois.cymru's bulk
+  protocol actually returns a 5-field ASN-info summary row for this query shape. Replaced with RIPEstat's
+  `announced-prefixes`/`as-overview` endpoints. See `CHANGELOG.md` for full live verification.
+- Wildcard DNS detection: probe count raised 3→6 (round-robin/load-balanced backends could go undetected
+  at 3 samples); `Subdomain.is_wildcard` (existed in the schema, never populated) now set for surviving
+  hosts whose DNS answer still matches the domain's wildcard fingerprint.
+- **Cloud discovery beyond storage buckets — investigated, deferred by decision (2026-07-31), not a gap
+  to silently fill later.** Serverless/API-gateway targets (AWS Lambda Function URLs, API Gateway default
+  domains, GCP Cloud Run) turned out to be un-guessable at all — each includes a random hash/ID with no
+  relation to the org's name, confirmed against their real URL shapes. Two options were found genuinely
+  feasible and live-tested (Docker Hub public org/repo discovery via its free keyless API; Azure Web App
+  name guessing, which reduces to a DNS-existence check since non-existent names simply don't resolve) —
+  the project owner chose not to build either right now. If revisited, the live-tested findings are the
+  starting point; no further feasibility research should be needed first.
+
+**Phase 4 — Exploit-intelligence freshness**
+- SSVC (`ssvc_exploitation`/`ssvc_automatable`, sourced from cve.circl.lu CVE records) is frozen into
+  `Finding.proof` at scan time and never refreshed, unlike EPSS/KEV which are refreshed daily by the
+  scheduler and re-queried live on every 4-hourly risk-compute run. Closing this needs a new scheduled
+  job (comparable in scope to `exploit_intel_refresh`) — a real feature addition, not a small fix;
+  explicitly deferred by the project owner (2026-07-30) rather than started reflexively.
+
+**Recently closed** (2026-07-30, same audit cycle, see `CHANGELOG.md` for full detail): unused nuclei
+`workflows/`/`network/misconfig` template categories wired in; naabu port-range silently falling back to
+top-100 for the `limited` profile; subdomain-takeover confidence dampening (plus an unrelated template-
+miscategorization bug caught while testing it); finding-fingerprint URL/casing normalization, including a
+verified, zero-collision production data migration.
+
+**Deferred, explicitly not dropped**:
+- Platform self-security: `worker-notification`'s `docker-compose.yml` environment block still omits
+  every `SMTP_*` var, so email notifications silently never send regardless of `.env` config — not fixed
+  yet since there's no real SMTP environment to verify delivery against in this phase (dev-treated-as-
+  prod); revisit once real SMTP credentials exist. (`POST /workspaces/invite` and the suspected cross-
+  tenant leak, the other two items from this same earlier assessment, are resolved/ruled-out — see
+  `CHANGELOG.md`, 2026-07-28/22.)
+- `findings.py::bulk_action`'s bulk UPDATE statements don't re-assert `workspace_id` in their own `WHERE`
+  clause (only the pre-check SELECT does) — not currently exploitable, inconsistent with the defense-in-
+  depth pattern used elsewhere; still low priority.
+
+**No longer deferred**: Dependency/library CVE remediation — **done** (2026-07-29/30): backend+workers
+91→1 CVEs (the 1 remaining is a documented, accepted risk), plus the Next.js 14→15 major upgrade
+(including 2 further transitive CVE fixes it exposed). See `CHANGELOG.md`.
+
+**Frontend changes**: small display/readability fixes can proceed without asking; anything that amounts
+to a visual revamp needs a heads-up first (this document included — see the Bug Bounty dashboard redesign
+in `CHANGELOG.md`, 2026-07-21, for the pattern that was followed: mockup review before implementation).
 
 ## 12. Open questions
 
