@@ -82,7 +82,7 @@ are in [`docs/PIPELINES.md`](./docs/PIPELINES.md) and [`docs/ARCHITECTURE.md`](.
 - **Database:** PostgreSQL 16 (primary store)
 - **Cache:** Redis 7 (caching, pub/sub, rate limiting)
 - **Queue:** RabbitMQ 3.13 (task broker, dead-letter queues)
-- **Storage:** MinIO (screenshots, evidence, reports)
+- **Storage:** Garage, S3-compatible (screenshots, evidence, reports, exports) — was MinIO; see CHANGELOG.md
 - **Search:** OpenSearch 2.x (full-text, analytics)
 - **Proxy:** NGINX (TLS, rate limiting, routing)
 - **Observability:** Prometheus + Grafana
@@ -151,8 +151,10 @@ SECRET_KEY=<64-char random hex>          # JWT signing key
 POSTGRES_PASSWORD=<strong-password>
 REDIS_PASSWORD=<strong-password>
 RABBITMQ_PASSWORD=<strong-password>
-MINIO_ACCESS_KEY=<access-key>
-MINIO_SECRET_KEY=<secret-key>
+MINIO_ACCESS_KEY=<access-key>            # Garage access key: "GK" + 24 hex chars
+MINIO_SECRET_KEY=<secret-key>             # Garage secret key: 64 hex chars
+GARAGE_RPC_SECRET=<64-char random hex>    # Garage inter-node RPC secret (internal only)
+GARAGE_ADMIN_TOKEN=<32-char random hex>   # Garage admin API token (internal only)
 ```
 
 ### Optional — Notifications

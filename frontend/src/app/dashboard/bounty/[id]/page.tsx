@@ -474,10 +474,19 @@ function SummaryTab({ programId, programName }: { programId: string; programName
 // The full module set exploit_worker.py::ALL_MODULES runs by default when
 // exploit_modules is unset -- mirrored here so the checkboxes' "everything
 // checked" state actually matches what the pipeline does with no override.
+// "redirect" was missing from this list until 2026-08-02 -- meant every
+// program's default was correct (backend defaults to ALL_MODULES when unset),
+// but the moment anyone narrowed modules via these checkboxes, redirect
+// silently dropped out with no way to toggle it back on since it never
+// appeared as a chip at all.
 const EXPLOIT_MODULES = [
   "xss", "sqli", "ssrf", "lfi", "idor", "csrf",
-  "ssti", "nosql", "jsonbody", "oauth", "bac", "upload", "jwt",
+  "ssti", "nosql", "jsonbody", "oauth", "bac", "upload", "jwt", "redirect",
 ] as const;
+// vulnscan_worker.py::VULNSCAN_ALL_MODULES -- same all-enabled-by-default
+// narrowing pattern as exploit_modules above, for the Phase-2 detection
+// checks (+ subdomain takeover) that run in the vulnscan stage.
+const VULNSCAN_MODULES = ["exposure", "cors", "headers", "403bypass", "graphql", "components", "takeover"] as const;
 const NUCLEI_SEVERITIES = ["critical", "high", "medium", "low", "info"] as const;
 // Off by default (BOUNTY_DEFAULT_EXCLUDED_TAGS in vulnscan_worker.py) -- only
 // re-included via allowed_extra_tags, never a blanket global.
@@ -575,6 +584,7 @@ function RulesOfEngagementEditor({ program, onChange }: { program: any; onChange
   };
 
   const modules: string[] = draft.exploit_modules ?? [...EXPLOIT_MODULES];
+  const vulnscanModules: string[] = draft.vulnscan_modules ?? [...VULNSCAN_MODULES];
   const severities: string[] = draft.nuclei_severities ?? [...NUCLEI_SEVERITIES];
   const extraTags: string[] = draft.allowed_extra_tags ?? [];
 
@@ -641,17 +651,45 @@ function RulesOfEngagementEditor({ program, onChange }: { program: any; onChange
                 <input className={roeInputCls} placeholder="password" value={draft.auth_password_field || ""} onChange={(e) => set("auth_password_field", e.target.value)} />
               </div>
             </div>
+            <p className="text-[11px] text-muted-foreground mt-2">
+              Some bug bounty programs require a custom identifying header on every request (e.g.
+              Bugcrowd&apos;s <code>X-Request-Purpose</code>) to avoid being rate-limited/blocked as
+              unidentified traffic. Not exposed as a dedicated field since it&apos;s program-specific and
+              rare — set <code>custom_headers: {"{"}&quot;Header-Name&quot;: &quot;value&quot;{"}"}</code> via
+              &quot;Edit as raw JSON&quot; above; it applies to every request across every stage.
+            </p>
           </div>
 
           <div>
             <h4 className="text-xs font-semibold text-foreground mb-2 uppercase tracking-wide">Exploit modules</h4>
-            <p className="text-[11px] text-muted-foreground mb-2">All 13 modules run by default — uncheck to narrow.</p>
+            <p className="text-[11px] text-muted-foreground mb-2">All {EXPLOIT_MODULES.length} modules run by default — uncheck to narrow.</p>
             <div className="flex flex-wrap gap-1.5">
               {EXPLOIT_MODULES.map((m) => (
                 <button key={m} onClick={() => toggleInList("exploit_modules", m, EXPLOIT_MODULES)}
                   className={cn(
                     "text-[11px] px-2 py-1 rounded border font-mono transition-colors",
                     modules.includes(m)
+                      ? "text-emerald-400 bg-emerald-500/10 border-emerald-500/30"
+                      : "text-muted-foreground bg-surface-800 border-border",
+                  )}>
+                  {m}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div>
+            <h4 className="text-xs font-semibold text-foreground mb-2 uppercase tracking-wide">Vulnscan detection modules</h4>
+            <p className="text-[11px] text-muted-foreground mb-2">
+              All {VULNSCAN_MODULES.length} run by default — uncheck to narrow (e.g. a program whose brief
+              explicitly excludes missing-security-headers or open-redirect findings from reward).
+            </p>
+            <div className="flex flex-wrap gap-1.5">
+              {VULNSCAN_MODULES.map((m) => (
+                <button key={m} onClick={() => toggleInList("vulnscan_modules", m, VULNSCAN_MODULES)}
+                  className={cn(
+                    "text-[11px] px-2 py-1 rounded border font-mono transition-colors",
+                    vulnscanModules.includes(m)
                       ? "text-emerald-400 bg-emerald-500/10 border-emerald-500/30"
                       : "text-muted-foreground bg-surface-800 border-border",
                   )}>
@@ -681,8 +719,38 @@ function RulesOfEngagementEditor({ program, onChange }: { program: any; onChange
             </div>
             <div>
               <h4 className="text-xs font-semibold text-foreground mb-2 uppercase tracking-wide">SSRF confirmation</h4>
-              <FieldLabel hint="An interactsh/collaborator host you control -- SSRF stays a no-op without this">OOB domain</FieldLabel>
-              <input className={roeInputCls} placeholder="your-oob.interact.sh" value={draft.oob_domain || ""} onChange={(e) => set("oob_domain", e.target.value)} />
+              <div className="flex items-center gap-2 mb-2">
+                <input type="checkbox" id="interactsh_auto" checked={!!draft.interactsh_auto}
+                  onChange={(e) => set("interactsh_auto", e.target.checked || undefined)}
+                  className="w-4 h-4 accent-emerald-600" />
+                <label htmlFor="interactsh_auto" className="text-sm text-foreground">
+                  Auto-manage via interactsh-client <span className="text-muted-foreground">(recommended — no more copying a URL from a web page by hand, and confirmed automatically by polling for real callbacks instead of you checking a dashboard yourself)</span>
+                </label>
+              </div>
+              {draft.interactsh_auto ? (
+                <p className="text-[11px] text-muted-foreground">
+                  A session is started on each exploit run — no more copying a URL from a web page by
+                  hand — and findings are confirmed automatically by polling for real callbacks instead
+                  of you checking a dashboard yourself. Each individual test gets its own unique domain
+                  (by design, for per-test isolation). Known limitation: a fresh session identity is
+                  currently minted every run rather than resumed from the last one — the pinned
+                  interactsh-client version has an upstream bug that silently drops a saved session on
+                  load, so resumption doesn&apos;t yet work. This doesn&apos;t affect confirmation
+                  accuracy, just operator-side continuity between runs. Uses the public interactsh
+                  server pool by default — override below only if you&apos;re running your own.
+                </p>
+              ) : (
+                <>
+                  <FieldLabel hint="An interactsh/collaborator host you control -- SSRF stays a no-op without this. Manual mode: you're responsible for checking the collaborator yourself for real callbacks, findings stay 'inconclusive'">OOB domain</FieldLabel>
+                  <input className={roeInputCls} placeholder="your-oob.interact.sh" value={draft.oob_domain || ""} onChange={(e) => set("oob_domain", e.target.value)} />
+                </>
+              )}
+              {draft.interactsh_auto && (
+                <div className="mt-2">
+                  <FieldLabel hint="Only needed for a self-hosted interactsh-server -- leave empty to use the public pool (oast.fun)">interactsh server override</FieldLabel>
+                  <input className={roeInputCls} placeholder="oast.fun" value={draft.interactsh_server || ""} onChange={(e) => set("interactsh_server", e.target.value)} />
+                </div>
+              )}
             </div>
           </div>
 
@@ -759,6 +827,31 @@ function RulesOfEngagementEditor({ program, onChange }: { program: any; onChange
               <FieldLabel hint="Requests a reset for auth_email and checks two things: whether the API response itself leaks the token, and whether it reflects an attacker-controlled Host/X-Forwarded-Host header back into a generated link (host-header poisoning). Never completes a reset, your test account's password is never touched">Password-reset checks (token leak + host-header poisoning) — reset endpoint URL</FieldLabel>
               <input className={roeInputCls} placeholder="https://target/api/auth/forgot-password" value={draft.password_reset_url || ""} onChange={(e) => set("password_reset_url", e.target.value)} />
               <p className="text-[11px] text-muted-foreground mt-1">Leave empty to skip — uses the Authentication email above, read-only (no reset is ever completed).</p>
+            </div>
+
+            <div className="p-3 rounded-lg border border-red-500/30 bg-red-500/5 space-y-2">
+              <div className="flex items-center gap-2">
+                <input type="checkbox" id="password_reset_completion_test" checked={!!draft.password_reset_completion_test}
+                  onChange={(e) => set("password_reset_completion_test", e.target.checked || undefined)}
+                  className="w-4 h-4 accent-red-600" />
+                <label htmlFor="password_reset_completion_test" className="text-sm text-foreground">
+                  Password-reset token reuse test <span className="text-muted-foreground">(actually completes a reset — but only ever on a brand-new disposable account this creates itself via the IDOR registration endpoint below, never a real/pre-existing account)</span>
+                </label>
+              </div>
+              {draft.password_reset_completion_test && (
+                <div className="ml-6 space-y-2">
+                  <div>
+                    <FieldLabel hint="The endpoint that completes a reset given a token + new password (different from the request-reset URL above). Sent as {token: '...', password: '...'} by default — override field names via raw-JSON mode (password_reset_token_field / password_reset_new_password_field) if the target uses different ones">Reset-confirm endpoint URL</FieldLabel>
+                    <input className={roeInputCls} placeholder="https://target/api/auth/reset-password" value={draft.password_reset_confirm_url || ""} onChange={(e) => set("password_reset_confirm_url", e.target.value)} />
+                  </div>
+                  <p className="text-[11px] text-muted-foreground">
+                    Also needs the IDOR registration endpoint configured in the Two-identity IDOR section
+                    above (to create the disposable test account) — this check registers its own
+                    separate throwaway account through it, same mechanism, independent of whether
+                    two-identity IDOR itself is enabled.
+                  </p>
+                </div>
+              )}
             </div>
 
             <div>

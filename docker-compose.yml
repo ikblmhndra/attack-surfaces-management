@@ -6,7 +6,7 @@ x-common-env: &common-env
   POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
   REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
   RABBITMQ_URL: amqp://${RABBITMQ_USER:-asm}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
-  MINIO_ENDPOINT: minio:9000
+  MINIO_ENDPOINT: garage:3900
   MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
   MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
   OPENSEARCH_HOST: opensearch
@@ -387,45 +387,35 @@ services:
     ports:
       - "15672:15672"
 
-  minio:
-    image: minio/minio:latest
-    container_name: asm-minio
+  # S3-compatible object storage. Was MinIO (minio/minio + minio/mc); those
+  # images were pulled from Docker Hub/quay.io/GHCR by upstream and MinIO's
+  # own binary releases are gone too (verified 2026-10-14) -- see CHANGELOG.md.
+  # Garage's bootstrap (cluster layout, access key, buckets, the
+  # screenshots-bucket public-read equivalent of `mc anonymous set download`)
+  # happens in infrastructure/garage/entrypoint.sh on first boot, replacing
+  # the old minio-init service -- there's no separate init container anymore.
+  garage:
+    build:
+      context: ./infrastructure/garage
+    container_name: asm-garage
     restart: unless-stopped
-    command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
-      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
-      MINIO_BROWSER: "on"
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      GARAGE_RPC_SECRET: ${GARAGE_RPC_SECRET}
+      GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN}
     volumes:
-      - minio-data:/data
+      - ./infrastructure/garage/garage.toml:/etc/garage.toml:ro
+      - garage-meta:/var/lib/garage/meta
+      - garage-data:/var/lib/garage/data
     networks:
       - asm-internal
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test: ["CMD", "garage", "status"]
       interval: 30s
       timeout: 10s
-      retries: 3
-    ports:
-      - "9001:9001"
-
-  minio-init:
-    image: minio/mc:latest
-    container_name: asm-minio-init
-    depends_on:
-      minio:
-        condition: service_healthy
-    entrypoint: >
-      /bin/sh -c "
-      mc alias set asm http://minio:9000 ${MINIO_ACCESS_KEY} ${MINIO_SECRET_KEY};
-      mc mb --ignore-existing asm/screenshots;
-      mc mb --ignore-existing asm/evidence;
-      mc mb --ignore-existing asm/reports;
-      mc mb --ignore-existing asm/exports;
-      mc anonymous set download asm/screenshots;
-      exit 0;
-      "
-    networks:
-      - asm-internal
+      retries: 5
+      start_period: 30s
 
   opensearch:
     image: opensearchproject/opensearch:2.13.0
@@ -531,7 +521,8 @@ volumes:
   postgres-data:
   redis-data:
   rabbitmq-data:
-  minio-data:
+  garage-meta:
+  garage-data:
   opensearch-data:
   prometheus-data:
   grafana-data:

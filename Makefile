@@ -86,8 +86,8 @@ up: ## Start all services
 up-build: ## Build and start all services
 	@$(COMPOSE) up -d --build
 
-up-infra: ## Start infrastructure only (DB, Redis, RabbitMQ, MinIO)
-	@$(COMPOSE) up -d postgres redis rabbitmq minio opensearch
+up-infra: ## Start infrastructure only (DB, Redis, RabbitMQ, Garage)
+	@$(COMPOSE) up -d postgres redis rabbitmq garage opensearch
 	@echo "$(GREEN)Infrastructure started$(NC)"
 
 down: ## Stop all services
@@ -190,8 +190,8 @@ ps: ## Show service status
 
 health: ## Check health of all services
 	@echo "$(CYAN)Checking service health...$(NC)"
-	@for service in postgres redis rabbitmq minio opensearch api frontend; do \
-		status=$$($(COMPOSE) ps $$service --format json 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0].get('Health','unknown'))" 2>/dev/null || echo "unknown"); \
+	@for service in postgres redis rabbitmq garage opensearch api frontend; do \
+		status=$$($(COMPOSE) ps $$service --format json 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); d=d[0] if isinstance(d,list) else d; print(d.get('Health','unknown'))" 2>/dev/null || echo "unknown"); \
 		if [ "$$status" = "healthy" ]; then \
 			echo "  $(GREEN)✓$(NC) $$service: $$status"; \
 		elif [ "$$status" = "unknown" ] || [ -z "$$status" ]; then \
@@ -287,11 +287,17 @@ prod-deploy: ## Production deployment (pull, build, migrate, restart)
 	@$(MAKE) health
 	@echo "$(GREEN)Deployment complete$(NC)"
 
-prod-backup: ## Full production backup (DB + MinIO)
+prod-backup: ## Full production backup (DB + Garage screenshots bucket)
 	@$(MAKE) db-dump
-	@echo "$(CYAN)Backing up MinIO...$(NC)"
-	@mkdir -p backups/minio
-	@$(COMPOSE) exec -T minio mc mirror asm/screenshots backups/minio/ 2>/dev/null || true
+	@echo "$(CYAN)Backing up Garage (screenshots bucket)...$(NC)"
+	@mkdir -p backups/garage
+	@docker run --rm --network $$(docker compose -f $(COMPOSE_FILE) ps -q garage | xargs -I{} docker inspect {} --format '{{range $$k,$$v := .NetworkSettings.Networks}}{{$$k}}{{end}}') \
+		-e AWS_ACCESS_KEY_ID=$$(grep MINIO_ACCESS_KEY .env | cut -d= -f2) \
+		-e AWS_SECRET_ACCESS_KEY=$$(grep MINIO_SECRET_KEY .env | cut -d= -f2) \
+		-e AWS_EC2_METADATA_DISABLED=true \
+		-v $$(pwd)/backups/garage:/backup \
+		amazon/aws-cli:2.17.62 --endpoint-url http://garage:3900 --region us-east-1 \
+		s3 sync s3://screenshots /backup 2>/dev/null || true
 	@echo "$(GREEN)Backup complete$(NC)"
 
 # ── Cleanup ───────────────────────────────────────────────────

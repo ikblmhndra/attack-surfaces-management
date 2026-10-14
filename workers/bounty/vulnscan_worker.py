@@ -22,6 +22,7 @@ import structlog
 from sqlalchemy import select
 
 from app.services.bounty_report import PRIORITY_BUCKETS
+from app.services.bounty_priority import host_sort_key, seed_domains_from_scope
 from app.services.bounty_scope import is_target_in_scope
 from app.services.scan_profiles import PROFILE_TEMPLATE_DIRS
 from workers.bounty.bounty_stage import BountyStageWorker, persist_deduped_attempts
@@ -50,6 +51,15 @@ log = structlog.get_logger()
 # allowed_extra_tags, mirroring the SQLi aggressiveness dial in the exploit
 # stage (built later, on top of this same per-program escalation pattern).
 BOUNTY_DEFAULT_EXCLUDED_TAGS = ["dos", "destructive", "unsafe"]
+
+# Detection-module set (Phase 2 checks + takeover), separate from nuclei's own
+# tag-based filtering above. All enabled by default (backward compatible --
+# existing programs that never set this see no behaviour change). Narrowed
+# via rules_of_engagement.vulnscan_modules for programs whose brief excludes
+# specific categories outright (e.g. a program that lists "missing security
+# headers" or "clickjacking" as explicitly not rewarded -- running `headers`
+# there just produces findings that can never be submitted).
+VULNSCAN_ALL_MODULES = {"exposure", "cors", "headers", "403bypass", "graphql", "components", "takeover"}
 
 SEVERITY_MAP = {
     "critical": "critical", "high": "high", "medium": "medium",
@@ -110,6 +120,7 @@ class BountyVulnscanWorker(BountyStageWorker):
             )).scalars().all()
 
         scope_rules = program.scope_rules or []
+        scope_seeds = seed_domains_from_scope(scope_rules)
         roe = program.rules_of_engagement or {}
 
         # Optional single-identity auth (see exploit_worker.py). Threaded into
@@ -117,7 +128,11 @@ class BountyVulnscanWorker(BountyStageWorker):
         # and the sensitive-file/CORS checks below -- NOT into check_403_bypass,
         # which specifically measures unauthenticated/anonymous access and
         # would silently stop measuring that if given a valid session.
-        extra_headers: Dict[str, str] = {}
+        # custom_headers (e.g. a bug bounty program's required identifying
+        # header) applies to every request regardless of auth -- see the
+        # identical comment in recon_worker.py.
+        extra_headers: Dict[str, str] = dict(roe.get("custom_headers") or {})
+        token: Optional[str] = None
         auth_login_url = roe.get("auth_login_url")
         auth_email = roe.get("auth_email")
         auth_password = roe.get("auth_password")
@@ -126,22 +141,46 @@ class BountyVulnscanWorker(BountyStageWorker):
                 auth_login_url, auth_email, auth_password,
                 email_field=roe.get("auth_email_field", "email"),
                 password_field=roe.get("auth_password_field", "password"),
+                extra_headers=extra_headers,
             )
             if token:
-                extra_headers = {"Authorization": f"Bearer {token}"}
+                extra_headers["Authorization"] = f"Bearer {token}"
             log.info("bounty_vulnscan_auth", program_id=program_id, authenticated=bool(token))
 
         # Skip targets probe already confirmed dead; unprobed (is_alive is
         # None) targets still get scanned -- nuclei does its own liveness
         # check per-request regardless.
-        in_scope_targets = [
-            t for t in targets
-            if t.is_alive is not False and is_target_in_scope(t.value, scope_rules)
-        ][:MAX_TARGETS_PER_RUN]
+        #
+        # Ranked before the MAX_TARGETS_PER_RUN cut: `targets` comes back in
+        # no particular order, so the surviving N used to be an arbitrary
+        # draw. That barely showed on a 50-target program but is decisive on
+        # a wide one -- the "PU" program here has 3619 targets, of which this
+        # cap scans 50 (1.4%), previously whichever 50 the query happened to
+        # return. Alive targets first (probe already proved they respond),
+        # then host priority.
+        in_scope_targets = sorted(
+            (t for t in targets
+             if t.is_alive is not False and is_target_in_scope(t.value, scope_rules)),
+            key=lambda t: (t.is_alive is not True, host_sort_key(t.value, scope_seeds)),
+        )[:MAX_TARGETS_PER_RUN]
 
         if not in_scope_targets:
             log.info("bounty_vulnscan_no_in_scope_targets", program_id=program_id)
             return {"skipped": "no_in_scope_targets"}
+
+        requested_vulnscan_modules = roe.get("vulnscan_modules")
+        # isinstance(requested_vulnscan_modules, list) alone, not "and
+        # requested_vulnscan_modules": the UI's module-picker can send
+        # vulnscan_modules: [] to mean "run nothing" by unchecking every box
+        # -- an empty-but-present list must stay empty, only an
+        # absent/non-list value (None, never configured) means "use the
+        # default set." Same fix applied to exploit_worker.py's
+        # _resolve_modules for the identical exploit_modules bug.
+        vulnscan_modules = (
+            {m for m in requested_vulnscan_modules if m in VULNSCAN_ALL_MODULES}
+            if isinstance(requested_vulnscan_modules, list)
+            else set(VULNSCAN_ALL_MODULES)
+        )
 
         allowed_extra_tags = set(roe.get("allowed_extra_tags") or [])
         exclude_tags = [t for t in BOUNTY_DEFAULT_EXCLUDED_TAGS if t not in allowed_extra_tags]
@@ -198,8 +237,13 @@ class BountyVulnscanWorker(BountyStageWorker):
 
         # Phase-2 detection modules (sensitive-file exposure, CORS, 403 bypass)
         # on the in-scope targets + a sample of their in-scope recon URLs.
-        detect_attempts = await self._run_detection(program_id, in_scope_targets, target_by_host, scope_rules, extra_headers)
-        takeover_attempts = await self._run_takeover_check(program_id, target_by_host)
+        detect_attempts = await self._run_detection(
+            program_id, in_scope_targets, target_by_host, scope_rules, extra_headers, vulnscan_modules,
+        )
+        takeover_attempts = (
+            await self._run_takeover_check(program_id, target_by_host)
+            if "takeover" in vulnscan_modules else []
+        )
         async with get_session() as db:
             await persist_deduped_attempts(db, detect_attempts + takeover_attempts)
             await db.commit()
@@ -210,7 +254,11 @@ class BountyVulnscanWorker(BountyStageWorker):
         )
 
         total = persisted + len(detect_attempts) + len(takeover_attempts)
-        authenticated = bool(extra_headers)
+        # bool(token), not bool(extra_headers): extra_headers is now seeded
+        # from custom_headers too, so it's non-empty whenever a program sets
+        # custom_headers regardless of whether login actually succeeded --
+        # token is the only thing that's actually true iff login succeeded.
+        authenticated = bool(token)
         log.info(
             "bounty_vulnscan_completed", program_id=program_id, nuclei=persisted,
             detection=len(detect_attempts), takeover=len(takeover_attempts), authenticated=authenticated,
@@ -255,10 +303,12 @@ class BountyVulnscanWorker(BountyStageWorker):
     async def _run_detection(
         self, program_id, in_scope_targets, target_by_host, scope_rules,
         extra_headers: Optional[Dict[str, str]] = None,
+        vulnscan_modules: Optional[set] = None,
     ) -> List[Dict[str, Any]]:
         """Sensitive-file / CORS / 403-bypass detection against in-scope target
         base URLs and a bounded sample of their in-scope recon URLs. Each check
         is a plain bounded GET; findings map back to their owning target."""
+        vulnscan_modules = vulnscan_modules if vulnscan_modules is not None else set(VULNSCAN_ALL_MODULES)
         # Base URLs from targets (prefer the probed url), collapsed to the
         # origin (scheme://host). url-type targets carry a path in `.value`
         # (e.g. a promoted "/security.txt" endpoint) -- walking sensitive-file
@@ -307,26 +357,31 @@ class BountyVulnscanWorker(BountyStageWorker):
         catch_all_cache: CatchAllCache = {}
         # Sensitive files + CORS on base URLs.
         for base, tid in base_urls.items():
-            for f in await check_sensitive_files(base, extra_headers=extra_headers, catch_all_cache=catch_all_cache):
-                attempts.append(self._detect_attempt(program_id, tid, "exposure", f))
-            for f in await check_cors(base, extra_headers=extra_headers):
-                attempts.append(self._detect_attempt(program_id, tid, "cors", f))
-            for f in await check_security_headers(base, extra_headers=extra_headers):
-                attempts.append(self._detect_attempt(program_id, tid, "headers", f))
+            if "exposure" in vulnscan_modules:
+                for f in await check_sensitive_files(base, extra_headers=extra_headers, catch_all_cache=catch_all_cache):
+                    attempts.append(self._detect_attempt(program_id, tid, "exposure", f))
+            if "cors" in vulnscan_modules:
+                for f in await check_cors(base, extra_headers=extra_headers):
+                    attempts.append(self._detect_attempt(program_id, tid, "cors", f))
+            if "headers" in vulnscan_modules:
+                for f in await check_security_headers(base, extra_headers=extra_headers):
+                    attempts.append(self._detect_attempt(program_id, tid, "headers", f))
         # CORS + 403-bypass on endpoint URLs. 403-bypass deliberately stays
         # unauthenticated -- it specifically measures what an anonymous caller
         # can reach, which a valid session would trivially (and misleadingly)
         # "solve".
         for url, tid in endpoint_urls.items():
-            for f in await check_cors(url, extra_headers=extra_headers):
-                attempts.append(self._detect_attempt(program_id, tid, "cors", f))
-            for f in await check_403_bypass(url, catch_all_cache=catch_all_cache):
-                attempts.append(self._detect_attempt(program_id, tid, "403bypass", f))
+            if "cors" in vulnscan_modules:
+                for f in await check_cors(url, extra_headers=extra_headers):
+                    attempts.append(self._detect_attempt(program_id, tid, "cors", f))
+            if "403bypass" in vulnscan_modules:
+                for f in await check_403_bypass(url, catch_all_cache=catch_all_cache):
+                    attempts.append(self._detect_attempt(program_id, tid, "403bypass", f))
             # Deeper GraphQL checks (sensitive schema field names, batching
             # acceptance) on any endpoint URL that looks like a GraphQL
             # path -- recon's own graphql_introspection() only records
             # whether introspection is open, not what it actually exposes.
-            if GRAPHQL_URL_RE.search(url):
+            if "graphql" in vulnscan_modules and GRAPHQL_URL_RE.search(url):
                 for f in await graphql_schema_scan(url, extra_headers=extra_headers):
                     attempts.append(self._detect_attempt(program_id, tid, "graphql", f))
                 for f in await check_graphql_batching(url, extra_headers=extra_headers):
@@ -337,9 +392,10 @@ class BountyVulnscanWorker(BountyStageWorker):
         # behind a login wall, which none of the URLs collected here are,
         # since js_urls is drawn from the same publicly-crawled asset list
         # as endpoint_urls above).
-        for js_url, tid in js_urls.items():
-            for f in await check_vulnerable_components(js_url):
-                attempts.append(self._detect_attempt(program_id, tid, "components", f))
+        if "components" in vulnscan_modules:
+            for js_url, tid in js_urls.items():
+                for f in await check_vulnerable_components(js_url):
+                    attempts.append(self._detect_attempt(program_id, tid, "components", f))
         return attempts
 
     def _detect_attempt(self, program_id, target_id, module: str, finding: Dict[str, Any]) -> Dict[str, Any]:

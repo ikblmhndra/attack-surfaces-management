@@ -25,6 +25,9 @@ from urllib.parse import urljoin, urlparse
 import aiohttp
 import structlog
 
+from app.services.bounty_redaction import redact_evidence
+from workers.bounty.tools import read_body_capped
+
 log = structlog.get_logger()
 
 _UA = {"User-Agent": "Mozilla/5.0 (compatible; ASM-Bounty/1.0)"}
@@ -56,7 +59,7 @@ async def _is_catch_all_200(
     try:
         async with session.get(f"{base}/asm-probe-{nonce}", allow_redirects=False) as r:
             if r.status == 200:
-                result = (True, (await r.content.read(20000)).decode(errors="ignore"))
+                result = (True, (await read_body_capped(r, 20000)).decode(errors="ignore"))
     except Exception:
         pass
     if cache is not None:
@@ -145,7 +148,7 @@ async def check_sensitive_files(
                     async with s.get(url, allow_redirects=False) as r:
                         if r.status != 200:
                             continue
-                        body = (await r.content.read(max_bytes)).decode(errors="ignore")
+                        body = (await read_body_capped(r, max_bytes)).decode(errors="ignore")
                 except Exception:
                     continue
                 if len(body) < 5:
@@ -163,7 +166,13 @@ async def check_sensitive_files(
                 findings.append({
                     "technique": f"sensitive-file{path}",
                     "severity": "high" if any(k in path for k in (".env", ".git", "credentials", "id_rsa", "wp-config")) else "medium",
-                    "evidence": {"url": url, "matched_signature": signature, "excerpt": body[:300]},
+                    # Redacted before storage, not at report time: a leaked
+                    # .env's whole point is the key names, and the target's
+                    # actual DB password adds nothing to the report while
+                    # creating a real liability if persisted. See
+                    # bounty_redaction.py.
+                    "evidence": {"url": url, "matched_signature": signature,
+                                 "excerpt": redact_evidence(body, limit=300)},
                 })
     except Exception as exc:
         log.warning("bounty_sensitive_files_error", base=base_url, error=str(exc)[:150])
@@ -375,7 +384,7 @@ async def discover_api_specs(
                     async with s.get(url, allow_redirects=False) as r:
                         if r.status != 200:
                             continue
-                        text = (await r.content.read(50000)).decode(errors="ignore")
+                        text = (await read_body_capped(r, 50000)).decode(errors="ignore")
                 except Exception:
                     continue
                 if any(k in text for k in ('"swagger"', '"openapi"', '"paths"')):
@@ -620,7 +629,7 @@ async def check_vulnerable_components(js_url: str, timeout: int = 15, max_bytes:
             async with s.get(js_url, allow_redirects=False) as r:
                 if r.status != 200:
                     return []
-                text = (await r.content.read(max_bytes)).decode(errors="ignore")
+                text = (await read_body_capped(r, max_bytes)).decode(errors="ignore")
     except Exception as exc:
         log.warning("bounty_vulnerable_components_error", url=js_url, error=str(exc)[:150])
         return []

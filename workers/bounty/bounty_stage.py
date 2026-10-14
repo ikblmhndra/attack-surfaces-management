@@ -125,6 +125,32 @@ async def set_stage_status(program_id: str, stage: str, payload: Dict[str, Any])
         await db.commit()
 
 
+async def set_interactsh_session_data(program_id: str, session_yaml: str) -> None:
+    """Persist interactsh-client's session-file content into
+    rules_of_engagement.interactsh_session_data so the SAME OOB domain gets
+    reused on the next exploit run instead of a fresh random one every time
+    (see interactsh_session.py's module docstring for why this exists).
+    Single hardcoded key, not a generic "set any RoE field" helper -- keeps
+    this safe to embed directly in the jsonb path text the same way
+    set_stage_status embeds `stage` (an internal, non-user-controlled value).
+    """
+    stmt = (
+        update(BountyProgram)
+        .where(BountyProgram.id == program_id)
+        .values(
+            rules_of_engagement=func.jsonb_set(
+                func.coalesce(BountyProgram.rules_of_engagement, text("'{}'::jsonb")),
+                text("'{interactsh_session_data}'"),
+                type_coerce(session_yaml, JSONB),
+                True,
+            )
+        )
+    )
+    async with get_session() as db:
+        await db.execute(stmt)
+        await db.commit()
+
+
 async def persist_deduped_attempts(db: AsyncSession, attempts: List[Dict[str, Any]]) -> int:
     """Insert new ExploitAttempt rows, or bump last_seen_at/occurrence_count on
     an existing row for the same (program_id, target_id, module, technique,

@@ -26,8 +26,10 @@ from urllib.parse import urlparse
 import aiohttp
 import structlog
 
+from app.services.bounty_redaction import redact_evidence
 from workers.bounty.detect import CatchAllCache, _is_catch_all_200
 from workers.bounty.exploit_tools import LFI_SIGNATURES
+from workers.bounty.tools import read_body_capped
 
 log = structlog.get_logger()
 
@@ -107,7 +109,7 @@ async def check_xxe(
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout), headers=headers) as s:
             async with s.post(url, data=_XXE_PAYLOAD, allow_redirects=False) as r:
-                body = (await r.content.read(65536)).decode(errors="ignore")
+                body = (await read_body_capped(r, 65536)).decode(errors="ignore")
     except Exception as exc:
         log.warning("bounty_xxe_error", url=url, error=str(exc)[:200])
         return []
@@ -120,7 +122,8 @@ async def check_xxe(
         "severity": "critical",
         "status": "confirmed",
         "evidence": {
-            "target_url": url, "matched_signature": signature, "excerpt": body[:300],
+            "target_url": url, "matched_signature": signature,
+            "excerpt": redact_evidence(body, limit=300),
             "note": "XML external entity resolved and read a local file -- confirmed via a known file-content signature.",
         },
     }]
