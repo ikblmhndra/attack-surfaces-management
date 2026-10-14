@@ -133,6 +133,110 @@ currently exploitable (the pre-check already validates every ID belongs to the c
 the update runs), but worth hardening to match the pattern used everywhere else, for defense in depth
 rather than because a real gap was demonstrated.
 
+**Bug Bounty pipeline audit (2026-10-14): found, fixing in progress.** An 8-angle code-review +
+security-review pass over the then-uncommitted `workers/bounty/*` changes (interactsh integration,
+source-map analysis, password-reset-reuse check, PII redaction, priority scoring) — every item below
+verified by reading the actual code, several independently re-found by 2-3 separate review passes.
+Treat this as a todo list, not a resolved record, and update this entry (don't just delete lines) as
+items actually get fixed. #1-3 below are done (same day); #4-10 are still open.
+
+Ranked by severity:
+
+1. **~~SSRF against our own scanning infra via JS source-map fetch.~~ Fixed 2026-10-14.**
+   `workers/bounty/tools.py`'s `_fetch_sourcemap_json` followed a `//# sourceMappingURL=` reference taken
+   from the *target's own* JS response via `urljoin()` and fetched it with no scope/host/private-IP
+   check — unlike every other live-request path in this pipeline. A target serving
+   `//# sourceMappingURL=http://169.254.169.254/...` turned passive JS analysis into SSRF against the
+   worker container. Fixed with a new `_is_safe_to_fetch()` guard (resolves the hostname, rejects
+   private/loopback/link-local/reserved/multicast addresses and non-http(s) schemes), applied before
+   fetching any source-map candidate URL — same `is_private`/`is_loopback`/`is_link_local` convention
+   already used in `workers/enrichment/enrichment_worker.py` and
+   `workers/validation/asset_validation_worker.py`. Live-verified inside the worker container against
+   `169.254.169.254`, `127.0.0.1`, `localhost`, a private `10.x` address, `file:///etc/passwd`, and the
+   `garage` service's own internal hostname — all correctly blocked; a real public domain still passes.
+2. **~~False-positive exploit finding auto-notifies Slack/Discord/email with no human gate.~~ Fixed
+   2026-10-14.** `exploit_ext.py::confirm_password_reset_reuse` marked "confirmed"/"high" from HTTP
+   status code alone (200-299) on two *live* password-reset attempts — many reset-confirm APIs return a
+   uniform 200 regardless of token validity (anti-enumeration), which made the two-call test meaningless.
+   Fixed by adding a negative-control request with a never-issued token before concluding: if that
+   baseline *also* gets a 2xx back, the endpoint's status code can't be trusted to mean anything, so the
+   finding downgrades to `"inconclusive"` (same convention already used elsewhere in this file for
+   exactly this kind of ambiguity) instead of `"confirmed"` — which keeps it out of
+   `notify_critical_findings`'s auto-notify path (that still filters on `status == "confirmed"`).
+3. **~~SSRF confirmation false-positives across co-located endpoints.~~ Fixed 2026-10-14.**
+   `exploit_tools.py::run_ssrf`'s OOB token was `param+hostname` only — two endpoints on the same host
+   sharing a param name (`url=`, `callback=`) got identical tokens, so one real callback marked every
+   attempt sharing that token as confirmed. Fixed by keying the token off a hash of the full URL instead
+   of just the hostname, so every (URL, param) pair gets a distinct token; the matching side
+   (`_confirm_ssrf_via_interactions`) needed no change since it just parses whatever token was embedded
+   in the stored payload. Verified the two URLs from the original failure scenario now produce distinct
+   tokens.
+4. **~~The "reuse OOB session across runs" feature is a no-op.~~ Addressed (honestly) 2026-10-14.**
+   Pinned `interactsh-client@v1.3.1` has an upstream bug (verified against the actual Go source for that
+   tag, and confirmed *still present on upstream's own main branch* -- not something a version bump
+   fixes): session-file loading YAML-unmarshals the file *path string*, not its contents, error
+   discarded — a fresh random domain is minted every run regardless. Patching and building our own
+   binary from source was judged disproportionate effort for what's an operator-convenience feature,
+   not a correctness one (SSRF confirmation accuracy is unaffected either way). Fixed the actual harm
+   instead: the frontend tooltip no longer promises reuse "until it expires" (it now states the known
+   limitation plainly), and `interactsh_session.py`'s docstring + `start_session()`'s log line document
+   the bug and stop claiming `resumed=True`. Session persistence itself is left in place, dormant, for
+   if/when this gets fixed upstream or someone does patch-build a fixed binary.
+5. **~~interactsh-client subprocess leaks on exception.~~ Fixed 2026-10-14.** The subprocess in
+   `exploit_worker.py` was only stopped at the tail of a `TemporaryDirectory` block; an exception from
+   any of the ~15 intervening modules skipped cleanup, orphaning a process that polls `oast.fun`
+   indefinitely. Fixed by wrapping that whole stretch (lfi through the password-reset-reuse check) in
+   `try`/`finally`, with the interactsh teardown moved into the `finally` — structurally confirmed via
+   AST inspection (exactly one `try` in `run_stage`, with a non-empty `finally`), so `stop_and_collect()`
+   now runs no matter what raises in between.
+6. **~~`authenticated` status flag is wrong after a header refactor.~~ Fixed 2026-10-14.**
+   `recon_worker.py` and `vulnscan_worker.py` both derived `authenticated = bool(extra_headers)`, which
+   stopped meaning "login succeeded" once `extra_headers` started being pre-seeded from `custom_headers`
+   regardless of outcome. Both now use the actual login-result variable (`auth_token` /  `token`,
+   initialized to `None` so it's safe to read even when no login was attempted) instead — matching
+   `exploit_worker.py`'s already-correct separate-boolean pattern.
+7. **~~Unchecking every module in the new UI silently runs all of them.~~ Fixed 2026-10-14.**
+   `vulnscan_worker.py` treated an empty `vulnscan_modules` list the same as "unset" and fell back to
+   running everything. Found the identical bug in `exploit_worker.py::_resolve_modules` for
+   `exploit_modules` too (same `and requested` truthiness check) and fixed both the same way: check
+   `isinstance(x, list)` alone, so a present-but-empty list is respected as "run nothing" and only an
+   absent/non-list value defaults to the full set.
+8. **~~`read_body_capped` reads past its own cap.~~ Fixed 2026-10-14.** Chunk size was hardcoded to 65536
+   regardless of the caller's `max_bytes`, checked only between chunks. Now capped to
+   `min(65536, max_bytes - total)` per read.
+9. **~~Redaction leaves secret/PII fragments unmasked in some shapes.~~ Fixed 2026-10-14.**
+   `bounty_redaction.py`'s JSON key-value matcher didn't handle backslash-escaped quotes, and PII inside
+   a JSON array value or in `key=value` form/query-string shape was only partially caught. Fixed the
+   escaped-quote case by switching the JSON value character class to `(?:\\.|[^"\\])*`. Fixed the
+   grouped-digits case (covers both the array-value and form/query-string shapes at once, since it's a
+   content-based pass that runs before the keyed patterns can partially consume the value) with a new
+   `_ID_NUMBER_GROUPED_RE` that matches any space/dot/dash-grouped digit sequence but only actually
+   redacts it if the digit count (separators stripped) is exactly 15 or 16 — same length discipline as
+   the existing contiguous-run pattern, so grouped dates/IPs/money amounts aren't swept up as false
+   positives. Live-verified all 6 cases from the original finding plus two negative controls (an IP, a
+   date) — see `backend/app/services/bounty_redaction.py`.
+10. **~~An inserted default-fill line demotes a docstring to dead code.~~ Fixed 2026-10-14.**
+    `vulnscan_worker.py::_run_detection` had a new first statement pushing its existing docstring to
+    second position. Moved the default-fill line after the docstring.
+
+All 10 items above are now fixed (2026-10-14), each rebuilt and verified against a running container
+(all affected services reached `healthy`, no import/syntax errors) before being marked done here.
+
+Lower-priority cleanup also surfaced and is **not yet done** (sequential `aiohttp.ClientSession`s where
+one-reused would do, `sorted()[:50]` where `heapq.nsmallest` would do, the same `extra_headers`
+extraction snippet copy-pasted into 4 worker files — which is also *why* finding 6 above only hit some
+of them and not others — and a second, parallel "which modules are enabled" convention introduced
+alongside the pre-existing one): a one-time sweep candidate, not a correctness risk, so lower priority
+than the 10 above were.
+
+Checked and ruled out during the same pass: the MinIO→Garage migration itself (bucket bootstrap,
+anonymous-screenshots-only access, the narrowed nginx proxy — see the How-to guide); the interactsh
+session secret *is* returned unredacted to workspace admins via the bounty program API, but so are the
+pre-existing `auth_password`/`auth_email` fields in the same JSONB blob, by the same design — not a new
+privilege-boundary gap, just worth a defense-in-depth fix eventually; `interactsh-client` is invoked
+with an argument list (no shell), so no command injection; generated report HTML doesn't embed
+`rules_of_engagement`, so credentials don't leak through the researcher-facing report artifact.
+
 ## Docs vs. reality — corrections this documentation set has already made once
 
 Documentation drifts from code by default, not by accident — this list exists so the same wrong claims

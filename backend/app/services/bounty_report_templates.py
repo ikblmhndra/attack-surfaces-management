@@ -275,6 +275,78 @@ MODULE_META: Dict[str, Dict[str, str]] = {
             "requests can't both pass the same 'is this still available' check before either commits."
         ),
     },
+    "cors": {
+        "label": "Cross-Origin Resource Sharing (CORS) Misconfiguration",
+        "impact": (
+            "The server's CORS policy is misconfigured -- review the specific technique below (exact "
+            "reflection of an arbitrary Origin, with or without Allow-Credentials, vs. a spec-invalid "
+            "wildcard+credentials combination) for the exact issue. An exact-Origin reflection combined "
+            "with Allow-Credentials lets any attacker-controlled site read authenticated responses from "
+            "this origin on a victim's behalf; a wildcard+credentials combination is spec-invalid and "
+            "generally not honored by real browsers, so its practical impact is lower."
+        ),
+        "remediation": (
+            "Serve an explicit allowlist of trusted origins from Access-Control-Allow-Origin (never "
+            "reflect the request's Origin verbatim), and only set Access-Control-Allow-Credentials on "
+            "responses to an allowlisted origin, never combined with a wildcard."
+        ),
+    },
+    "takeover": {
+        "label": "Subdomain Takeover",
+        "impact": (
+            "This subdomain's CNAME points to a resource on a third-party service that is no longer "
+            "claimed/provisioned there -- confirmed via a fingerprint match against the live CNAME "
+            "target. Anyone can register that same resource on the third-party service and serve "
+            "arbitrary content under this trusted domain, enabling phishing, cookie/session theft "
+            "(if cookies are scoped to the parent domain), or malware distribution with the "
+            "organization's own domain lending it credibility."
+        ),
+        "remediation": (
+            "Either remove the stale DNS CNAME record if the subdomain is no longer in use, or "
+            "re-claim/re-provision the resource on the third-party service so the CNAME target is "
+            "owned again. Audit other subdomains for the same stale-CNAME pattern."
+        ),
+    },
+    "graphql": {
+        "label": "GraphQL Security Misconfiguration",
+        "impact": (
+            "A GraphQL endpoint has a security-relevant misconfiguration -- review the specific "
+            "technique below (introspection left enabled exposing the full schema including "
+            "unlinked/sensitive fields, or query batching accepted without limits enabling resource-"
+            "exhaustion or auth-bypass-via-batching) for the exact issue and its real impact."
+        ),
+        "remediation": (
+            "Disable introspection in production, apply query depth/complexity limits, and cap or "
+            "disable batched query execution unless explicitly required."
+        ),
+    },
+    "components": {
+        "label": "Vulnerable / Outdated Frontend Component",
+        "impact": (
+            "A frontend JavaScript library with a known vulnerability (outdated version, disclosed "
+            "CVE) is loaded by this page -- exact impact depends on the specific library and "
+            "vulnerability class (commonly XSS-adjacent for frontend libraries). Confirm the "
+            "identified version and vulnerability actually apply before reporting."
+        ),
+        "remediation": (
+            "Upgrade the affected library to a patched version; track frontend dependencies for "
+            "known vulnerabilities the same way backend dependencies are tracked."
+        ),
+    },
+    "403bypass": {
+        "label": "Access Control Bypass (403 Forbidden Bypass)",
+        "impact": (
+            "A path that returns 403/blocked on the plain request became reachable using a path-"
+            "manipulation or header trick (e.g. a trailing dot, double-encoding, an internal-facing "
+            "header claiming trusted origin) -- the access restriction is enforced by a check that "
+            "can be bypassed rather than a real authorization decision."
+        ),
+        "remediation": (
+            "Enforce access control in the application layer itself (not just a reverse-proxy path "
+            "match), normalise paths before any allow/deny decision, and never trust client-supplied "
+            "headers (X-Forwarded-For/X-Original-URL and similar) for access decisions."
+        ),
+    },
     "nuclei": {
         "label": "Vulnerability / Misconfiguration (nuclei)",
         "impact": (
@@ -376,6 +448,21 @@ TECHNIQUE_META: Dict[str, Dict[str, str]] = {
             "client-supplied Host/X-Forwarded-Host header. Use a server-side configured canonical "
             "domain instead, and validate/allowlist the Host header at the edge (reverse proxy/load "
             "balancer) regardless."
+        ),
+    },
+    "password-reset-token-reusable": {
+        "label": "Password-Reset Token Not Invalidated After Use",
+        "impact": (
+            "Directly confirmed on a disposable test account created for this check only: the same "
+            "password-reset token was used to successfully complete a reset twice in a row. The token "
+            "isn't invalidated after first use, so anyone who obtains a token once (a shared device, a "
+            "proxy/access log, a referrer leak) can keep using it -- and a token that was already "
+            "'used' can't be treated as neutralized by incident response."
+        ),
+        "remediation": (
+            "Invalidate (delete or mark consumed) the reset token server-side the instant it's "
+            "successfully used, so any further attempt with the same token is rejected regardless of "
+            "how it was obtained."
         ),
     },
     "bac-unauth-privileged": {

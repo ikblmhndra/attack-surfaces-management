@@ -12,14 +12,14 @@ understand *why* need different things from the same page.
 | Document | Mode | Read this for |
 |---|---|---|
 | [TUTORIAL.md](./TUTORIAL.md) | Tutorial | A guided, hands-on first run: stack up, register, create an org, run a scan, see a risk score |
-| [HOWTO.md](./HOWTO.md) | How-to | Task guides: add a migration, add a worker queue, reverse-proxy a new internal service, run tests |
+| [HOWTO.md](./HOWTO.md) | How-to | Task guides: add a migration, add a worker queue, reverse-proxy a new internal service, run tests, operate Garage object storage |
 | [ARCHITECTURE.md](./ARCHITECTURE.md) | Reference | System context diagram, container/network topology, NGINX routing table, request-flow diagrams |
 | [DATA_MODEL.md](./DATA_MODEL.md) | Reference | Full ERD (both schemas) + a complete field-by-field reference table for all 36 tables |
 | [PIPELINES.md](./PIPELINES.md) | Reference | Queue topology table, ASM/Bug Bounty pipeline flowcharts, the scope-gate diagram, exploit-module reference table |
 | [API_REFERENCE.md](./API_REFERENCE.md) | Reference | Every endpoint, every router, the auth model — plus the live interactive reference at `/api/docs` |
 | [FRONTEND.md](./FRONTEND.md) | Reference | App Router structure, Zustand store shape, the Bug Bounty program-detail page's tab-by-tab patterns |
 | [DEVELOPMENT.md](./DEVELOPMENT.md) | Reference | Makefile command table, the risk-scoring formula's exact numbers, config wiring, known quirks |
-| [EXPLANATION.md](./EXPLANATION.md) | Explanation | The reasoning behind the above: why two pipelines, the scope gate's safety property, theming/accessibility choices, self-hosted docs, what the self-security audit did and didn't find |
+| [EXPLANATION.md](./EXPLANATION.md) | Explanation | The reasoning behind the above: why two pipelines, the scope gate's safety property, theming/accessibility choices, self-hosted docs, what the self-security audit and the Bug Bounty pipeline audit did and didn't find |
 
 **Outside the four modes** (product/business planning documents, not user- or developer-facing system
 documentation, so they don't fit the Diátaxis framework and aren't forced into it):

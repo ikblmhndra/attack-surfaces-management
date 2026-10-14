@@ -8,13 +8,15 @@ pure filesystem lookup, not tied to the ASM Asset schema) rather than
 duplicating it.
 """
 import asyncio
+import ipaddress
 import json
 import os
 import re
 import shutil
+import socket
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
-from urllib.parse import urljoin
+from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import urljoin, urlsplit
 
 import aiohttp
 import structlog
@@ -76,7 +78,7 @@ def _flatten_scalars(node: Any, out: Dict[str, str]) -> None:
 async def login_and_get_session(
     login_url: str, email: str, password: str,
     email_field: str = "email", password_field: str = "password",
-    timeout: int = 20,
+    timeout: int = 20, extra_headers: Optional[Dict[str, str]] = None,
 ) -> tuple[Optional[str], Dict[str, str]]:
     """POST real test credentials to the program's configured login endpoint.
     Returns (token, flattened_scalar_fields) -- the second is every scalar
@@ -86,7 +88,9 @@ async def login_and_get_session(
     failure -- callers proceed unauthenticated rather than raise, since auth
     is an optional enhancement, not a hard requirement."""
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout), headers=_UA) as s:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=timeout), headers={**_UA, **(extra_headers or {})},
+        ) as s:
             async with s.post(
                 login_url, json={email_field: email, password_field: password}, allow_redirects=False,
             ) as r:
@@ -113,14 +117,15 @@ async def login_and_get_session(
 async def login_and_get_token(
     login_url: str, email: str, password: str,
     email_field: str = "email", password_field: str = "password",
-    timeout: int = 20,
+    timeout: int = 20, extra_headers: Optional[Dict[str, str]] = None,
 ) -> Optional[str]:
     """POST real test credentials to the program's configured login endpoint
     and pull a bearer token out of the JSON response. Thin wrapper over
     login_and_get_session() for the (much more common) callers that only
     need the token itself."""
     token, _ = await login_and_get_session(
-        login_url, email, password, email_field=email_field, password_field=password_field, timeout=timeout,
+        login_url, email, password, email_field=email_field, password_field=password_field,
+        timeout=timeout, extra_headers=extra_headers,
     )
     return token
 
@@ -466,6 +471,172 @@ DOM_XSS_SINK_RE = re.compile(
 API_BASE_URL_RE = re.compile(
     r"""['"](https?://[a-zA-Z0-9.\-]+(?:/[a-zA-Z0-9._\-/]*)?)['"]""")
 
+# ── Source-map extraction ──────────────────────────────────────
+# A deployed `.js.map` reconstructs a bundle's original, pre-minification
+# source: real file paths (revealing internal module structure and admin/api
+# code split out of the served bundle), un-mangled names, developer comments,
+# and string literals a minifier would otherwise inline or rename. Running the
+# same endpoint/secret passes over that original source finds far more than the
+# minified bundle alone, and the source *paths* are themselves recon intel.
+# Passive: a `.map` is a public asset the server already serves next to the
+# `.js` -- fetching it is not exploitation.
+_SOURCEMAP_URL_RE = re.compile(r"//[#@]\s*sourceMappingURL=([^\s'\"]+)")
+_SOURCEMAP_MAX_BYTES = 15_000_000
+_SOURCEMAP_SCAN_CHARS = 5_000_000
+
+
+async def read_body_capped(resp: "aiohttp.ClientResponse", max_bytes: int) -> bytes:
+    """Read a response body up to `max_bytes`, accumulating chunks until EOF or
+    the cap. `resp.content.read(n)` alone is NOT enough: on a chunked/streamed
+    response it returns only whatever is already buffered (observed live: a
+    single `read(15MB)` against a chunked jsdelivr source map returned just the
+    first 279-byte chunk, so the JSON never parsed). This reads the whole body
+    while still bounding it."""
+    chunks: List[bytes] = []
+    total = 0
+    while total < max_bytes:
+        # Capped to the remaining budget, not a flat 65536: read(65536) on a
+        # response with that much already buffered returns up to 65536 bytes
+        # regardless of how much of max_bytes is left, so a caller passing
+        # e.g. max_bytes=20000 could get back ~3x what it asked for.
+        chunk = await resp.content.read(min(65536, max_bytes - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)
+
+
+async def _is_safe_to_fetch(url: str) -> bool:
+    """Guard against following a URL that the *target itself* supplied (a
+    sourceMappingURL comment inside its own JS) rather than one we picked --
+    unlike js_url (already scope-checked upstream before analyze_js_file was
+    ever called), this is attacker/target-controlled content dictating a new
+    fetch target, which can point anywhere: a cloud metadata endpoint, an
+    internal service reachable from this worker container, etc. Resolves the
+    hostname and checks every resolved address, not just the literal string,
+    since a hostname can resolve to a private/loopback/link-local address
+    without looking suspicious itself. Same is_private/is_loopback/
+    is_link_local convention already used for this purpose in
+    workers/enrichment/enrichment_worker.py and
+    workers/validation/asset_validation_worker.py -- is_target_in_scope()
+    (backend/app/services/bounty_scope.py) is the wrong tool here, it's a
+    bug-bounty-program authorization matcher with no notion of private IPs."""
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return False
+    host = parsed.hostname
+    try:
+        addrs = [ipaddress.ip_address(host)]
+    except ValueError:
+        try:
+            loop = asyncio.get_event_loop()
+            infos = await loop.getaddrinfo(host, None)
+            addrs = [ipaddress.ip_address(info[4][0]) for info in infos]
+        except (socket.gaierror, OSError, ValueError):
+            return False  # unresolvable -- nothing safe to fetch
+    return bool(addrs) and all(
+        not (a.is_private or a.is_loopback or a.is_link_local or a.is_reserved or a.is_multicast)
+        for a in addrs
+    )
+
+
+def _decode_data_uri_sourcemap(uri: str) -> Optional[str]:
+    """An inline `data:application/json[;base64],<payload>` source map -> its
+    JSON text, or None if it isn't a data URI we can decode."""
+    if not uri.startswith("data:"):
+        return None
+    try:
+        header, _, payload = uri.partition(",")
+        if ";base64" in header:
+            import base64
+            return base64.b64decode(payload).decode("utf-8", errors="ignore")
+        from urllib.parse import unquote
+        return unquote(payload)
+    except Exception:
+        return None
+
+
+async def _fetch_sourcemap_json(
+    session: "aiohttp.ClientSession", js_url: str, js_text: str,
+) -> Optional[Dict[str, Any]]:
+    """Locate and parse a JS bundle's source map. Tries the
+    `//# sourceMappingURL=` comment (inline data URI, or relative/absolute
+    URL) first, then the near-universal `<bundle>.js.map` convention -- which
+    is often served even when the comment was stripped from the bundle.
+    Returns the parsed map dict, or None."""
+    raw: Optional[str] = None
+    candidate_urls: List[str] = []
+
+    m = _SOURCEMAP_URL_RE.search(js_text)
+    if m:
+        ref = m.group(1).strip()
+        inline = _decode_data_uri_sourcemap(ref)
+        if inline is not None:
+            raw = inline
+        else:
+            candidate_urls.append(urljoin(js_url, ref))
+
+    map_guess = js_url.split("?", 1)[0] + ".map"
+    if map_guess not in candidate_urls:
+        candidate_urls.append(map_guess)
+
+    if raw is None:
+        for map_url in candidate_urls:
+            if not await _is_safe_to_fetch(map_url):
+                continue
+            try:
+                async with session.get(map_url) as resp:
+                    if resp.status != 200:
+                        continue
+                    body = await read_body_capped(resp, _SOURCEMAP_MAX_BYTES)
+                    raw = body.decode(errors="ignore")
+                    break
+            except Exception:
+                continue
+
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        # A `.map` guess that 200s with an SPA catch-all HTML page lands here.
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _harvest_sourcemap(smap: Dict[str, Any]) -> Tuple[List[str], str]:
+    """From a parsed source map: the original source file paths (cleaned of
+    `webpack://` / absolute-path noise) and the concatenated original source
+    content. Third-party sources (node_modules / vendor / framework runtime)
+    are dropped so the downstream endpoint/secret passes see the app's own
+    code, not the endpoints and example keys baked into its libraries."""
+    sources = smap.get("sources") or []
+    contents = smap.get("sourcesContent") or []
+    paths: List[str] = []
+    texts: List[str] = []
+    for i, src in enumerate(sources):
+        if not isinstance(src, str):
+            continue
+        low = src.lower()
+        if any(noise in low for noise in ("node_modules", "/vendor/", "webpack/runtime", "webpack/bootstrap")):
+            continue
+        clean = src
+        for prefix in ("webpack://", "webpack-internal:///", "file://"):
+            if clean.startswith(prefix):
+                clean = clean[len(prefix):]
+        # Collapse the `/./` segments webpack embeds (`app/./src/x` -> `app/src/x`)
+        # and drop any leading `./` or `/` so paths read like a real tree.
+        clean = clean.replace("/./", "/").lstrip("./").lstrip("/")
+        if clean:
+            paths.append(clean)
+        if i < len(contents) and isinstance(contents[i], str):
+            texts.append(contents[i])
+    return sorted(set(paths)), "\n".join(texts)[:_SOURCEMAP_SCAN_CHARS]
+
 
 async def discover_js_files(urls: List[str], timeout: int = 15, max_pages: int = 30) -> Set[str]:
     """subjs if installed; otherwise a direct <script src> scrape -- both are
@@ -521,34 +692,55 @@ async def discover_js_files(urls: List[str], timeout: int = 15, max_pages: int =
 async def analyze_js_file(js_url: str, timeout: int = 15, max_bytes: int = 2_000_000) -> Dict[str, Any]:
     """Fetch a JS file and run lightweight LinkFinder/SecretFinder-style regex
     passes over it -- passive content analysis on an already-served, public
-    asset, not active exploitation."""
+    asset, not active exploitation. When the bundle ships a source map, the
+    same passes also run over the recovered original source (see
+    _fetch_sourcemap_json), which routinely surfaces internal endpoints and
+    module paths the minified bundle hides."""
+    empty = {"endpoints": [], "secrets": []}
+    source_paths: List[str] = []
+    src_text = ""
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
-            async with session.get(js_url) as resp:
-                if resp.status != 200:
-                    return {"endpoints": [], "secrets": []}
-                body = await resp.content.read(max_bytes)
-                text = body.decode(errors="ignore")
+            try:
+                async with session.get(js_url) as resp:
+                    if resp.status != 200:
+                        return empty
+                    body = await read_body_capped(resp, max_bytes)
+                    text = body.decode(errors="ignore")
+            except Exception as exc:
+                log.warning("bounty_js_fetch_error", url=js_url, error=str(exc)[:200])
+                return empty
+            # Same open session -- the map lives next to the bundle.
+            smap = await _fetch_sourcemap_json(session, js_url, text)
+            if smap:
+                source_paths, src_text = _harvest_sourcemap(smap)
     except Exception as exc:
-        log.warning("bounty_js_fetch_error", url=js_url, error=str(exc)[:200])
-        return {"endpoints": [], "secrets": []}
+        log.warning("bounty_js_analyze_error", url=js_url, error=str(exc)[:200])
+        return empty
+
+    # Recovered original source is unioned in so every downstream consumer of
+    # endpoints/secrets benefits without changing shape.
+    scan_text = f"{text}\n{src_text}" if src_text else text
 
     endpoints = sorted({
-        m for m in ENDPOINT_PATTERN.findall(text)
+        m for m in ENDPOINT_PATTERN.findall(scan_text)
         if not m.lower().endswith(_ENDPOINT_ASSET_EXTENSIONS)
     })[:200]
-    secrets = sorted(label for label, pattern in SECRET_PATTERNS.items() if pattern.search(text))
-    dom_xss_sinks = sorted(set(DOM_XSS_SINK_RE.findall(text)))[:20]
+    secrets = sorted(label for label, pattern in SECRET_PATTERNS.items() if pattern.search(scan_text))
+    dom_xss_sinks = sorted(set(DOM_XSS_SINK_RE.findall(scan_text)))[:20]
     api_base_urls = sorted({
-        u for u in API_BASE_URL_RE.findall(text)
+        u for u in API_BASE_URL_RE.findall(scan_text)
         if not u.lower().rsplit("?", 1)[0].endswith(_ENDPOINT_ASSET_EXTENSIONS)
     })[:50]
-    return {
+    result: Dict[str, Any] = {
         "endpoints": endpoints,
         "secrets": secrets,
         "dom_xss_sinks": dom_xss_sinks,
         "api_base_urls": api_base_urls,
     }
+    if source_paths:
+        result["source_paths"] = source_paths[:100]
+    return result
 
 
 # ── Module 4: Path & Endpoint Discovery ────────────────────────

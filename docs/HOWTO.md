@@ -127,3 +127,82 @@ make workers-scale NUCLEI=6 DISCOVERY=4 PORT=3
 
 Scale whichever worker type is the current bottleneck for a given workload — nuclei scans are usually
 the slowest stage on a large scan, so that's the one most often scaled up first.
+
+## How to operate Garage (object storage, was MinIO)
+
+`minio/minio` and `minio/mc` were pulled from Docker Hub/quay.io/GHCR by upstream, and MinIO's own
+binary releases (`dl.min.io`) went offline too (`410 Gone`) — see `CHANGELOG.md` for the incident. The
+storage engine is now [Garage](https://garagehq.deuxfleurs.fr) (`infrastructure/garage/`), S3-compatible.
+No app code changed — `backend/app/core/minio_client.py` and the workers still use the `minio` Python
+SDK, just pointed at `garage:3900` instead of `minio:9000`.
+
+**Checking health / poking at buckets:**
+
+```bash
+docker compose logs garage                                    # bootstrap log + ongoing server logs
+docker compose exec garage garage status                      # cluster/node health
+docker compose exec garage garage bucket info screenshots      # size, object count, permissions
+docker compose exec garage garage key list                    # access keys known to this cluster
+```
+
+**Why there's no separate init container anymore:** Garage's official image ships only the `/garage`
+binary — no shell, can't self-bootstrap. `infrastructure/garage/entrypoint.sh` starts `garage server` in
+the background, waits for it, then assigns cluster layout, imports `$MINIO_ACCESS_KEY`/
+`$MINIO_SECRET_KEY` as a Garage access key, creates the 4 buckets, grants read+write, and enables
+anonymous website access on `screenshots` only — every step checks before acting, so a normal
+`docker compose restart garage` just replays the bootstrap log harmlessly.
+
+**Credentials:** `MINIO_ACCESS_KEY`/`MINIO_SECRET_KEY` in `.env` are reused (same var names), but Garage
+validates their format strictly, unlike MinIO: access key must be `GK` + 24 hex chars, secret must be 64
+hex chars.
+
+```bash
+echo "MINIO_ACCESS_KEY=GK$(openssl rand -hex 12)"
+echo "MINIO_SECRET_KEY=$(openssl rand -hex 32)"
+```
+
+Changing these in `.env` and restarting does **not** rotate anything by itself — `entrypoint.sh` only
+imports a key if one with that exact ID doesn't already exist. To actually rotate: `garage key list` to
+find the old key's ID, `garage key delete <id>`, update `.env`, `docker compose up -d garage` to
+re-import and re-grant.
+
+**Backups:** `make prod-backup` backs up the `screenshots` bucket via a one-off `amazon/aws-cli`
+container (not `mc` — that binary doesn't exist in the Garage image) pointed at Garage's S3 API, landing
+in `backups/garage/`. To back up a different bucket by hand:
+
+```bash
+source .env
+docker run --rm --network attack-surfaces-management_asm-internal \
+  -e AWS_ACCESS_KEY_ID="$MINIO_ACCESS_KEY" -e AWS_SECRET_ACCESS_KEY="$MINIO_SECRET_KEY" \
+  -e AWS_EC2_METADATA_DISABLED=true -v "$(pwd)/backups/garage:/backup" \
+  amazon/aws-cli:2.17.62 --endpoint-url http://garage:3900 --region us-east-1 \
+  s3 sync s3://<bucket> /backup
+```
+
+(`--network` assumes the compose project is named after the repo directory, Docker's default — if
+that's not your setup, resolve it instead: `docker compose ps -q garage | xargs docker inspect --format
+'{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}'`.) There's no Garage equivalent of MinIO's
+bundled browser console (port 9001) — dropped, not replaced; use the same `aws-cli` pattern with `s3 ls`
+to look around manually.
+
+**Public (anonymous) screenshot access:** Garage has no MinIO-style anonymous bucket policy on its
+normal S3 API — public reads only exist through its separate Host-header-routed website-serving mode.
+`nginx.conf`'s `/storage/screenshots/` location strips the bucket prefix and sets
+`Host: screenshots.web.garage.internal` (never resolved over real DNS, nginx just sets the header)
+before proxying to Garage's website port (3902); `evidence`/`reports`/`exports` stay key-authenticated
+on the normal S3 API port (3900). If screenshots stop loading: `garage bucket info screenshots | grep -i
+website` should say `true`, then check `docker compose logs nginx`.
+
+**Troubleshooting:**
+- *Unhealthy/restarting `garage` container* — the healthcheck is `garage status`, which succeeds even
+  pre-bootstrap (reports "NO ROLE ASSIGNED"), so a failure means the daemon itself isn't responding, not
+  a bootstrap-in-progress state. Check `docker compose logs garage` for the actual error.
+- *`S3Error` on app startup* — `init_minio()` retries for 5 attempts before raising, so a transient
+  Garage restart shouldn't be fatal. Confirm `MINIO_ENDPOINT=garage:3900` (not `9000`, MinIO's old port).
+- *`minio/minio` or `minio/mc` pull errors again* — shouldn't happen; nothing in this repo references
+  those images anymore (`grep -rn "minio/" docker-compose.yml infrastructure/` turns up nothing but
+  historical comments). If it does, something reintroduced a direct MinIO reference — check `git diff`
+  before debugging it as a registry outage.
+- *Rebuilding fails* — `infrastructure/garage/Dockerfile` pins `FROM dxflrs/garage:v1.0.1`. If that tag
+  ever disappears, `docker pull dxflrs/garage:v1.0.1` directly first to confirm it's this image and not
+  a wider registry/network issue, the same way the original MinIO incident was diagnosed.

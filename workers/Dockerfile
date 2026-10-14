@@ -54,7 +54,8 @@ RUN go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@v2.14.0
     && go install -v github.com/hahwul/dalfox/v2@v2.9.2 \
     && go install -v github.com/hakluke/hakrawler@latest \
     && go install -v github.com/003random/getJS/v2@latest \
-    && go install -v github.com/projectdiscovery/alterx/cmd/alterx@latest
+    && go install -v github.com/projectdiscovery/alterx/cmd/alterx@latest \
+    && go install -v github.com/projectdiscovery/interactsh/cmd/interactsh-client@v1.3.1
 
 # ── Bug bounty active-exploit tools (pinned) ───────────────────
 # sqlmap runs as a script (invoked via `python /opt/sqlmap/sqlmap.py`), not a
@@ -99,6 +100,7 @@ RUN pip install --no-cache-dir --upgrade pip \
     && ln -sf /go/bin/subzy /usr/local/bin/subzy \
     && ln -sf /go/bin/nuclei /usr/local/bin/nuclei \
     && ln -sf /go/bin/dalfox /usr/local/bin/dalfox \
+    && ln -sf /go/bin/interactsh-client /usr/local/bin/interactsh-client \
     && pip install --no-cache-dir arjun==2.2.7
 
 # ── tldextract data ────────────────────────────────────────────

@@ -54,6 +54,12 @@ class BountyProbeWorker(BountyStageWorker):
             )).scalars().all()
 
         scope_rules = program.scope_rules or []
+        roe = program.rules_of_engagement or {}
+        # A bug bounty program's required identifying header (e.g. Bugcrowd's
+        # X-Request-Purpose) must reach every request, including this stage's
+        # httpx liveness probe -- it's often the very first traffic the
+        # pipeline sends, so it needs to be identifiable from the start too.
+        extra_headers: Dict[str, str] = dict(roe.get("custom_headers") or {})
         in_scope_targets: List[BountyTarget] = []
         for target in targets:
             if is_target_in_scope(target.value, scope_rules):
@@ -72,7 +78,7 @@ class BountyProbeWorker(BountyStageWorker):
         with tempfile.TemporaryDirectory(prefix="asm-bounty-probe-") as tmpdir_raw:
             tmpdir = Path(tmpdir_raw)
             probe_values = [t.value for t in in_scope_targets]
-            alive = await run_httpx(probe_values, tmpdir)
+            alive = await run_httpx(probe_values, tmpdir, extra_headers=extra_headers)
 
         # WAF fingerprint the alive targets (bounded). Keyed by target value.
         waf_by_value: Dict[str, Any] = {}

@@ -19,6 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services.bounty_priority import host_sort_key
 from app.services.bounty_scope import is_target_in_scope
 from workers.bounty.bounty_stage import BountyStageWorker
 from workers.bounty.browser_crawl import browser_crawl
@@ -172,7 +173,13 @@ class BountyReconWorker(BountyStageWorker):
         # login_and_get_session (not just login_and_get_token) because the
         # browser crawl below needs more than the bearer token to make an SPA
         # actually render its logged-in state -- see browser_crawl.py.
-        extra_headers: Dict[str, str] = {}
+        # custom_headers (e.g. a bug bounty program's required
+        # X-Request-Purpose/X-Bugcrowd-Ninja identifying header) applies to
+        # every request regardless of whether auth succeeds -- some programs
+        # require it even on unauthenticated traffic to avoid being blocked
+        # as unidentified/adversarial. Seeded before the auth check so it's
+        # present on the login POST itself too, not just requests after it.
+        extra_headers: Dict[str, str] = dict(roe.get("custom_headers") or {})
         auth_token: Optional[str] = None
         session_fields: Dict[str, str] = {}
         auth_login_url = roe.get("auth_login_url")
@@ -183,9 +190,10 @@ class BountyReconWorker(BountyStageWorker):
                 auth_login_url, auth_email, auth_password,
                 email_field=roe.get("auth_email_field", "email"),
                 password_field=roe.get("auth_password_field", "password"),
+                extra_headers=extra_headers,
             )
             if auth_token:
-                extra_headers = {"Authorization": f"Bearer {auth_token}"}
+                extra_headers["Authorization"] = f"Bearer {auth_token}"
             log.info("bounty_recon_auth", program_id=program_id, authenticated=bool(auth_token))
 
         # Seed recon from BOTH explicit domain targets AND the in-scope domain
@@ -229,9 +237,14 @@ class BountyReconWorker(BountyStageWorker):
         promoted = 0
         if message.get("auto_chain"):
             async with get_session() as db:
-                promoted = await self._auto_promote_in_scope(db, program_id, scope_rules)
+                promoted = await self._auto_promote_in_scope(db, program_id, scope_rules, domains)
 
-        authenticated = bool(extra_headers)
+        # bool(auth_token), not bool(extra_headers): extra_headers is now
+        # seeded from custom_headers too (see above), so it's non-empty
+        # whenever a program sets custom_headers regardless of whether login
+        # actually succeeded -- auth_token is the only thing that's actually
+        # true iff login succeeded.
+        authenticated = bool(auth_token)
         log.info(
             "bounty_recon_completed",
             program_id=program_id, domains=len(domains),
@@ -271,6 +284,16 @@ class BountyReconWorker(BountyStageWorker):
             entries: List[Tuple[str, str, str, Dict[str, Any]]] = []
 
             subdomains = await self._enumerate_subdomains(domain, tmpdir, entries)
+            # Rank once here so every bounded consumer below inherits it: each
+            # of _resolve_base_urls / _collect_urls (katana) / _discover_paths
+            # (ffuf, feroxbuster) / _discover_apis / _browser_crawl_urls takes
+            # its own `subdomains[:MAX_*]` slice, and the list arrives from a
+            # dict-ordered set, so which handful got the expensive deep crawls
+            # was previously an arbitrary draw -- on a 307-host program only 2
+            # hosts get a browser crawl and 2 get feroxbuster. Every host is
+            # still recorded as an asset (that happens inside
+            # _enumerate_subdomains); this only decides who gets crawled deeply.
+            subdomains = sorted(subdomains, key=lambda h: host_sort_key(h, [domain]))
             base_urls = await self._resolve_base_urls(subdomains, tmpdir, extra_headers)
             await self._collect_urls(domain, subdomains, base_urls, tmpdir, entries, extra_headers)
             await self._analyze_js(entries)
@@ -281,7 +304,9 @@ class BountyReconWorker(BountyStageWorker):
             async with get_session() as db:
                 return await self._persist(db, program_id, entries)
 
-    async def _auto_promote_in_scope(self, db: AsyncSession, program_id: str, scope_rules) -> int:
+    async def _auto_promote_in_scope(
+        self, db: AsyncSession, program_id: str, scope_rules, seed_domains: Optional[List[str]] = None,
+    ) -> int:
         """Promote in-scope subdomain assets to domain targets (full-auto only).
 
         Mirrors endpoints/bounty.py::promote_asset -- scope re-check + dedup
@@ -289,6 +314,13 @@ class BountyReconWorker(BountyStageWorker):
         out-of-scope asset can never become testable. Promoting the hosts is
         enough: exploit pulls its candidate URLs from in-scope BountyAssets
         that are owned by an approved target, so the URLs come along for free.
+
+        Candidates are ranked by host_sort_key before the MAX_AUTO_PROMOTE cut.
+        This query has no inherent ordering, so before that the surviving N was
+        an arbitrary draw: measured on a real 307-subdomain program, the 50
+        promoted hosts included three school-registration sites and a
+        veterinary queue app while `rootwebadmin`, six tax systems, `lpse`,
+        `simpeg`, `disdukcapil`, `vpn` and `owncloud` were never tested at all.
         """
         existing = set((await db.execute(
             select(BountyTarget.value).where(BountyTarget.program_id == program_id)
@@ -301,6 +333,7 @@ class BountyReconWorker(BountyStageWorker):
                 BountyAsset.promoted.is_(False),
             )
         )).scalars().all()
+        assets = sorted(assets, key=lambda a: host_sort_key(a.value, seed_domains))
 
         promoted = 0
         for asset in assets:
@@ -483,6 +516,11 @@ class BountyReconWorker(BountyStageWorker):
                 extras["dom_xss_sinks"] = analysis["dom_xss_sinks"]
             if analysis.get("api_base_urls"):
                 extras["api_base_urls"] = analysis["api_base_urls"][:20]
+            # Original source file paths recovered from a .js.map -- reveal the
+            # app's real internal module tree (admin/api code that was split
+            # out of the served bundle), high-signal for a human reviewer.
+            if analysis.get("source_paths"):
+                extras["source_paths"] = analysis["source_paths"][:50]
             if extras:
                 entries.append((f"js_intel@{js_url}", "js_finding", "js_analysis", {"js_file": js_url, **extras}))
 

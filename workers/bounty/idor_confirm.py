@@ -103,6 +103,7 @@ def generate_test_identity(reference_email: str) -> tuple[str, str]:
 
 async def register_test_identity(
     registration_url: str, fields_template: Dict[str, Any], email: str, password: str, timeout: int = 20,
+    extra_headers: Optional[Dict[str, str]] = None,
 ) -> bool:
     """POST a program-configured registration payload shape. Returns whether
     it looked like it succeeded (2xx) -- callers proceed to attempt login
@@ -110,7 +111,9 @@ async def register_test_identity(
     login attempt itself is the real confirmation this identity is usable."""
     payload = _fill_template(fields_template, email, password)
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout), headers=_UA) as s:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=timeout), headers={**_UA, **(extra_headers or {})},
+        ) as s:
             async with s.post(registration_url, json=payload, allow_redirects=False) as r:
                 ok = 200 <= r.status < 300
                 if not ok:

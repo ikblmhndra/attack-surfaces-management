@@ -4,6 +4,537 @@ All notable changes to this project are documented below, sorted newest-first.
 
 ---
 
+## 2026-10-14 — Makefile still referenced `minio` after the Garage migration (found during repo audit)
+
+Audit pass (code review + security review + live end-to-end run of the stack) over the Garage migration
+and the pending `workers/bounty/*` changes. The Garage migration itself checked out end-to-end (user
+registration → org → scan → full pipeline → PDF report landed in the Garage `reports` bucket, all
+verified live) — but `Makefile` still had 3 literal `minio` references that would have broken on next use.
+
+### Fixed
+- **`Makefile`**: `up-infra` and `health` targets referenced the now-gone `minio` service — renamed to
+  `garage`. `health` also had a pre-existing (unrelated to this migration) bug: `docker compose ps
+  <single-service> --format json` returns one JSON object, not an array, so `d[0].get(...)` raised
+  `KeyError` and was silently caught, reporting "checking..." for every service, always. Fixed to handle
+  both shapes.
+- **`prod-backup`**: used `mc mirror` (the MinIO client binary), which no longer exists in the Garage
+  container (it ships only the `garage` binary, no shell, no `mc`). Replaced with `aws s3 sync` against
+  Garage's S3 API via a one-off `amazon/aws-cli` container — verified against the real bucket.
+
+---
+
+## 2026-10-14 — Replaced MinIO with Garage (upstream pulled MinIO's public images/binaries)
+
+`docker compose up` started failing with `pull access denied for minio/mc, repository does not exist`.
+Verified this is not a local auth/rate-limit issue: `minio/minio` and `minio/mc` are both gone from
+Docker Hub (`hub.docker.com/v2/repositories/minio/*` → `object not found`), `quay.io/minio/*` now
+requires auth, `ghcr.io/minio/*` → `denied`, and MinIO's own binary releases (`dl.min.io`) return
+`410 Gone`. Upstream has pulled free public distribution entirely — this breaks for everyone still
+pointing at those images, not just this repo.
+
+### Changed
+- Swapped the storage engine for **Garage** (`dxflrs/garage`, S3-compatible, still freely
+  distributed, verified against the actual binary before committing to it — see
+  `infrastructure/garage/`). The `minio` Python SDK (`backend/app/core/minio_client.py`, workers) is
+  generic S3, so this needed no application code changes — only infra:
+  - `docker-compose.yml`: `minio` + `minio-init` services replaced by a single `garage` service.
+    Garage's official image is scratch-based (no shell, can't self-bootstrap), so
+    `infrastructure/garage/Dockerfile` repackages the same binary in Alpine and
+    `infrastructure/garage/entrypoint.sh` does first-boot cluster layout / access key import /
+    bucket creation (idempotent across restarts) — there's no separate init container anymore.
+  - `infrastructure/garage/garage.toml`: `s3_region` pinned to `us-east-1` (the `minio` SDK's
+    hardcoded default region — a mismatch fails every request with `AuthorizationHeaderMalformed`).
+    No secrets in this file; `rpc_secret`/`admin_token` come from `GARAGE_RPC_SECRET`/
+    `GARAGE_ADMIN_TOKEN` env vars, which the `garage` binary reads itself.
+  - `infrastructure/nginx/nginx.conf`: Garage has no MinIO-style anonymous bucket policy on its S3
+    API — public reads only exist through its Host-header-routed website-serving mode. The
+    `/storage/screenshots/` location now strips the bucket prefix and proxies to Garage's website
+    port with an explicit `Host` header instead of passing `$host` through (verified: non-public
+    buckets still 404 anonymously).
+  - `MINIO_ACCESS_KEY`/`MINIO_SECRET_KEY` env var names kept as-is (zero app-code churn), but
+    **Garage validates their format strictly** unlike MinIO: access key must be `GK` + 24 hex
+    chars, secret must be 64 hex chars. `.env.example` documents the generation one-liners.
+  - MinIO's bundled browser console (port 9001) has no Garage equivalent — dropped, not replaced.
+
+---
+
+## 2026-08-06 — Source-map extraction in JS analysis (+ fixed a systemic chunked-read truncation bug it uncovered)
+
+Reviewed the `claude-bughunter` plugin's `/recon` skill against our pipeline. Ours is broader on almost
+every axis (more subdomain sources, more crawlers, gf classification, nuclei, takeover, sensitive-file
+checks all already present) — but it does one thing we didn't: **source-map extraction**. A deployed
+`.js.map` reconstructs a bundle's original pre-minification source, which routinely exposes internal API
+endpoints, admin/module paths split out of the served bundle, developer comments, and un-mangled names.
+Our `analyze_js_file` only ever regex'd the minified bundle.
+
+### Added
+- **`workers/bounty/tools.py`**: `analyze_js_file` now locates a bundle's source map (via the
+  `//# sourceMappingURL=` comment — inline `data:` URI or relative/absolute URL — with a
+  `<bundle>.js.map` convention fallback), parses it, and runs the same endpoint/secret/api-base passes
+  over the **recovered original source**, unioned with the minified results so every downstream consumer
+  benefits with no shape change. Third-party sources (`node_modules`/`vendor`/framework runtime) are
+  dropped so library endpoints and example keys don't pollute results. New `source_paths` field surfaces
+  the recovered internal module tree; `recon_worker.py::_analyze_js` records it in the per-file js_intel.
+- Verified end-to-end against a controlled minified-bundle-plus-map server: admin endpoints present
+  **only** in the source map (`/api/v1/admin/users/delete`, `/internal/admin/impersonate/`) are
+  recovered, the minified bundle's own endpoint is still found (union not replacement), a secret in the
+  recovered source is labelled, node_modules paths/endpoints are excluded, and a JS file with no source
+  map still analyses exactly as before. Also live-checked against a real published map (axios on
+  jsdelivr): 41 real source paths recovered.
+
+### Fixed (systemic bug the live test surfaced)
+- `resp.content.read(n)` returns only what's **currently buffered** on a chunked/streamed response, not
+  up to `n` bytes — observed live: a single `read(15MB)` against a chunked jsdelivr source map returned
+  just the first **279-byte** chunk, so the JSON never parsed and the whole feature silently no-op'd.
+  This was **not** unique to the new code: the same `content.read(n)` pattern was in **6 other read
+  sites** across `detect.py` (catch-all baseline, `check_sensitive_files`, 403-bypass, vulnerable-
+  component JS reads), `upload_xxe.py` (XXE), and `exploit_tools.py` (LFI) — every one of which could
+  under-read a chunked response and **miss a finding** whose signature sits past the first chunk (a
+  leaked `.env` whose `DB_` line isn't in chunk one, an `/etc/passwd` read that arrives chunked, etc).
+  Added `read_body_capped(resp, max_bytes)` (accumulates chunks to EOF or the cap) and swept all 7 sites
+  onto it. Verified no import cycle across all three worker containers (tools.py imports none of its new
+  consumers) and re-ran the sensitive-file redaction e2e (which exercises the swept
+  `check_sensitive_files` path) — still green.
+
+---
+
+## 2026-08-06 — Evidence redaction: stop persisting the target's secrets and citizens' PII
+
+Installed the `claude-bughunter` plugin (82 offensive-security skills) and reviewed it for techniques
+worth adopting into the pipeline. Its `evidence-hygiene` skill is mostly a human capture/redaction
+workflow (screenshot black-barring, HAR sanitisation) and isn't implementable here — but its core
+principle, *"prove the bug, not the user"*, pointed at a real gap in our own code.
+
+**The gap**: findings store a snippet of the target's live response body (`evidence.excerpt`) and
+`bounty_report_templates.py` drops it verbatim into the generated draft under "Response excerpt
+confirming the issue". All three capture sites stored it **raw**. `nuclei` was already invoked with
+`-redact` for auth headers, so the tool we shell out to was more careful than our own code.
+
+This is not hypothetical for this deployment. The programs here are Indonesian public sector, and the
+host-prioritisation work earlier the same day deliberately steers testing toward `disdukcapil` (civil
+registry → NIK), `simpeg`/`bkpsdm` (HR), and `rsud`/`simrs` (medical) — i.e. we had just aimed the
+pipeline at the highest-PII systems in the program while still capturing their responses unredacted.
+
+### Added
+- **`backend/app/services/bounty_redaction.py`** (new): `redact_evidence(text, limit)` masks secret and
+  PII *values* while preserving structure — keys, JSON shape, status codes and trace IDs all stay, since
+  those are what prove the finding and what a triager needs to correlate logs. Covers sensitive keyed
+  pairs (JSON / form / `.env` shapes), emails (local part masked, domain kept), JWTs, Indonesian mobile
+  numbers, and NIK/NPWP identifiers.
+- Wired into all three excerpt-capture sites: `detect.py::check_sensitive_files`,
+  `exploit_tools.py` (LFI), `upload_xxe.py` (XXE). Redaction happens at **capture**, not at report
+  render, so the raw value never reaches the database at all. `limit` truncates *after* redaction —
+  truncating first could cut a value mid-token and leave a partial secret no pattern matches.
+
+### Deliberately not attempted
+- **Personal names.** No reliable pattern exists, and a heuristic aggressive enough for Indonesian names
+  would shred ordinary response text and destroy the excerpt's evidential value. Left as a human step at
+  submission time (the skill's black-bar protocol covers it). The test asserts this explicitly so the
+  limitation is visible rather than assumed.
+
+### Verified
+- Unit-tested against realistic shapes: a leaked `.env`, a civil-registry JSON response, a loose JWT.
+- **False-positive guards asserted too**, since over-redaction silently destroys evidence: a 13-digit
+  millisecond epoch timestamp, trace/request IDs, small numbers and ordinary HTML all pass through
+  untouched. The NIK/NPWP rule is bounded to exactly 15–16 digits rather than a generic "long digit run"
+  precisely to avoid eating ms-epoch timestamps.
+- End-to-end through the real detection path (local server serving a leaked `.env` → `check_sensitive_files`
+  → stored finding): the `.env` is **still detected** at high severity, `DB_PASSWORD`/`APP_KEY`/NIK/phone/
+  email values are gone, while `DB_PASSWORD` as a *key*, `APP_ENV=production`, `DB_HOST` and the email
+  domain remain readable.
+- Two bugs were caught by these tests rather than by inspection, both the same shape as the hostname bug
+  fixed earlier today — a token boundary that didn't survive real-world naming:
+  1. `\b` before the key name meant `DB_PASSWORD` / `MAIL_PASSWORD` / `user_email` never matched, i.e.
+     the single most common form of the thing being redacted. Fixed by allowing a leading identifier
+     fragment while still requiring the key to end at the delimiter (`"passwordish"` still won't match).
+  2. The key list had `api_key` but not bare `key`, so Laravel's `APP_KEY` — the most common real secret
+     in a leaked `.env` — sailed through. Added, accepting occasional over-match on a benign JSON `"key"`
+     field as the cheaper error.
+- Confirmed no retroactive cleanup was needed: queried every stored excerpt across all five programs for
+  secret/PII patterns — zero matches (the KPI `.env` finding was a catch-all HTML page, not a real file).
+
+### Evaluated and NOT adopted (recording the reasoning, not silently skipping)
+- **`hunt-cache-poison`**: cache poisoning by definition risks serving attacker-controlled content to the
+  target's real users. Every program brief this pipeline runs against forbids disrupting legitimate
+  users, and the skill's own method depends on a cache-buster behaving exactly as expected to stay
+  contained. Not something to automate unprompted.
+- **`hunt-business-logic`**: coupon-race-stacking, negative-quantity price tampering, checkout-amount
+  tampering — all state-changing financial operations, and all requiring app-specific knowledge of which
+  endpoint does what. Same category as the race-condition module, which for exactly this reason requires
+  the operator to name the endpoint via `rules_of_engagement` rather than discovering it.
+- **`triage-validation`, `bugcrowd-reporting`, `report-writing`**: human judgement gates (7-question
+  validity gate, severity decisions, dedup checks). These are valuable *as skills* — which is how the
+  plugin already provides them once loaded — and hard-coding them into pipeline logic would replace
+  researcher judgement with a heuristic, the opposite of what they're for.
+
+---
+
+## 2026-08-06 — Pipeline audit: bounded stages kept an *arbitrary* subset, not the most promising one
+
+Audited recon/vulnscan/exploit for improvement opportunities. Found one bug repeated in three places:
+every stage correctly bounds how much it processes, but three of them then took a plain list slice over
+an unordered source, so *which* items survived the bound was an arbitrary draw rather than a choice.
+
+Measured on the live 307-subdomain Diskominfo Tangsel program: of 307 discovered subdomains only 50
+(16%) were auto-promoted to testable targets, and the 50 that won included `ppdbsmpn11`/`13`/`15`
+(school-registration sites), `anggur`, and `antrian-keswankesmavet` (a veterinary queue app) — while
+`rootwebadmin`, six tax systems (`pajak`, `bapenda`, `bphtb`, `pbb-bphtb`, `e-sptpd`, `pendapatan`),
+`lpse` (procurement), `simpeg`/`bkpsdm` (HR), `disdukcapil` (civil registry), `vpn`, `owncloud` and
+~15 `api.*` hosts were never tested at all. Bali showed the same shape (194 subdomains, 50 promoted).
+
+### Added
+- **`backend/app/services/bounty_priority.py`** (new): `host_priority_score()`/`host_sort_key()` — a
+  coarse 5-tier triage score for bare hostnames (tier 0 admin/auth/remote-access/devops, 1 sensitive
+  business systems, 2 dev/staging, 3 api/service, 4 everything else), plus `seed_domains_from_scope()`.
+  Lives in `app/services` (not `workers/`) for the same reason `bounty_report_templates.py` does: both
+  worker and backend code need it. Distinct from `bounty_report.py::PRIORITY_BUCKETS`, which matches URL
+  *paths* — these match host labels, which is why it isn't a reuse of that table.
+
+### Changed
+- **`workers/bounty/recon_worker.py`** — two sites:
+  - `_auto_promote_in_scope()` now ranks candidates before the `MAX_AUTO_PROMOTE` cut (the query has no
+    `ORDER BY`, so the surviving 50 were whatever Postgres returned first). Takes the run's seed domains
+    so the program's own apex/`www` host is pinned rather than scored as generic.
+  - `_process_domain()` sorts `subdomains` once right after enumeration, so all five bounded consumers
+    downstream inherit it (`_resolve_base_urls`, katana seeds in `_collect_urls`, ffuf + feroxbuster in
+    `_discover_paths`, `_discover_apis`, `_browser_crawl_urls`). On a 307-host program only 2 hosts get
+    a browser crawl and 2 get feroxbuster — previously an arbitrary 2. Every host is still *recorded* as
+    an asset regardless; this only decides who gets crawled deeply.
+- **`workers/bounty/vulnscan_worker.py`**: target selection sorts alive-first (probe already proved they
+  respond), then by host priority, before the `MAX_TARGETS_PER_RUN` cut. Barely visible on a 50-target
+  program, decisive on a wide one — the `PU` program here has **3619 targets of which this cap scans 50
+  (1.4%)**, previously whichever 50 the query happened to return.
+- The tiebreak in `host_sort_key` is the hostname itself, which also makes a truncated run
+  **reproducible** — before this, two runs over identical data could test different hosts with no way to
+  tell why.
+
+### Verified
+- Scorer unit-tested, then validated against the real 307-host dataset: **10/10** of the high-value hosts
+  the audit found skipped now land inside the top 50, with the promoted set going from mostly generic to
+  `{tier0: 20, tier1: 26, tier2: 4}`.
+- Integration-tested the wiring: `seed_domains_from_scope` against real scope-rule shapes (wildcard
+  stripping, out-of-scope carve-outs correctly *not* treated as seeds, non-domain rule types ignored);
+  vulnscan's alive-first-then-priority ordering; and `_auto_promote_in_scope` end-to-end against the real
+  307 hosts **deliberately shuffled first**, so a pass couldn't come from already-sorted input.
+- Two design bugs were caught *by* that real-data validation rather than by the unit tests, and are worth
+  recording because both looked fine in isolation:
+  1. First revision required a keyword to be a whole host label, which missed `cpanel1` (numeric suffix),
+     `disdukcapil` and `apisimpeg` (Indonesian hostnames glue words together). Fixed by matching at the
+     start *or* end of a label, tolerating trailing digits.
+  2. First tier ordering put dev/staging and `api.*` above sensitive business systems. That filled 49 of
+     50 slots with tier-0/dev/api hosts and admitted exactly **one** business system — `pajak`, `lpse`,
+     `simpeg`, `disdukcapil` all still missed the cut, i.e. it barely beat the arbitrary draw it
+     replaced. Reordered so money/PII systems rank directly below the direct-compromise tier.
+
+### Not changed (audit finding that did not survive checking)
+- The audit initially flagged `naabu`, `tlsx`, `amass` and `getJS` as installed-but-unused in
+  `workers/Dockerfile`. Checking before touching anything showed the first three are used actively by the
+  **ASM scanner** pipeline (`port_worker.py`, `coverage_worker.py`, `discovery_worker.py`), which shares
+  the same image — removing them would have broken it. Only `getJS` is genuinely unreferenced (Dockerfile
+  only, zero Python references); left in place as a one-line cleanup not worth an image rebuild on its
+  own. Recording this because the original audit statement was wrong.
+- Exploit stage needed no change: it already sorts by `_priority_score` before its `MAX_URLS` cut. That
+  existing pattern is what the three fixes above were modelled on.
+
+---
+
+## 2026-08-04 — Auto-managed interactsh session: stable OOB domain + automatic SSRF confirmation
+
+SSRF confirmation previously required `rules_of_engagement.oob_domain` to be manually copy-pasted from
+the interactsh web UI (app.interactsh.com) -- every time that page is reopened it starts a fresh session
+with a new random subdomain, so the configured domain routinely went stale between pipeline runs. Worse,
+`run_ssrf` only ever injected payloads and recorded `status: "inconclusive"` -- it never checked whether
+the target actually made a real outbound request, leaving the researcher to manually cross-reference
+every injected token against the interactsh dashboard by hand (confirmed 0/15 real SSRF this way against
+the Bali program's `invest.baliprov.dev`/`digifest.baliprov.dev` candidates).
+
+### Added
+- **`workers/bounty/interactsh_session.py`** (new): wraps the real `interactsh-client` Go binary as a
+  managed background subprocess for the duration of one exploit run, rather than reimplementing its
+  RSA-OAEP + AES-256-CTR interaction-decryption protocol in Python (too easy to get a crypto detail
+  subtly wrong and silently miss real interactions -- same "shell out to the real tool" convention every
+  other Go-based check in this pipeline already follows). interactsh-client has no one-shot flag (it
+  polls continuously by design), so this manages the full lifecycle: `start_session()` launches it
+  (resuming a persisted session file if one was handed in), reads its startup banner to learn the
+  assigned domain, and `InteractshSession.stop_and_collect()` gives trailing OOB callbacks a grace
+  period, terminates the process, and returns the accumulated JSONL interactions plus the (updated)
+  session file content for the caller to persist.
+  - **Verified live against the real interactsh-client binary + public oast.fun server** (not assumed
+    from docs, which turned out to be wrong on two points -- see Fixed below): resuming a persisted
+    session reuses the exact same `correlation-id`/`secret-key` (confirmed by diffing the session YAML
+    before/after resumption) -- i.e. the underlying session identity is genuinely stable and never
+    re-registers from scratch. What's *not* stable, and by design: each individual domain generated
+    within that session still gets a fresh random suffix on top of the shared `correlation-id` root
+    (e.g. `d9onkb3rnlps7pe96eg0ecbtgpi3q7ke5.oast.fun` then `d9onkb3rnlps7pe96eg0jhd7568mqqkre.oast.fun`
+    -- same `d9onkb3rnlps7pe96eg0` root, different suffix). This is correct interactsh behavior, not a
+    bug to work around -- a literal single static domain reused forever would itself be a weaker OOB
+    testing practice (predictable, no per-test isolation). The actual win over the old manual-copy-paste
+    flow is unchanged: no more visiting a web page and copying a URL by hand, and confirmation is now
+    automatic instead of manual.
+- **`workers/bounty/exploit_worker.py`**: new opt-in `rules_of_engagement.interactsh_auto` -- when set,
+  starts a session before SSRF testing (using it as `oob_domain` instead of/on top of any manually-set
+  one), and after all SSRF injections for the run, polls for real interactions and correlates them
+  against the specific per-param tokens `run_ssrf` already embeds in its payload subdomains (`_confirm_
+  ssrf_via_interactions`, a pure function tested independently of the subprocess). A genuine match
+  upgrades that finding from `status: "inconclusive"` to `"confirmed"`, severity to `"high"`, and attaches
+  the interaction's own evidence (source IP, protocol, timestamp) -- proof, not just an assertion. No
+  match (the common case -- most injected params were never used to build an outbound request at all)
+  leaves the finding exactly as before this feature existed.
+- **`workers/bounty/bounty_stage.py`**: `set_interactsh_session_data()` -- persists the session file's
+  YAML content into `rules_of_engagement.interactsh_session_data` via a single-key `jsonb_set` (same
+  pattern `set_stage_status` already uses for `stage_status`, so a concurrent RoE edit elsewhere is never
+  clobbered), so the next exploit run resumes the same session identity instead of re-registering from
+  scratch each time.
+- **`workers/Dockerfile`**: `interactsh-client@v1.3.1` (pinned, matching this file's existing convention)
+  added to the Go-tool install chain and symlinked into `/usr/local/bin`.
+- **`RulesOfEngagementEditor`** (`page.tsx`): the existing manual "OOB domain" field is now behind an
+  "Auto-manage via interactsh-client (recommended)" checkbox -- checked, it explains the persisted-session
+  behavior and exposes an optional server override (for a future self-hosted `interactsh-server`, not
+  built yet -- that needs a domain with NS delegation and a publicly-reachable host, real infrastructure
+  the researcher has to provision, not something addressable in code); unchecked, falls back to the
+  original manual field unchanged.
+- Verified `_confirm_ssrf_via_interactions`'s correlation logic with 5 unit tests: no interactions leaves
+  everything untouched, a matching interaction confirms only the matching finding (siblings untouched),
+  partial confirmation on a multi-param finding only marks the param that actually got a hit, a full-id
+  that merely *contains* a token without it being a genuine subdomain prefix is correctly rejected (not
+  just substring matching), and an injection payload referencing a different session's oob_domain is
+  correctly ignored rather than cross-matched against this run's interactions.
+
+### Fixed (found during live verification against the real binary -- both wrong assumptions from reading upstream source/docs rather than testing)
+- **Domain-banner parsing**: assumed `interactsh-client` prints its assigned domain as a bare hostname on
+  its own line (what the Go source's `gologger.Info().Msgf("%s\n", ...)` call site suggested). Live
+  output showed it's actually prefixed with an ANSI-colored `[INF]` level tag on every line (`\x1b[34mINF
+  \x1b[0m] d9onhi....oast.fun`), which the original `^hostname$`-anchored regex never matched -- every
+  session silently "failed to start" with no domain observed. Fixed by stripping ANSI escape codes and
+  searching for the domain pattern anywhere in the line instead of anchoring the whole line to it.
+- **Session file never saved**: assumed passing `-session-file <path>` would make the client persist its
+  session on exit regardless of how it was stopped. Traced through the actual source: `SaveSessionTo()`
+  is only ever called from a `signal.Notify(c, os.Interrupt)` handler -- i.e. SIGINT only. This module was
+  calling `Process.terminate()` (SIGTERM on POSIX), which interactsh-client doesn't handle at all, so it
+  died with no session file written every time -- resumption silently never worked. Fixed by sending
+  SIGINT (`send_signal(signal.SIGINT)`) instead.
+- Both were caught by testing against the real binary end-to-end (fresh session -> real self-triggered
+  callback -> stop -> resume from saved session -> diff the session YAML) rather than trusting the
+  upstream source reading alone -- consistent with this whole session's "verify against the real target/
+  tool before believing it works" discipline.
+
+User manually validated the confirmed SSTI finding from the Bali pipeline run (`invest.baliprov.dev`,
+`{{7*7}}` -> `49`) via Burp Repeater and found no evaluated `49` in the response -- flagged as a likely
+false positive. Replayed the exact baseline and payload requests live: byte-identical responses, no "49"
+anywhere in either. Root cause: this endpoint returns a large, paginated JSON listing of live government
+asset data (prices, IDs, pagination counters) that changes between requests -- `run_ssti`'s existing
+baseline guard (one inert-value request per param, skip if "expected" already appears there) can still
+miss a coincidental match if the live data drifts between the baseline fetch and the payload fetch
+moments later, and "49" is a short, common enough 2-digit sequence to plausibly appear somewhere in a
+large enough response purely by chance, unrelated to any template evaluation.
+
+### Fixed
+- **`workers/bounty/exploit_ext.py`**: `SSTI_PAYLOADS`' operands changed from `7*7=49` to `83*97=8051` --
+  same fix shape as this session's earlier `cmdi` echo-marker -> arithmetic-result change: a longer,
+  less-common expected value is far less likely to coincidentally collide with unrelated real
+  application data. `{{7*'7'}}` -> `"7777777"` (already a 7-digit repeated-digit sequence, already
+  effectively collision-proof) left unchanged.
+- Verified via unit test covering three cases: a genuinely vulnerable mock (evaluates `83*97` ->
+  confirmed), a safe mock (no finding), and a regression case specifically modeling the real false
+  positive -- a mock response containing "49" as coincidental substrings (`"price":149000`, `"id":"a49f2"`,
+  `"pct":"49%"`) but never "8051" (correctly produces no finding, where the old `49`-based payload would
+  have false-positived on any of those three). Also re-ran the fixed `run_ssti` live against the real
+  `invest.baliprov.dev` endpoint that produced the original false positive -- clean, no finding.
+- **Data cleanup**: marked the original finding `triage_status: false_positive` by specific ID (non-
+  destructive, matches established practice), deleted the one draft report built from it (the
+  `report_worker.py` triage-status fix from 2026-08-02 correctly prevents this finding from generating
+  *new* report drafts going forward, but the draft that already existed before the triage needed manual
+  cleanup, same as the KPI `.env` case). Bali program now shows 3 genuine draft reports (2 subdomain
+  takeover + 1 CORS), 1 dismissed.
+
+---
+
+## 2026-08-03 — Onboarded Bali Provincial Government program; found and fixed the same MODULE_META gap for 5 vulnscan-stage modules
+
+Full first pipeline run against a new program (`*.baliprov.dev`, 41 in-scope apps after carving out
+`gitlab`/`payment`/`sso` for extra caution) surfaced 4 real findings in ~1h5m with zero errors: a
+confirmed SSTI (`{{7*7}}` -> `49` on `invest.baliprov.dev`), a CORS wildcard+credentials misconfig, and
+**2 confirmed subdomain takeovers** (`chatbot.baliprov.dev` and `temani.baliprov.dev`, both CNAME'd to
+an unclaimed Gemfury resource). Reviewing the draft reports for these found the same class of bug as
+2026-08-02's `headers`/`exposure` and `upload`/`jwt`/`redirect`/`cmdi`/`bruteforce`/`passwordreset` gaps:
+
+### Fixed
+- **`backend/app/services/bounty_report_templates.py`**: `MODULE_META` was still missing entries for
+  `cors`, `takeover`, `graphql`, `components`, and `403bypass` -- all real, actively-used vulnscan-stage
+  module names (the exact same 5 names `VULNSCAN_ALL_MODULES` was built around one day earlier), so
+  their reports fell back to the generic "Vulnerability / Misconfiguration (nuclei)" label. This wasn't
+  hypothetical: both real subdomain-takeover reports and the CORS report from this run were mislabeled
+  this way before the fix. Added all 5 entries with accurate label/impact/remediation text (`takeover`
+  in particular explains the phishing/credential-theft risk of a trusted-domain CNAME pointing at an
+  unclaimed third-party resource). `display_target` resolution didn't need a fix this time -- `check_cors`
+  and the takeover check both already key their evidence `"url"`, which the `target_url -> url ->
+  matched_at` fallback chain (fixed 2026-08-02) already handles correctly.
+- **Data cleanup**: deleted the 3 mislabeled draft reports (2 takeover + 1 CORS) by specific ID, re-ran
+  the `report` stage, confirmed all 4 reports (SSTI's was already correct) now carry accurate,
+  class-specific titles.
+
+Given how many times this exact bug shape (a module name real code emits but `MODULE_META` never got an
+entry for) recurred across two days of onboarding new programs, did a full audit instead of waiting to
+find the next one program at a time: cross-referenced every literal module-name string actually passed
+to `_to_attempt()` across all of `exploit_worker.py` (18: xss, sqli, ssrf, lfi, redirect, ssti, nosql,
+jsonbody, oauth, csrf, idor, bac, upload, jwt, cmdi, bruteforce, passwordreset, race) and `_detect_attempt()`
+across `vulnscan_worker.py` (7: exposure, cors, headers, 403bypass, graphql, components, takeover)
+against `MODULE_META`'s keys. All 25 are now covered -- confirmed complete, not just "probably fine".
+
+---
+
+## 2026-08-02 — New program onboarding: `rules_of_engagement.custom_headers` (all-stage identifying header injection)
+
+Prompted by onboarding a new Bugcrowd program (MATLAB Online / MathWorks): its brief requires a custom
+`X-Request-Purpose: BugcrowdResearch` header on *every single request* to avoid being rate-limited/
+blocked as unidentified traffic -- not specific to this program, several bug bounty programs require
+something similar. The pipeline had no general mechanism for this; `extra_headers` existed everywhere
+but was only ever seeded from `Authorization: Bearer <token>` after a successful login, so unauthenticated
+requests (and the login POST itself) carried nothing.
+
+### Added
+- **New `rules_of_engagement.custom_headers`** (`Dict[str, str]`): merged into every stage's base
+  `extra_headers` *before* the auth-token check, so it's present even on unauthenticated requests and on
+  the login POST itself, with `Authorization` layered on top afterward once/if login succeeds.
+- **`workers/bounty/recon_worker.py`, `vulnscan_worker.py`, `exploit_worker.py`**: `extra_headers` now
+  seeded from `roe.get("custom_headers")` instead of always starting `{}`.
+- **`workers/bounty/probe_worker.py`**: didn't fetch `rules_of_engagement` or use `extra_headers` at all
+  before this -- added both, threaded into its `run_httpx` liveness probe (probe is often the pipeline's
+  very first traffic against a target, so it needs to be identifiable from the start too).
+- **`workers/bounty/tools.py`**: `login_and_get_session`/`login_and_get_token` gained an `extra_headers`
+  param (previously only sent a bare User-Agent).
+- **`workers/bounty/idor_confirm.py`**: `register_test_identity` gained `extra_headers` too, threaded
+  through both its callers (two-identity IDOR identity-B registration in `exploit_worker.py`, and
+  `confirm_password_reset_reuse` in `exploit_ext.py`).
+- **`workers/bounty/exploit_ext.py`**: `check_login_rate_limit`, `check_password_reset_token_leak`,
+  `check_host_header_poisoning`, and `confirm_password_reset_reuse` all gained `extra_headers` params
+  (previously hardcoded to just `_UA`) and are now called with it from `exploit_worker.py`.
+  `check_race_condition` already had it (built earlier today).
+- **Known, accepted gap**: `run_wafw00f` (WAF fingerprinting in the probe stage) has no way to carry
+  custom headers -- the wafw00f CLI wrapper here doesn't expose a `-H`-equivalent. Left as-is: it's a
+  single one-off fingerprint request per host, much lower risk of being flagged as adversarial/
+  unidentified traffic than the bulk of actual testing traffic, which is now covered.
+- **`RulesOfEngagementEditor`** (`page.tsx`): no dedicated structured field added (a multi-key header
+  dict doesn't fit the single-value-per-field form pattern, and this need is program-specific/rare) --
+  documented via a hint in the Authentication section pointing at the existing "Edit as raw JSON" mode,
+  same precedent as `race_condition_body`.
+- Verified against real subprocess + real network calls (not just a mock): a local echo server captured
+  the custom header on both the CLI-tool path (`run_httpx`'s `-H` flag) and the aiohttp path
+  (`check_login_rate_limit`'s session headers), confirming the actual wire-level header name/value
+  arrived intact through both of the two fundamentally different header-injection mechanisms this
+  codebase uses.
+
+---
+
+## 2026-08-02 — Vulnscan detection module pruning (`rules_of_engagement.vulnscan_modules`); fixed a pre-existing `redirect` gap in the exploit-module UI
+
+Second piece of onboarding the MATLAB Online Bugcrowd program: its brief explicitly excludes several
+finding categories from reward -- missing security headers, clickjacking, and open redirect among them.
+`exploit_worker.py` already let a program narrow its default module set via `rules_of_engagement.
+exploit_modules`; `vulnscan_worker.py`'s Phase-2 detection checks (`_run_detection`) had no equivalent
+and always ran everything (sensitive-file exposure, CORS, security headers, 403-bypass, GraphQL,
+vulnerable-component detection) plus a hardcoded, always-on takeover check.
+
+### Added
+- **`workers/bounty/vulnscan_worker.py`**: new `VULNSCAN_ALL_MODULES` constant (`exposure`, `cors`,
+  `headers`, `403bypass`, `graphql`, `components`, `takeover`) and `rules_of_engagement.vulnscan_modules`
+  narrowing, same list-intersection pattern as `exploit_modules`/`_resolve_modules` -- unset or an empty
+  list means "all enabled" (backward compatible, no behaviour change for existing programs like KPI),
+  an explicit list restricts to just those. `_run_detection` and the takeover check both gated on it.
+- **`RulesOfEngagementEditor`** (`page.tsx`): new "Vulnscan detection modules" chip-toggle section,
+  mirroring the existing "Exploit modules" one.
+- **Found and fixed a real, pre-existing gap while adding this**: the frontend's `EXPLOIT_MODULES`
+  array was missing `"redirect"` (13 of the backend's 14 `ALL_MODULES` entries) -- harmless while nobody
+  narrowed modules (backend defaults to its own full `ALL_MODULES` when `exploit_modules` is unset), but
+  the instant anyone unchecked even one unrelated chip, `redirect` silently dropped out of the resulting
+  explicit list with no way to check it back on, since it was never offered as an option at all. Added it.
+- **Left as-is, documented rather than filtered further**: nuclei's own template selection (a separate
+  mechanism from the module list above, already tag-based via `BOUNTY_DEFAULT_EXCLUDED_TAGS =
+  ["dos", "destructive", "unsafe"]`) has no clean per-category filter equivalent to "exclude
+  missing-header findings" -- a stray nuclei misconfig/header template hit would just be ineligible for
+  reward on a program like this one, not a compliance problem worth adding new nuclei-side filtering
+  infrastructure for.
+- Verified via a mocked `_run_detection` test: a pruned module set (`exposure`, `cors`, `graphql`,
+  `components` -- MATLAB-Online-shaped, `headers`/`403bypass` excluded) ran exactly the checks it should
+  and none of the excluded ones; an unset/`None` module set still ran everything, confirming existing
+  programs see no behaviour change.
+
+---
+
+## 2026-08-02 — Live validation: recon concurrency confirmed (19min vs 1.5h+), new password-reset/race modules don't fit KPI's surface
+
+Validated the day's work against the real KPI program rather than stopping at mocked/unit tests.
+
+### Recon concurrency (bounded `asyncio.gather`, see this date's earlier entry)
+Triggered a real recon re-run: completed in **1146s (19m6s)** for all 10 domains, vs. the previously
+observed 1.5h+ sequential run -- log timestamps confirm 3 domains genuinely started their subdomain-enum
+step in the same second (`ssj.kpi.go.id`/`old.kpi.go.id`/`saran.kpi.go.id` all at 19:55:46), proving the
+semaphore bound engaged for real, not just in the mocked test. Zero `bounty_recon_domain_failed` entries
+-- all 10 domains completed cleanly; the only warnings logged were pre-existing, already-tolerated
+per-source noise (cert mismatches on a couple of subdomains, crtsh 502s, occasional wayback/gau
+timeouts), not new failures.
+
+### Race-condition / host-header-poisoning / password-reset-reuse: no matching surface on KPI
+Checked live (not assumed) whether KPI has a target these 3 new opt-in modules could meaningfully run
+against:
+- `?option=com_users&view=registration` and `?option=com_users&task=reset.request` (KPI's real Joomla
+  `com_users` endpoints, confirmed present via recon-discovered assets) both silently redirect to the
+  homepage -- KPI's frontend has neither public self-registration nor a working public password-reset
+  flow, despite the links existing in recon output (likely default Joomla menu items pointing at a
+  feature that's disabled site-wide, not something specific to our requests).
+- The only form-shaped candidates recon found (`/formulir-aduan`, `/apresiasi`) are a public complaint/
+  feedback intake -- accepting concurrent submissions from different visitors is completely normal
+  behavior for a public form, not a race-condition bug, and firing 15 concurrent test submissions at
+  KPI's real complaint-handling system would just create junk data with zero security value.
+- Conclusion: these 3 modules are correctly built and already validated (unit tests + live-network
+  smoke tests against local mock servers earlier today) -- KPI specifically just doesn't have an
+  application surface that fits them. Not a gap in the code; a mismatch between this particular
+  target's shape and what these checks are for. `rules_of_engagement` was left unchanged (no
+  `password_reset_url`/`race_condition_url` added) since configuring them against a redirect-to-
+  homepage endpoint would produce a meaningless always-empty result, not a real test.
+
+---
+
+## 2026-08-02 — Password-reset token reuse-after-consumption test (opt-in, self-registered disposable account)
+
+Closes out Phase 3.4b -- the one piece explicitly left unbuilt earlier today because it needs to
+actually complete a password reset (real state change) and needed a decision on whose account to use
+for that. User authorized creating the test account itself ("Untuk akun coba lu create sendiri aja
+gapapa bro") rather than requiring a pre-existing one.
+
+### Added
+- **`workers/bounty/exploit_ext.py`**: `confirm_password_reset_reuse(registration_url,
+  registration_fields, reset_request_url, reset_confirm_url, email_field, token_field,
+  new_password_field, timeout)`. Reuses the exact registration infra already built and approved for
+  two-identity IDOR (`generate_test_identity`/`register_test_identity` from `idor_confirm.py`) to
+  create a brand-new, disposable test account via the program's own public registration endpoint --
+  no pre-existing account, real or otherwise, is ever touched. Flow: register the throwaway account,
+  trigger a reset for its own email, extract the token from the API response (reuses
+  `_extract_reset_token` -- if no token leaks, correctly returns no finding, same "can't test without
+  mailbox integration" limitation already documented for the sibling token-leak check), complete the
+  reset once with that token, then attempt the *same* token again with a different new password. Two
+  successful completions in a row -- confirmed, technique `password-reset-token-reusable`, high
+  severity: the token wasn't invalidated after first use.
+- **`workers/bounty/exploit_worker.py`**: new dispatch block gated on
+  `rules_of_engagement.password_reset_completion_test` (a separate, explicit boolean -- unlike the two
+  read-only password-reset checks, this one actually changes state, even if only on a disposable
+  account, so it doesn't piggyback on just `password_reset_url` being set) plus a new
+  `password_reset_confirm_url` field. Reuses the already-in-scope `idor_registration_url`/
+  `idor_registration_fields` locals rather than requiring the operator to configure registration twice.
+- **`bounty_report_templates.py`**: added `TECHNIQUE_META["password-reset-token-reusable"]`.
+- **`RulesOfEngagementEditor`** (`page.tsx`): new red-bordered sub-section (visually distinct from the
+  amber "aggressive testing" checks above it -- this is the only one that completes a real action, not
+  just probes) with the opt-in checkbox and confirm-URL field; field-name overrides
+  (`password_reset_token_field`/`password_reset_new_password_field`) left to the existing raw-JSON
+  fallback mode rather than adding more dedicated inputs for what should be a rare override.
+- Verified via a mocked register+request-reset+confirm-reset server covering both a vulnerable case
+  (token accepted twice, confirms the finding fires with the right evidence) and a properly-behaved
+  case (second use of the same token rejected, confirms no false positive) -- also asserted the
+  disposable account was genuinely registered through the app's own endpoint each time (not stubbed
+  out), matching the "never touches a real account" guarantee this whole design rests on.
+
+---
+
 ## 2026-08-02 — Host-header poisoning check on the password-reset flow (opt-in)
 
 The safe half of Phase 3.4b (the other half, reuse-after-consumption, needs a real test account +

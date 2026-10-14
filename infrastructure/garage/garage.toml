@@ -1,0 +1,42 @@
+# Garage (S3-compatible object storage) config.
+#
+# Replaces MinIO: minio/minio and minio/mc were pulled from Docker Hub, quay.io
+# and GHCR by upstream, and MinIO's own binary releases (dl.min.io) now 404/410
+# (verified 2026-10-14) -- there is no way to pull or download them anymore.
+# See CHANGELOG.md.
+#
+# No secrets live in this file. `rpc_secret` and `admin.admin_token` are read
+# from the GARAGE_RPC_SECRET / GARAGE_ADMIN_TOKEN env vars instead -- the
+# `garage` binary itself reads those (see `garage --help`), the same way the
+# rest of this repo's services take their credentials from docker-compose
+# `environment:` / `.env` rather than baked-in config files.
+
+metadata_dir = "/var/lib/garage/meta"
+data_dir = "/var/lib/garage/data"
+db_engine = "lmdb"
+
+# Single-node deployment: one copy of the data, no multi-node quorum.
+replication_factor = 1
+
+rpc_bind_addr = "[::]:3901"
+rpc_public_addr = "garage:3901"
+
+[s3_api]
+# Must be "us-east-1": the `minio` Python SDK (used in backend/app/core/minio_client.py
+# and the workers) hardcodes this as its default region when none is passed,
+# and a mismatch here causes every request to fail with AuthorizationHeaderMalformed.
+s3_region = "us-east-1"
+api_bind_addr = "[::]:3900"
+
+[s3_web]
+# Garage has no "anonymous bucket policy" like MinIO's `mc anonymous set download`.
+# Public, unauthenticated reads are only possible through this website-serving
+# mode, bucket-routed by Host header. Used solely so nginx can proxy
+# /storage/screenshots/* here (see infrastructure/nginx/nginx.conf) -- this
+# domain is never resolved over real DNS, nginx just sets the Host header
+# directly to "screenshots.web.garage.internal".
+bind_addr = "[::]:3902"
+root_domain = ".web.garage.internal"
+
+[admin]
+api_bind_addr = "[::]:3903"
